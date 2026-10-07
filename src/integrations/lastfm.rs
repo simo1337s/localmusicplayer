@@ -124,6 +124,44 @@ fn parse_response(status: u16, body: &str) -> anyhow::Result<Value> {
     json.context("Last.fm returned invalid JSON")
 }
 
+/// Why Last.fm ignored scrobbles in a `track.scrobble` answer (`ignoredMessage` codes).
+pub fn ignored_reasons(v: &serde_json::Value) -> Vec<String> {
+    let scrobbles = match v.pointer("/scrobbles/scrobble") {
+        Some(serde_json::Value::Array(list)) => list.iter().collect(),
+        Some(one) => vec![one],
+        None => Vec::new(),
+    };
+    scrobbles
+        .into_iter()
+        .filter_map(|s| {
+            let message = s.get("ignoredMessage")?;
+            let code = message
+                .get("code")
+                .and_then(|c| {
+                    c.as_str()
+                        .map(str::to_string)
+                        .or_else(|| c.as_u64().map(|n| n.to_string()))
+                })
+                .unwrap_or_default();
+            let why = match code.as_str() {
+                "" | "0" => return None,
+                "1" => "Last.fm rejected the artist name (check the file's tags)",
+                "2" => "Last.fm rejected the song title (check the file's tags)",
+                "3" => "it was played too long ago",
+                "4" => "its time is in the future (check your computer's clock)",
+                "5" => "you've reached Last.fm's daily scrobble limit",
+                _ => "Last.fm ignored it",
+            };
+            let track = s.pointer("/track/#text").and_then(|t| t.as_str()).unwrap_or_default();
+            Some(if track.is_empty() {
+                why.to_string()
+            } else {
+                format!("“{track}”: {why}")
+            })
+        })
+        .collect()
+}
+
 /// Last.fm prefers the main artist: "A, B" -> "A".
 pub fn scrobble_artist(artist: &str) -> &str {
     let artist = artist.trim();
@@ -359,23 +397,14 @@ impl Lastfm {
         Ok(())
     }
 
-    async fn submit(&self, batch: &[QueuedScrobble]) -> anyhow::Result<()> {
+    /// `track.scrobble`. Returns why Last.fm ignored any of them (it answers 200 either way).
+    async fn submit(&self, batch: &[QueuedScrobble]) -> anyhow::Result<Vec<String>> {
         let v = self.post("track.scrobble", batch_params(batch), true).await?;
-        if let Some(attr) = v.pointer("/scrobbles/@attr") {
-            let count = |k: &str| {
-                attr.get(k)
-                    .and_then(|x| x.as_u64().or_else(|| x.as_str().and_then(|s| s.parse().ok())))
-                    .unwrap_or(0)
-            };
-            let ignored = count("ignored");
-            if ignored > 0 {
-                tracing::warn!(
-                    "lastfm: {ignored} of {} scrobbles ignored by Last.fm",
-                    count("accepted") + ignored
-                );
-            }
+        let ignored = ignored_reasons(&v);
+        for reason in &ignored {
+            tracing::warn!("lastfm: scrobble ignored: {reason}");
         }
-        Ok(())
+        Ok(ignored)
     }
 
     async fn enqueue(&self, scrobble: QueuedScrobble) -> anyhow::Result<()> {
@@ -389,24 +418,24 @@ impl Lastfm {
     /// `track.scrobble`. Transient failures (network, 5xx, rate limiting) and an invalid
     /// session queue the scrobble for later; transient ones return `Ok(())`. After a
     /// successful scrobble the queue is flushed too.
-    pub async fn scrobble(&self, track: &Track, started_at: i64) -> anyhow::Result<()> {
+    pub async fn scrobble(&self, track: &Track, started_at: i64) -> anyhow::Result<Option<String>> {
         let Some(s) = QueuedScrobble::from_track(track, started_at) else {
             tracing::debug!("lastfm: not scrobbling {:?}: missing artist or title", track.id);
-            return Ok(());
+            return Ok(None);
         };
         if !self.is_authenticated() {
             anyhow::bail!("not logged in to Last.fm");
         }
         match self.submit(std::slice::from_ref(&s)).await {
-            Ok(()) => {
+            Ok(ignored) => {
                 if let Err(e) = self.flush_queue().await {
                     tracing::debug!("lastfm: flushing scrobble queue failed: {e:#}");
                 }
-                Ok(())
+                Ok(ignored.into_iter().next())
             }
             Err(e) if is_transient(&e) => {
                 tracing::info!("lastfm: scrobble failed ({e:#}), queued for later");
-                self.enqueue(s).await
+                self.enqueue(s).await.map(|()| None)
             }
             Err(e) if is_auth_error(&e) => {
                 // Keep it so it can be submitted after re-authenticating.
@@ -444,7 +473,7 @@ impl Lastfm {
         while !queue.is_empty() {
             let n = queue.len().min(BATCH_SIZE);
             match self.submit(&queue[..n]).await {
-                Ok(()) => {
+                Ok(_) => {
                     submitted += n;
                     queue.drain(..n);
                 }
@@ -544,6 +573,14 @@ impl ScrobbleTracker {
             return !t.scrobbled && (t.duration_ms == 0 || duration > MIN_TRACK_LEN);
         }
         !t.scrobbled && duration > MIN_TRACK_LEN && t.listened >= (duration / 2).min(MAX_LISTEN_REQUIRED)
+    }
+
+    /// The length reported by the player, for tracks whose tags didn't have one (they could
+    /// never reach "half the song" otherwise).
+    pub fn set_duration_if_unknown(&mut self, duration_ms: u64) {
+        if let Some(t) = self.current.as_mut().filter(|t| t.duration_ms == 0) {
+            t.duration_ms = duration_ms;
+        }
     }
 
     pub fn mark_scrobbled(&mut self) {
@@ -695,6 +732,49 @@ mod tests {
                 "duration[1]"
             ]
         );
+    }
+
+    #[test]
+    fn tracker_learns_unknown_lengths_from_the_player() {
+        let mut t = ScrobbleTracker::new();
+        // Tags without a length: half of "unknown" can never be reached.
+        t.start("a", 0, 100);
+        t.tick(true, secs(200));
+        assert!(!t.should_scrobble());
+        t.set_duration_if_unknown(180_000);
+        assert!(t.should_scrobble());
+        // A known length is kept.
+        t.start("b", 300_000, 200);
+        t.set_duration_if_unknown(10_000);
+        t.tick(true, secs(150));
+        assert!(t.should_scrobble());
+    }
+
+    #[test]
+    fn ignored_scrobbles_say_why() {
+        let one: serde_json::Value = serde_json::from_str(
+            r##"{"scrobbles":{"scrobble":{"track":{"corrected":"0","#text":"01 Intro"},
+                "artist":{"corrected":"0","#text":"Unknown Artist"},
+                "ignoredMessage":{"code":"1","#text":"Artist was ignored"}},
+                "@attr":{"ignored":1,"accepted":0}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            ignored_reasons(&one),
+            vec!["“01 Intro”: Last.fm rejected the artist name (check the file's tags)".to_string()]
+        );
+        let batch: serde_json::Value = serde_json::from_str(
+            r##"{"scrobbles":{"scrobble":[
+                {"track":{"#text":"A"},"ignoredMessage":{"code":"0","#text":""}},
+                {"track":{"#text":"B"},"ignoredMessage":{"code":"5","#text":"Daily limit"}}],
+                "@attr":{"ignored":1,"accepted":1}}}"##,
+        )
+        .unwrap();
+        assert_eq!(
+            ignored_reasons(&batch),
+            vec!["“B”: you've reached Last.fm's daily scrobble limit".to_string()]
+        );
+        assert!(ignored_reasons(&serde_json::json!({})).is_empty());
     }
 
     #[test]

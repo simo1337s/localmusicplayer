@@ -1547,6 +1547,7 @@ impl Service {
             MpvEvent::Duration(d) => {
                 if d > 0.0 {
                     self.duration = d;
+                    self.scrobble.set_duration_if_unknown((d * 1000.0) as u64);
                     self.publish_player();
                 }
             }
@@ -1680,9 +1681,13 @@ impl Service {
         self.scrobble.mark_scrobbled();
         if let (Some(lfm), Some((_, started))) = (self.lastfm.clone(), self.scrobble.current()) {
             if let Some(t) = self.queue.current().cloned() {
+                let shared = self.shared.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = lfm.scrobble(&t, started).await {
-                        tracing::warn!("scrobble failed: {e:#}");
+                    match lfm.scrobble(&t, started).await {
+                        Ok(None) => {}
+                        // Usually bad tags on a local file; silently missing scrobbles are worse.
+                        Ok(Some(why)) => shared.error(format!("Not scrobbled: {why}")),
+                        Err(e) => tracing::warn!("scrobble failed: {e:#}"),
                     }
                 });
             }
