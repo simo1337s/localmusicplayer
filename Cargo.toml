@@ -13,6 +13,9 @@ egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
 librespot-core = { version = "0.8", default-features = false, features = ["native-tls"] }
 librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "native-tls"] }
 librespot-oauth = { version = "0.8", default-features = false, features = ["native-tls"] }
+librespot-protocol = "0.8"
+protobuf = "3"
+http = "1"
 lofty = "0.25"
 rusqlite = { version = "0.40", features = ["bundled"] }
 reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "charset", "gzip", "json", "form", "query"] }

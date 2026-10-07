@@ -63,6 +63,8 @@ pub struct PlaybackConfig {
     pub gapless: bool,
     /// Optional mpv `--audio-device`, e.g. `pipewire/alsa_output.usb-...`. Empty = default.
     pub audio_device: String,
+    /// Bit-perfect output for lossless files: exclusive device access, no ReplayGain.
+    pub bit_perfect: bool,
 }
 
 impl Default for PlaybackConfig {
@@ -73,6 +75,7 @@ impl Default for PlaybackConfig {
             replaygain: true,
             gapless: true,
             audio_device: String::new(),
+            bit_perfect: false,
         }
     }
 }
@@ -84,11 +87,15 @@ pub struct SpotifyConfig {
     /// 96, 160 or 320 kbps.
     pub bitrate: u16,
     pub normalisation: bool,
-    /// OAuth client id. Defaults to Spotify's desktop client id; set your own
-    /// developer app id if you hit Web API rate limits.
+    /// OAuth client id used to log in (playback + library). Defaults to Spotify's desktop client id.
     pub client_id: String,
     /// Loopback port registered as redirect URI for the client id.
     pub redirect_port: u16,
+    /// Optional client id of your own Spotify developer app, used for Web API calls
+    /// (search, likes). The shared default client id is often rate limited.
+    pub web_api_client_id: String,
+    /// Redirect port registered for `web_api_client_id` (http://127.0.0.1:<port>/login).
+    pub web_api_redirect_port: u16,
     /// Keep downloaded audio in ~/.cache/medley/spotify (uses disk, saves bandwidth).
     pub cache_audio: bool,
 }
@@ -101,6 +108,8 @@ impl Default for SpotifyConfig {
             normalisation: true,
             client_id: SPOTIFY_DEFAULT_CLIENT_ID.into(),
             redirect_port: 8898,
+            web_api_client_id: String::new(),
+            web_api_redirect_port: 8899,
             cache_audio: false,
         }
     }

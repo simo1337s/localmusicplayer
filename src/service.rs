@@ -16,8 +16,8 @@ use crate::integrations::lyrics::LyricsFetcher;
 use crate::integrations::mpris::Mpris;
 use crate::library::{self, liked_playlist, Db, Library, LIKED_ID};
 use crate::model::{
-    normalize_artist, normalize_title, now_unix, ImportedPlaylist, Lyrics, Playlist, PlaylistKind, RepeatMode, Source,
-    Track,
+    normalize_artist, normalize_title, now_unix, AudioQuality, ImportedPlaylist, Lyrics, Playlist, PlaylistKind,
+    RepeatMode, Source, Track,
 };
 use crate::player::mpv::{Mpv, MpvEvent, MpvOptions};
 use crate::player::queue::Queue;
@@ -75,7 +75,11 @@ pub enum Command {
     ImportAppleXml(PathBuf),
     ImportAppleApi,
     Rescan,
+    /// Ask mpv which output devices exist (for the device picker).
+    ListAudioDevices,
     SpotifyLogin,
+    /// Authorize the user's own developer app for Web API calls.
+    SpotifyWebApiLogin,
     SpotifyLogout,
     SyncSpotify,
     SyncSoundCloud,
@@ -112,6 +116,8 @@ pub struct PlayerView {
     pub upcoming: Vec<Track>,
     pub up_next_len: usize,
     pub context: String,
+    /// Format of what's playing (codec, bit depth, sample rate).
+    pub quality: Option<AudioQuality>,
 }
 
 impl Default for PlayerView {
@@ -129,6 +135,7 @@ impl Default for PlayerView {
             upcoming: Vec::new(),
             up_next_len: 0,
             context: String::new(),
+            quality: None,
         }
     }
 }
@@ -194,9 +201,15 @@ pub struct Feed {
     pub search: SearchState,
     pub lyrics: LyricsState,
     pub spotify: AccountStatus,
+    /// True while a Spotify login is stored, whatever the current status message says.
+    pub spotify_logged_in: bool,
+    /// Status of the optional own-app Web API login.
+    pub spotify_web_api: AccountStatus,
     pub soundcloud: AccountStatus,
     pub lastfm: AccountStatus,
     pub scan: Option<(usize, usize)>,
+    /// mpv output devices as (id, description), filled on request.
+    pub audio_devices: Vec<(String, String)>,
     pub raise: bool,
     pub quit: bool,
 }
@@ -277,13 +290,21 @@ enum Internal {
         soundcloud: Result<Vec<Track>>,
     },
     LastfmSession(Result<(String, String)>),
+    Quality {
+        track_id: String,
+        quality: Option<AudioQuality>,
+    },
+    AudioDevices(Vec<(String, String)>),
 }
 
 struct SpotifySync {
     user: String,
-    /// Playlists in Spotify's order. `None` tracks = unchanged since last sync.
-    playlists: Vec<(SpotifyPlaylistMeta, Option<Vec<Track>>)>,
-    liked: Vec<Track>,
+    /// Playlists in Spotify's order with their track ids. `None` = unchanged since last sync.
+    playlists: Vec<(SpotifyPlaylistMeta, Option<Vec<String>>)>,
+    /// Liked Songs track ids, newest first.
+    liked: Vec<String>,
+    /// New or updated track metadata.
+    tracks: Vec<Track>,
 }
 
 struct SoundCloudSync {
@@ -326,6 +347,7 @@ pub struct Service {
     duration: f64,
     /// Playable track for the current queue entry (differs for resolved imports).
     playing: Option<Track>,
+    quality: Option<AudioQuality>,
     load_seq: u64,
     started_reported: bool,
     resume_position: Option<f64>,
@@ -336,8 +358,13 @@ pub struct Service {
     mpv_preloaded: Option<String>,
 
     spotify_auth: Arc<SpotifyAuth>,
+    /// Optional login with the user's own developer app, for Web API calls.
+    spotify_web_auth: Option<Arc<SpotifyAuth>>,
     spotify: Option<SpotifyEngine>,
     spotify_connecting: bool,
+    /// A sync was requested before the session was connected.
+    spotify_sync_pending: bool,
+    spotify_syncing: bool,
     spotify_tx: UnboundedSender<SpotifyEvent>,
     spotify_api: Arc<SpotifyApi>,
 
@@ -400,6 +427,7 @@ impl Service {
         let receivers: Receivers = (mpv_rx, sp_rx, int_rx);
 
         let spotify_auth = Arc::new(SpotifyAuth::new(&cfg.spotify, &paths.spotify_dir()));
+        let spotify_web_auth = SpotifyAuth::web_api(&cfg.spotify, &paths.spotify_dir()).map(Arc::new);
         let soundcloud = Arc::new(SoundCloud::new(
             http.clone(),
             &cfg.soundcloud.client_id,
@@ -432,6 +460,7 @@ impl Service {
             position_at: Instant::now(),
             duration: 0.0,
             playing: None,
+            quality: None,
             load_seq: 0,
             started_reported: false,
             resume_position: None,
@@ -440,8 +469,11 @@ impl Service {
             mpv_tx,
             mpv_preloaded: None,
             spotify_auth,
+            spotify_web_auth,
             spotify: None,
             spotify_connecting: false,
+            spotify_sync_pending: false,
+            spotify_syncing: false,
             spotify_tx,
             spotify_api: Arc::new(SpotifyApi::new(http)),
             soundcloud,
@@ -727,6 +759,14 @@ impl Service {
             }
             Command::ImportAppleApi => self.import_apple_api(),
             Command::Rescan => self.start_scan(),
+            Command::ListAudioDevices => {
+                let binary = self.cfg.playback.mpv_path.clone();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    let devices = crate::player::mpv::list_audio_devices(&binary).await;
+                    let _ = tx.send(Internal::AudioDevices(devices));
+                });
+            }
             Command::SpotifyLogin => self.spotify_login(),
             Command::SpotifyLogout => {
                 if let Some(sp) = self.spotify.take() {
@@ -737,10 +777,14 @@ impl Service {
                     self.set_status(PlayStatus::Stopped);
                 }
                 self.spotify_auth.logout();
+                if let Some(a) = &self.spotify_web_auth {
+                    a.logout();
+                }
                 spotify::clear_credentials(&self.paths.spotify_dir());
                 self.set_account(|f| &mut f.spotify, AccountStatus::Off);
             }
             Command::SyncSpotify => self.start_spotify_sync(),
+            Command::SpotifyWebApiLogin => self.spotify_web_api_login(),
             Command::SyncSoundCloud => self.start_soundcloud_sync(),
             Command::LastfmLogin => self.lastfm_login(),
             Command::LastfmLogout => {
@@ -882,10 +926,20 @@ impl Service {
             .and_then(|s| serde_json::from_str(&s).ok())
     }
 
+    /// Login used for Web API calls: the user's own app if authorized, else the main login.
+    fn web_auth(&self) -> Option<Arc<SpotifyAuth>> {
+        if !self.cfg.spotify.enabled {
+            return None;
+        }
+        match &self.spotify_web_auth {
+            Some(a) if a.has_login() => Some(a.clone()),
+            _ => self.spotify_auth.has_login().then(|| self.spotify_auth.clone()),
+        }
+    }
+
     fn resolver(&self) -> Resolver {
         Resolver {
-            spotify: (self.cfg.spotify.enabled && self.spotify_auth.has_login())
-                .then(|| (self.spotify_auth.clone(), self.spotify_api.clone())),
+            spotify: self.web_auth().map(|auth| (auth, self.spotify_api.clone())),
             soundcloud: self.cfg.soundcloud.enabled.then(|| self.soundcloud.clone()),
         }
     }
@@ -897,9 +951,10 @@ impl Service {
         let opts = MpvOptions {
             binary: self.cfg.playback.mpv_path.clone(),
             volume: self.cfg.playback.volume,
-            replaygain: self.cfg.playback.replaygain,
+            replaygain: self.cfg.playback.replaygain && !self.cfg.playback.bit_perfect,
             gapless: self.cfg.playback.gapless,
             audio_device: self.cfg.playback.audio_device.clone(),
+            exclusive: self.cfg.playback.bit_perfect,
         };
         self.mpv = Some(Mpv::spawn(&opts, self.mpv_tx.clone()).await?);
         Ok(())
@@ -1006,6 +1061,7 @@ impl Service {
         let Some(track) = self.queue.current().cloned() else {
             return;
         };
+        self.detect_quality();
         let now = now_unix();
         let _ = self.db.record_play(&track.id, now);
         {
@@ -1029,6 +1085,53 @@ impl Service {
             });
         }
         self.save_session();
+    }
+
+    /// Works out the format of the track that just started.
+    fn detect_quality(&mut self) {
+        self.quality = None;
+        let Some(t) = self.playing.clone() else { return };
+        match t.source {
+            Source::Local => {
+                let tx = self.internal_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let quality = library::quality::read(std::path::Path::new(&t.uri));
+                    let _ = tx.send(Internal::Quality {
+                        track_id: t.id,
+                        quality,
+                    });
+                });
+            }
+            Source::Spotify => {
+                self.quality = Some(AudioQuality {
+                    codec: "Ogg Vorbis".into(),
+                    bitrate_kbps: Some(self.cfg.spotify.bitrate as u32),
+                    ..Default::default()
+                });
+            }
+            // SoundCloud streams are inspected through mpv once loaded.
+            Source::SoundCloud | Source::AppleMusic => {}
+        }
+    }
+
+    async fn mpv_stream_quality(&self) -> Option<AudioQuality> {
+        let mpv = self.mpv.as_ref()?;
+        let codec = mpv
+            .command(serde_json::json!(["get_property", "audio-codec-name"]))
+            .await
+            .ok()?;
+        let bitrate = mpv
+            .command(serde_json::json!(["get_property", "audio-bitrate"]))
+            .await
+            .ok()
+            .and_then(|v| v.as_f64());
+        let rate = mpv
+            .command(serde_json::json!(["get_property", "audio-params/samplerate"]))
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .map(|r| r as u32);
+        Some(AudioQuality::from_mpv(codec.as_str()?, bitrate, rate))
     }
 
     async fn pause(&mut self) {
@@ -1173,6 +1276,9 @@ impl Service {
                 self.set_position(start);
                 self.status = PlayStatus::Playing;
                 self.on_track_started();
+                if self.playing.as_ref().is_some_and(|t| t.source == Source::SoundCloud) {
+                    self.quality = self.mpv_stream_quality().await;
+                }
                 self.publish_player();
                 self.update_presence();
                 self.refresh_mpv_preload().await;
@@ -1340,6 +1446,7 @@ impl Service {
             pv.shuffle = self.queue.shuffle;
             pv.repeat = self.queue.repeat;
             pv.context = self.queue.context_name.clone();
+            pv.quality = self.quality.clone();
         }
         self.mpris.update(
             self.queue.current(),
@@ -1397,7 +1504,15 @@ impl Service {
         } else {
             AccountStatus::Off
         };
+        let web_api = match &self.spotify_web_auth {
+            Some(a) if a.has_login() => AccountStatus::Connected(String::new()),
+            _ => AccountStatus::Off,
+        };
         let mut feed = self.shared.feed.write().unwrap();
+        feed.spotify_logged_in = self.spotify_auth.has_login();
+        if !matches!(feed.spotify_web_api, AccountStatus::Working(_)) {
+            feed.spotify_web_api = web_api;
+        }
         if !matches!(feed.spotify, AccountStatus::Working(_)) {
             feed.spotify = spotify;
         }
@@ -1499,8 +1614,8 @@ impl Service {
         };
         self.save_playlists(vec![playlist], &[]);
 
-        if track.source == Source::Spotify && self.spotify_auth.has_login() {
-            let (auth, api) = (self.spotify_auth.clone(), self.spotify_api.clone());
+        if let (Source::Spotify, Some(auth)) = (track.source, self.web_auth()) {
+            let api = self.spotify_api.clone();
             let t = track.clone();
             tokio::spawn(async move {
                 if let Ok(token) = auth.token().await {
@@ -1642,29 +1757,87 @@ impl Service {
     }
 
     fn start_spotify_sync(&mut self) {
-        if !self.spotify_auth.has_login() {
+        if !self.spotify_auth.has_login() || self.spotify_syncing {
             return;
         }
+        // The library is imported through the playback session, so connect first.
+        let Some(session) = self.spotify.as_ref().and_then(|e| e.session()) else {
+            self.spotify_sync_pending = true;
+            self.set_account(|f| &mut f.spotify, AccountStatus::Working("Connecting…".into()));
+            if self.spotify.is_some() {
+                // Session dropped: reconnect from scratch.
+                if let Some(sp) = self.spotify.take() {
+                    sp.shutdown();
+                }
+            }
+            self.connect_spotify();
+            return;
+        };
+        self.spotify_syncing = true;
         self.set_account(|f| &mut f.spotify, AccountStatus::Working("Syncing playlists…".into()));
-        let auth = self.spotify_auth.clone();
-        let api = self.spotify_api.clone();
-        let tx = self.internal_tx.clone();
-        // Snapshot ids of playlists we already have, to skip unchanged ones.
-        let known: HashMap<String, String> = {
+        let known: HashSet<String> = {
             let lib = self.shared.library.read().unwrap();
-            lib.playlists
-                .iter()
-                .filter(|p| p.kind == PlaylistKind::Spotify)
-                .filter_map(|p| {
-                    let rid = p.remote_id.clone()?;
-                    let snap = self.db.get_kv(&format!("spotify_snapshot:{rid}"))?;
-                    Some((rid, snap))
-                })
+            lib.tracks
+                .values()
+                .filter(|t| t.source == Source::Spotify)
+                .map(|t| t.id.clone())
                 .collect()
         };
+        let web = self.web_auth().map(|a| (a, self.spotify_api.clone()));
+        let tx = self.internal_tx.clone();
         tokio::spawn(async move {
-            let r = spotify_sync(&auth, &api, &known).await;
+            let r = match spotify_sync_internal(session, known).await {
+                Ok(sync) => Ok(sync),
+                Err(e) => {
+                    tracing::warn!("Spotify library import via session failed: {e:#}; trying the Web API");
+                    match web {
+                        Some((auth, api)) => spotify_sync_web(&auth, &api, &HashMap::new())
+                            .await
+                            .map_err(|e2| anyhow!("{e:#} (Web API: {})", friendly_spotify_error(&e2))),
+                        None => Err(e),
+                    }
+                }
+            };
             let _ = tx.send(Internal::SpotifySynced(r));
+        });
+    }
+
+    /// Fallback when no playback session can be opened (e.g. connection refused).
+    fn start_spotify_web_sync(&mut self) {
+        let Some(auth) = self.web_auth() else { return };
+        if self.spotify_syncing {
+            return;
+        }
+        self.spotify_syncing = true;
+        self.set_account(|f| &mut f.spotify, AccountStatus::Working("Syncing playlists…".into()));
+        let api = self.spotify_api.clone();
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let r = spotify_sync_web(&auth, &api, &HashMap::new())
+                .await
+                .map_err(|e| anyhow!("{}", friendly_spotify_error(&e)));
+            let _ = tx.send(Internal::SpotifySynced(r));
+        });
+    }
+
+    fn spotify_web_api_login(&mut self) {
+        let Some(auth) = self.spotify_web_auth.clone() else {
+            self.shared
+                .error("Enter your Spotify app's client ID in Settings → Spotify → Advanced first");
+            return;
+        };
+        self.set_account(
+            |f| &mut f.spotify_web_api,
+            AccountStatus::Working("Waiting for browser login…".into()),
+        );
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let status = match auth.login().await {
+                Ok(_) => AccountStatus::Connected(String::new()),
+                Err(e) => AccountStatus::Error(format!("{e:#}")),
+            };
+            shared.feed.write().unwrap().spotify_web_api = status;
+            shared.repaint();
         });
     }
 
@@ -1679,8 +1852,8 @@ impl Service {
                 .map(|p| (p.id.clone(), p.track_ids.clone()))
                 .collect()
         };
-        let liked_ids: Vec<String> = sync.liked.iter().map(|t| t.id.clone()).collect();
-        tracks.extend(sync.liked);
+        tracks.extend(sync.tracks);
+        let liked_ids = sync.liked;
         playlists.push(Playlist {
             id: "spotify:liked".into(),
             name: "Liked Songs".into(),
@@ -1694,9 +1867,7 @@ impl Service {
         for (meta, list) in sync.playlists {
             let id = format!("spotify:{}", meta.id);
             let track_ids = match list {
-                Some(list) => {
-                    let ids = list.iter().map(|t| t.id.clone()).collect();
-                    tracks.extend(list);
+                Some(ids) => {
                     let _ = self
                         .db
                         .set_kv(&format!("spotify_snapshot:{}", meta.id), &meta.snapshot_id);
@@ -1880,8 +2051,7 @@ impl Service {
             self.shared.feed.write().unwrap().search.pending = 0;
             return;
         }
-        let spotify = (self.cfg.spotify.enabled && self.spotify_auth.has_login())
-            .then(|| (self.spotify_auth.clone(), self.spotify_api.clone()));
+        let spotify = self.web_auth().map(|auth| (auth, self.spotify_api.clone()));
         let sc = self.cfg.soundcloud.enabled.then(|| self.soundcloud.clone());
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -1948,8 +2118,15 @@ impl Service {
                 let _ = mpv
                     .command(serde_json::json!([
                         "set_property",
+                        "audio-exclusive",
+                        if p.bit_perfect { "yes" } else { "no" }
+                    ]))
+                    .await;
+                let _ = mpv
+                    .command(serde_json::json!([
+                        "set_property",
                         "replaygain",
-                        if p.replaygain { "track" } else { "no" }
+                        if p.replaygain && !p.bit_perfect { "track" } else { "no" }
                     ]))
                     .await;
                 let _ = mpv
@@ -1995,6 +2172,12 @@ impl Service {
                 self.paths.lyrics_cache(),
                 self.cfg.lyrics.online,
             ));
+        }
+        if old.spotify.web_api_client_id != self.cfg.spotify.web_api_client_id
+            || old.spotify.web_api_redirect_port != self.cfg.spotify.web_api_redirect_port
+        {
+            self.spotify_web_auth = SpotifyAuth::web_api(&self.cfg.spotify, &self.paths.spotify_dir()).map(Arc::new);
+            self.publish_accounts();
         }
         if old.spotify != self.cfg.spotify {
             if old.spotify.client_id != self.cfg.spotify.client_id
@@ -2104,20 +2287,35 @@ impl Service {
                         } else {
                             engine.shutdown();
                         }
+                        if std::mem::take(&mut self.spotify_sync_pending) {
+                            self.start_spotify_sync();
+                        } else if !self.spotify_syncing {
+                            let name = self.db.get_kv("spotify_user").unwrap_or_default();
+                            self.set_account(|f| &mut f.spotify, AccountStatus::Connected(name));
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("Spotify connect failed: {e:#}");
-                        self.set_account(|f| &mut f.spotify, AccountStatus::Error(format!("Playback: {e:#}")));
+                        self.set_account(
+                            |f| &mut f.spotify,
+                            AccountStatus::Error(format!("Couldn't connect: {e:#}")),
+                        );
+                        if std::mem::take(&mut self.spotify_sync_pending) {
+                            self.start_spotify_web_sync();
+                        }
                     }
                 }
             }
-            Internal::SpotifySynced(r) => match r {
-                Ok(sync) => self.merge_spotify(sync),
-                Err(e) => {
-                    self.set_account(|f| &mut f.spotify, AccountStatus::Error(format!("{e:#}")));
-                    self.shared.error(format!("Spotify sync failed: {e:#}"));
+            Internal::SpotifySynced(r) => {
+                self.spotify_syncing = false;
+                match r {
+                    Ok(sync) => self.merge_spotify(sync),
+                    Err(e) => {
+                        self.set_account(|f| &mut f.spotify, AccountStatus::Error(format!("Sync failed: {e:#}")));
+                        self.shared.error(format!("Spotify sync failed: {e:#}"));
+                    }
                 }
-            },
+            }
             Internal::SoundCloudSynced(r) => match r {
                 Ok(sync) => self.merge_soundcloud(sync),
                 Err(e) => {
@@ -2166,7 +2364,10 @@ impl Service {
                     feed.search.pending = 0;
                     match spotify {
                         Ok(t) => feed.search.spotify = t,
-                        Err(e) => feed.search.errors.push(format!("Spotify: {e:#}")),
+                        Err(e) => feed
+                            .search
+                            .errors
+                            .push(format!("Spotify: {}", friendly_spotify_error(&e))),
                     }
                     match soundcloud {
                         Ok(t) => feed.search.soundcloud = t,
@@ -2174,6 +2375,16 @@ impl Service {
                     }
                 }
                 drop(feed);
+                self.shared.repaint();
+            }
+            Internal::Quality { track_id, quality } => {
+                if self.playing.as_ref().is_some_and(|t| t.id == track_id) {
+                    self.quality = quality;
+                    self.publish_player();
+                }
+            }
+            Internal::AudioDevices(devices) => {
+                self.shared.feed.write().unwrap().audio_devices = devices;
                 self.shared.repaint();
             }
             Internal::LastfmSession(r) => match r {
@@ -2206,7 +2417,67 @@ fn make_lastfm(cfg: &Config, http: &reqwest::Client, paths: &Paths) -> Option<Ar
     Some(Arc::new(lfm))
 }
 
-async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<String, String>) -> Result<SpotifySync> {
+/// Imports playlists and Liked Songs through the playback session (not rate limited like the
+/// public Web API). Only tracks we don't know yet get their metadata fetched.
+async fn spotify_sync_internal(
+    session: librespot_core::session::Session,
+    known: HashSet<String>,
+) -> Result<SpotifySync> {
+    use crate::providers::spotify_internal as si;
+    let user = si::display_name(&session).await;
+    let ids = si::rootlist(&session).await?;
+    let mut lists = Vec::with_capacity(ids.len());
+    for id in &ids {
+        match si::playlist(&session, id).await {
+            Ok(p) => lists.push(p),
+            Err(e) => tracing::warn!("skipping Spotify playlist {id}: {e:#}"),
+        }
+    }
+    let liked = si::liked(&session).await.unwrap_or_else(|e| {
+        tracing::warn!("Spotify Liked Songs: {e:#}");
+        Vec::new()
+    });
+
+    let mut need = Vec::new();
+    let mut seen = HashSet::new();
+    let all = lists
+        .iter()
+        .flat_map(|p| p.items.iter().map(|(u, _)| u))
+        .chain(liked.iter().map(|(u, _)| u));
+    for uri in all {
+        if uri.starts_with("spotify:track:") && !known.contains(uri) && seen.insert(uri.as_str()) {
+            need.push(uri.clone());
+        }
+    }
+    let mut fetched = si::tracks(&session, &need).await?;
+    for (uri, at) in &liked {
+        if let Some(t) = fetched.get_mut(uri) {
+            t.added_at = *at;
+        }
+    }
+    let have = |uri: &String| known.contains(uri) || fetched.contains_key(uri);
+    let playlists = lists
+        .into_iter()
+        .map(|p| {
+            let ids = p.items.iter().map(|(u, _)| u).filter(|u| have(u)).cloned().collect();
+            (p.meta, Some(ids))
+        })
+        .collect();
+    let liked_ids = liked.iter().map(|(u, _)| u).filter(|u| have(u)).cloned().collect();
+    Ok(SpotifySync {
+        user,
+        playlists,
+        liked: liked_ids,
+        tracks: fetched.into_values().collect(),
+    })
+}
+
+/// Fallback import through the public Web API.
+async fn spotify_sync_web(
+    auth: &SpotifyAuth,
+    api: &SpotifyApi,
+    known: &HashMap<String, String>,
+) -> Result<SpotifySync> {
     let mut token = auth.token().await?;
     let user = match api.me(&token).await {
         Ok(u) => u,
@@ -2219,6 +2490,7 @@ async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<Stri
     };
     let metas = api.playlists(&token).await?;
     let mut playlists = Vec::with_capacity(metas.len());
+    let mut tracks = Vec::new();
     for meta in metas {
         if known.get(&meta.id) == Some(&meta.snapshot_id) && !meta.snapshot_id.is_empty() {
             playlists.push((meta, None));
@@ -2227,7 +2499,10 @@ async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<Stri
         // Tokens last an hour; refresh between playlists for huge libraries.
         token = auth.token().await?;
         match api.playlist_tracks(&token, &meta.id).await {
-            Ok(tracks) => playlists.push((meta, Some(tracks))),
+            Ok(list) => {
+                playlists.push((meta, Some(list.iter().map(|t| t.id.clone()).collect())));
+                tracks.extend(list);
+            }
             Err(e) => {
                 tracing::warn!("skipping playlist {}: {e:#}", meta.name);
                 playlists.push((meta, None));
@@ -2235,6 +2510,8 @@ async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<Stri
         }
     }
     let liked = api.liked_tracks(&auth.token().await?).await?;
+    let liked_ids = liked.iter().map(|t| t.id.clone()).collect();
+    tracks.extend(liked);
     Ok(SpotifySync {
         user: if user.display_name.is_empty() {
             user.id
@@ -2242,8 +2519,20 @@ async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<Stri
             user.display_name
         },
         playlists,
-        liked,
+        liked: liked_ids,
+        tracks,
     })
+}
+
+/// Turns Web API errors into something actionable.
+fn friendly_spotify_error(e: &anyhow::Error) -> String {
+    if spotify_api::error_status(e) == Some(429) || format!("{e:#}").contains("429") {
+        "Spotify's shared Web API key is rate limited right now. For reliable search, add your own \
+         Spotify app in Settings → Spotify → Advanced."
+            .into()
+    } else {
+        format!("{e:#}")
+    }
 }
 
 /// Finds a playable version of an imported (Apple Music) song on Spotify or SoundCloud.

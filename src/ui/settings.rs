@@ -17,6 +17,7 @@ pub struct SettingsState {
     new_folder: String,
     import_path: String,
     show_spotify_advanced: bool,
+    devices_requested: bool,
 }
 
 fn expand_home(s: &str) -> PathBuf {
@@ -131,8 +132,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 status(ui, &cx.feed.spotify);
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let logged_in = matches!(cx.feed.spotify, AccountStatus::Connected(_) | AccountStatus::Working(_));
-                    if logged_in {
+                    if cx.feed.spotify_logged_in {
                         if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync playlists")).clicked() {
                             cx.actions.push(Action::Cmd(Command::SyncSpotify));
                         }
@@ -154,22 +154,46 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                             for b in [96u16, 160, 320] {
                                 ui.selectable_value(&mut cfg.spotify.bitrate, b, format!("{b} kbps"));
                             }
+                            ui.add_enabled(false, egui::Button::selectable(false, "Lossless (FLAC)")).on_disabled_hover_text(
+                                "Spotify only sends its lossless FLAC streams to the official Spotify apps. \
+                                 Third-party players (librespot) get 320 kbps Ogg Vorbis at most.",
+                            );
                         });
                     ui.checkbox(&mut cfg.spotify.normalisation, "Normalize volume");
                 });
                 ui.checkbox(&mut cfg.spotify.cache_audio, "Cache audio on disk (saves bandwidth, up to 2 GB)");
                 ui.collapsing("Advanced", |ui| {
                     st.show_spotify_advanced = true;
-                    text_field(ui, "Client ID", &mut cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID, false);
+                    ui.label(RichText::new("Your own Spotify app (recommended for search)").strong());
+                    hint(
+                        ui,
+                        "Your playlists import through Medley's direct Spotify connection. Search and syncing likes use \
+                         Spotify's Web API, whose shared key is often rate limited (HTTP 429). Fix it with a free app: \
+                         developer.spotify.com → Dashboard → Create app, redirect URI http://127.0.0.1:8899/login, \
+                         tick \"Web API\", then paste its Client ID here and click Authorize.",
+                    );
+                    text_field(ui, "Client ID", &mut cfg.spotify.web_api_client_id, "e.g. 1a2b3c4d5e6f…", false);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Redirect port").color(TEXT_DIM));
+                        ui.add(egui::DragValue::new(&mut cfg.spotify.web_api_redirect_port).range(1024..=65535));
+                        let saved = !cfg.spotify.web_api_client_id.trim().is_empty();
+                        if ui.add_enabled(saved, egui::Button::new(theme::ic(icon::SIGN_IN, "Authorize"))).clicked() {
+                            cx.actions.push(Action::Cmd(Command::SpotifyWebApiLogin));
+                        }
+                    });
+                    status(ui, &cx.feed.spotify_web_api);
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Login client").strong());
+                    text_field(ui, "Login client ID", &mut cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID, false);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Login redirect port").color(TEXT_DIM));
                         ui.add(egui::DragValue::new(&mut cfg.spotify.redirect_port).range(1024..=65535));
                         if ui.button("Reset").clicked() {
                             cfg.spotify.client_id = SPOTIFY_DEFAULT_CLIENT_ID.into();
                             cfg.spotify.redirect_port = 8898;
                         }
                     });
-                    hint(ui, "Use your own developer app (redirect URI http://127.0.0.1:<port>/login) if the shared client gets rate limited.");
+                    hint(ui, "Leave the login client on Spotify's own ID: playback only works with it.");
                 });
             });
 
@@ -264,8 +288,47 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.checkbox(&mut cfg.lyrics.enabled, "Show lyrics");
                 ui.checkbox(&mut cfg.lyrics.online, "Fetch lyrics from LRCLIB when there are no local lyrics");
                 text_field(ui, "mpv binary", &mut cfg.playback.mpv_path, "mpv", false);
-                text_field(ui, "Audio device (mpv, optional)", &mut cfg.playback.audio_device, "auto — e.g. pipewire/alsa_output…", false);
-                hint(ui, "Local files and SoundCloud play through mpv; Spotify plays through librespot.");
+                if !st.devices_requested {
+                    st.devices_requested = true;
+                    cx.actions.push(Action::Cmd(Command::ListAudioDevices));
+                }
+                ui.label(RichText::new("Output device (local files & SoundCloud)").color(TEXT_DIM));
+                ui.horizontal(|ui| {
+                    let current = cfg.playback.audio_device.clone();
+                    let shown = if current.is_empty() {
+                        "Automatic".to_string()
+                    } else {
+                        cx.feed
+                            .audio_devices
+                            .iter()
+                            .find(|(id, _)| *id == current)
+                            .map(|(_, d)| d.clone())
+                            .unwrap_or(current)
+                    };
+                    egui::ComboBox::from_id_salt("audio-device")
+                        .width(ui.available_width() - 90.0)
+                        .selected_text(shown)
+                        .truncate()
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut cfg.playback.audio_device, String::new(), "Automatic");
+                            for (id, desc) in cx.feed.audio_devices.iter().filter(|(id, _)| id != "auto") {
+                                ui.selectable_value(&mut cfg.playback.audio_device, id.clone(), format!("{desc}  —  {id}"));
+                            }
+                        });
+                    if ui.button("Refresh").clicked() {
+                        cx.actions.push(Action::Cmd(Command::ListAudioDevices));
+                    }
+                });
+                ui.add_space(4.0);
+                ui.checkbox(&mut cfg.playback.bit_perfect, "Bit-perfect output for lossless files");
+                hint(
+                    ui,
+                    "Opens the device exclusively and skips ReplayGain so FLAC/ALAC/WAV reach your DAC untouched. \
+                     For true bit-perfect playback pick an \"alsa/hw:…\" device above, keep the volume at 100% and use your \
+                     DAC or amp for volume. Through PipeWire, audio is resampled to PipeWire's rate unless you allow more \
+                     rates (see the README).",
+                );
+                hint(ui, "Local files and SoundCloud play through mpv; Spotify plays through librespot (max 320 kbps Ogg Vorbis).");
             });
 
             // ---------------------------------------------------------- appearance

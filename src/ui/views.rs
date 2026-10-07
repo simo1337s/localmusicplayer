@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use egui::{vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Id, Layout, Margin, Pos2, Rect, Sense, Ui};
+use egui::{vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Layout, Margin, Pos2, Rect, Sense, Ui};
 use egui_phosphor::regular as icon;
 
 use super::panels;
@@ -11,7 +11,7 @@ use super::widgets::{self, text_trunc, TableOpts};
 use super::{Action, Cx, View};
 use crate::library::Album;
 use crate::model::{Playlist, PlaylistKind, Source, Track};
-use crate::service::{AccountStatus, Command, PlayStatus};
+use crate::service::{Command, PlayStatus};
 
 pub struct ViewState<'a> {
     pub view: &'a View,
@@ -764,7 +764,7 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             widgets::track_table(ui, cx, &local, &opts, viewport, origin);
             ui.add_space(16.0);
         }
-        let spotify_on = matches!(cx.feed.spotify, AccountStatus::Connected(_) | AccountStatus::Working(_));
+        let spotify_on = cx.feed.spotify_logged_in;
         if spotify_on {
             widgets::heading_icon(ui, icon::SPOTIFY_LOGO, source_color(Source::Spotify), "Spotify");
             if spotify.is_empty() {
@@ -948,5 +948,18 @@ fn track_titles(ui: &mut Ui, cx: &mut Cx, t: &Track, w: f32) {
     ui.add_space(4.0);
     let source = cx.player.via.as_ref().map(|v| v.source).unwrap_or(t.source);
     widgets::source_badge(ui, source);
-    let _ = Id::new("np");
+    if let Some(q) = &cx.player.quality {
+        ui.horizontal(|ui| {
+            let (r, _) = ui.allocate_exact_size(vec2(w.min(320.0), 20.0), Sense::hover());
+            let used = text_trunc(
+                ui,
+                r.left_top() + vec2(0.0, 2.0),
+                &q.label(),
+                theme::font(12.5),
+                TEXT_DIM,
+                r.width() - 70.0,
+            );
+            widgets::quality_badge(ui, Pos2::new(used.right() + 8.0, used.center().y), q);
+        });
+    }
 }

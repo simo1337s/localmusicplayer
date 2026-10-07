@@ -42,6 +42,8 @@ pub struct MpvOptions {
     pub replaygain: bool,
     pub gapless: bool,
     pub audio_device: String,
+    /// Exclusive device access (bit-perfect with ALSA hw devices).
+    pub exclusive: bool,
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
@@ -85,6 +87,10 @@ impl Mpv {
             .arg(format!("--volume={}", opts.volume.clamp(0.0, 100.0)))
             .arg(format!("--gapless-audio={}", if opts.gapless { "weak" } else { "no" }))
             .arg(format!("--replaygain={}", if opts.replaygain { "track" } else { "no" }))
+            .arg(format!(
+                "--audio-exclusive={}",
+                if opts.exclusive { "yes" } else { "no" }
+            ))
             .arg(format!("--input-ipc-server={}", socket.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -258,6 +264,33 @@ impl Drop for Mpv {
     }
 }
 
+/// Output devices mpv can use, as (id, description). The id goes into `--audio-device`.
+pub async fn list_audio_devices(binary: &str) -> Vec<(String, String)> {
+    let output = Command::new(binary)
+        .arg("--no-config")
+        .arg("--audio-device=help")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    match output {
+        Ok(out) => parse_device_list(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_device_list(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix('\'')?;
+            let (id, desc) = rest.split_once('\'')?;
+            let desc = desc.trim().trim_start_matches('(').trim_end_matches(')').to_string();
+            Some((id.to_string(), desc))
+        })
+        .collect()
+}
+
 const LEAN_FLAGS: &[&str] = &[
     "--osc=no",
     "--load-scripts=no",
@@ -355,6 +388,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_device_list() {
+        let text = "List of detected audio devices:\n  'auto' (Autoselect device)\n  'pipewire' (Default (pipewire))\n  'alsa/hw:CARD=DAC,DEV=0' (USB DAC, USB Audio/Direct hardware device without any conversions)\n";
+        let devices = parse_device_list(text);
+        assert_eq!(devices.len(), 3);
+        assert_eq!(devices[1], ("pipewire".into(), "Default (pipewire".into()));
+        assert_eq!(devices[2].0, "alsa/hw:CARD=DAC,DEV=0");
+        assert!(devices[2].1.starts_with("USB DAC"));
+    }
+
+    #[test]
     fn parses_option_list() {
         let text = "Options:\n\n --osc                            Flag (default: yes)\n --load-scripts                   Flag (default: yes)\n\nTotal: 2 options\n";
         assert_eq!(
@@ -381,6 +424,7 @@ mod tests {
             replaygain: false,
             gapless: true,
             audio_device: String::new(),
+            exclusive: false,
         };
         let mpv = Mpv::spawn(&opts, tx).await.unwrap();
         // Use the null audio output so the test needs no sound card.

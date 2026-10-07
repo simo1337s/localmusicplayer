@@ -320,3 +320,103 @@ mod tests {
         assert_eq!(l.line_at(99999), Some(2));
     }
 }
+
+/// Format details of what's playing, shown as "FLAC · 24-bit / 96 kHz".
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct AudioQuality {
+    pub codec: String,
+    pub lossless: bool,
+    pub bits: Option<u8>,
+    pub sample_rate: Option<u32>,
+    pub bitrate_kbps: Option<u32>,
+}
+
+impl AudioQuality {
+    /// Lossless with more than CD resolution (16-bit / 48 kHz).
+    pub fn hi_res(&self) -> bool {
+        self.lossless && (self.bits.unwrap_or(16) > 16 || self.sample_rate.unwrap_or(44_100) > 48_000)
+    }
+
+    pub fn label(&self) -> String {
+        let mut parts = vec![self.codec.clone()];
+        if self.lossless {
+            let rate = self.sample_rate.map(|r| {
+                let khz = r as f32 / 1000.0;
+                if khz.fract() == 0.0 {
+                    format!("{khz:.0} kHz")
+                } else {
+                    format!("{khz:.1} kHz")
+                }
+            });
+            match (self.bits, rate) {
+                (Some(b), Some(r)) => parts.push(format!("{b}-bit / {r}")),
+                (None, Some(r)) => parts.push(r),
+                (Some(b), None) => parts.push(format!("{b}-bit")),
+                (None, None) => {}
+            }
+        } else if let Some(k) = self.bitrate_kbps.filter(|k| *k > 0) {
+            parts.push(format!("{k} kbps"));
+        }
+        parts.join(" · ")
+    }
+
+    /// Codec names as mpv reports them (`audio-codec-name`).
+    pub fn from_mpv(codec: &str, bitrate_bps: Option<f64>, sample_rate: Option<u32>) -> AudioQuality {
+        let (name, lossless) = match codec {
+            "flac" => ("FLAC", true),
+            "alac" => ("ALAC", true),
+            "ape" => ("APE", true),
+            "wavpack" => ("WavPack", true),
+            "tta" => ("TTA", true),
+            c if c.starts_with("pcm_") => ("PCM", true),
+            "mp3" | "mp3float" => ("MP3", false),
+            "aac" => ("AAC", false),
+            "opus" => ("Opus", false),
+            "vorbis" => ("Ogg Vorbis", false),
+            other => (other, false),
+        };
+        AudioQuality {
+            codec: name.to_string(),
+            lossless,
+            bits: None,
+            sample_rate,
+            bitrate_kbps: bitrate_bps.map(|b| (b / 1000.0).round() as u32),
+        }
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn labels() {
+        let flac = AudioQuality {
+            codec: "FLAC".into(),
+            lossless: true,
+            bits: Some(24),
+            sample_rate: Some(96_000),
+            bitrate_kbps: Some(2900),
+        };
+        assert_eq!(flac.label(), "FLAC · 24-bit / 96 kHz");
+        assert!(flac.hi_res());
+        let cd = AudioQuality {
+            bits: Some(16),
+            sample_rate: Some(44_100),
+            ..flac.clone()
+        };
+        assert_eq!(cd.label(), "FLAC · 16-bit / 44.1 kHz");
+        assert!(!cd.hi_res());
+        let ogg = AudioQuality {
+            codec: "Ogg Vorbis".into(),
+            bitrate_kbps: Some(320),
+            ..Default::default()
+        };
+        assert_eq!(ogg.label(), "Ogg Vorbis · 320 kbps");
+        assert!(AudioQuality::from_mpv("pcm_s24le", None, Some(48_000)).lossless);
+        assert_eq!(
+            AudioQuality::from_mpv("opus", Some(160_000.0), None).label(),
+            "Opus · 160 kbps"
+        );
+    }
+}

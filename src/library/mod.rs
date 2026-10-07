@@ -2,6 +2,7 @@
 
 pub mod db;
 pub mod m3u;
+pub mod quality;
 pub mod scanner;
 
 use std::collections::{HashMap, HashSet};

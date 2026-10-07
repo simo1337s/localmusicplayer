@@ -56,11 +56,26 @@ Everything is under **Settings** (gear icon in the sidebar).
 | Service | What to do |
 | --- | --- |
 | **Local files** | `~/Music` is scanned by default. Add more folders in Settings, or drag a folder onto the window. |
-| **Spotify** | Click **Log in with Spotify**. Your browser opens Spotify's login page; approve it and your playlists and Liked Songs import automatically. Playback needs **Spotify Premium**. If you ever hit rate limits, create your own app at developer.spotify.com (redirect URI `http://127.0.0.1:8898/login`) and paste its client ID under *Advanced*. |
+| **Spotify** | Click **Log in with Spotify**. Your browser opens Spotify's login page; approve it and your playlists and Liked Songs import automatically. The import goes through Medley's own Spotify connection, so it isn't affected by Web API rate limits. Playback needs **Spotify Premium**. **Search** uses Spotify's Web API, whose shared key is often rate limited (HTTP 429). To fix that, create a free app at [developer.spotify.com](https://developer.spotify.com/dashboard) (redirect URI `http://127.0.0.1:8899/login`, tick *Web API*), paste its Client ID under *Settings → Spotify → Advanced*, and click **Authorize**. |
 | **SoundCloud** | Paste your profile URL (`https://soundcloud.com/you`) and click **Sync**. Private likes and playlists also need your `oauth_token` cookie from soundcloud.com (DevTools → Application → Cookies). |
 | **Apple Music** | On a Mac or in iTunes on Windows: *File → Library → Export Library…*, then drop the `Library.xml` onto Medley or paste its path. You can also paste your `media-user-token` cookie from music.apple.com and use *Import with the Apple Music API*. Songs play from local files, Spotify or SoundCloud. |
 | **Last.fm** | Create an API account at [last.fm/api/account/create](https://www.last.fm/api/account/create), paste the key and secret, click **Connect account** and approve in the browser. |
 | **Discord** | Create an application at [discord.com/developers/applications](https://discord.com/developers/applications) (call it "Medley", or anything you like), and paste its **Application ID**. |
+
+## Lossless & hi-res
+
+- Local **FLAC, ALAC, WAV, AIFF, APE and WavPack** play at their native bit depth and sample rate. The player bar shows the format (e.g. `FLAC · 24-bit / 96 kHz`) with a **LOSSLESS** or **HI-RES** badge.
+- **Settings → Playback → Output device** picks the exact output (e.g. your USB DAC). **Bit-perfect output** opens the device exclusively and skips ReplayGain. For true bit-perfect playback, choose an `alsa/hw:…` device, keep Medley's volume at 100% and use your DAC or amp for volume.
+- On **PipeWire**, everything is resampled to PipeWire's rate unless you let it switch rates. Create `~/.config/pipewire/pipewire.conf.d/10-rates.conf`:
+
+  ```
+  context.properties = {
+      default.clock.allowed-rates = [ 44100 48000 88200 96000 176400 192000 ]
+  }
+  ```
+
+  Then run `systemctl --user restart pipewire`.
+- **Spotify lossless isn't possible.** Spotify only streams its FLAC files to the official Spotify apps, so librespot-based players (including Medley) get 320 kbps Ogg Vorbis at most.
 
 ## Keyboard shortcuts
 
@@ -103,6 +118,7 @@ Logs: run `MEDLEY_LOG=medley=debug medley` in a terminal.
 ## Troubleshooting
 
 - **No sound from Spotify on PipeWire**: install `pipewire-alsa`. You can also build with PulseAudio output: `cargo build --release --features pulseaudio` (needs `libpulse`).
+- **Spotify "HTTP 429 Too Many Requests"**: that's the shared Web API key being rate limited. Library import no longer uses it. For search, add your own Spotify app (see *Setting up your accounts*).
 - **Spotify says Premium is required**: playlists and search work on free accounts, but librespot can only stream with Premium.
 - **Some SoundCloud tracks won't play**: SoundCloud Go+ tracks only offer 30-second previews to third-party apps, and some tracks are region-locked.
 - **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. Medley loads a CJK font only when your library needs it.

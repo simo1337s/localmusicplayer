@@ -681,6 +681,29 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
     }
 }
 
+/// "HI-RES" / "LOSSLESS" pill with its left edge centred on `left`. Returns its rect.
+pub fn quality_badge(ui: &Ui, left: Pos2, q: &crate::model::AudioQuality) -> Option<Rect> {
+    if !q.lossless {
+        return None;
+    }
+    let (text, color) = if q.hi_res() {
+        ("HI-RES", Color32::from_rgb(0xf5, 0xc4, 0x51))
+    } else {
+        ("LOSSLESS", Color32::from_rgb(0x4f, 0xd1, 0xc5))
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), theme::bold_font(9.5), color);
+    let rect = Rect::from_min_size(
+        Pos2::new(left.x, left.y - (galley.size().y + 4.0) / 2.0),
+        galley.size() + vec2(10.0, 4.0),
+    );
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(4), theme::with_alpha(color, 38));
+    ui.painter().galley(rect.min + vec2(5.0, 2.0), galley, color);
+    Some(rect)
+}
+
 /// Small source badge "● Spotify".
 pub fn source_badge(ui: &mut Ui, source: Source) {
     ui.horizontal(|ui| {

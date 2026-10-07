@@ -59,17 +59,28 @@ pub struct SpotifyAuth {
 }
 
 impl SpotifyAuth {
+    /// The main login (playback and library import).
     pub fn new(cfg: &SpotifyConfig, dir: &Path) -> SpotifyAuth {
+        Self::with_client(&cfg.client_id, cfg.redirect_port, dir, "oauth.json")
+    }
+
+    /// Login with the user's own developer app, used only for Web API calls.
+    pub fn web_api(cfg: &SpotifyConfig, dir: &Path) -> Option<SpotifyAuth> {
+        let id = cfg.web_api_client_id.trim();
+        (!id.is_empty()).then(|| Self::with_client(id, cfg.web_api_redirect_port, dir, "oauth-webapi.json"))
+    }
+
+    pub fn with_client(client_id: &str, port: u16, dir: &Path, file_name: &str) -> SpotifyAuth {
         let _ = std::fs::create_dir_all(dir);
-        let file = dir.join("oauth.json");
+        let file = dir.join(file_name);
         let refresh = std::fs::read_to_string(&file)
             .ok()
             .and_then(|s| serde_json::from_str::<StoredToken>(&s).ok())
-            .filter(|t| t.client_id == cfg.client_id)
+            .filter(|t| t.client_id == client_id)
             .map(|t| t.refresh_token);
         SpotifyAuth {
-            client_id: cfg.client_id.clone(),
-            redirect_uri: format!("http://127.0.0.1:{}/login", cfg.redirect_port),
+            client_id: client_id.to_string(),
+            redirect_uri: format!("http://127.0.0.1:{port}/login"),
             file,
             state: Mutex::new(AuthState { access: None, refresh }),
             refresh_lock: tokio::sync::Mutex::new(()),
@@ -306,6 +317,11 @@ impl SpotifyEngine {
     pub fn shutdown(&self) {
         self.player.stop();
         self.session.shutdown();
+    }
+
+    /// The live session, if it's still connected (used for library import).
+    pub fn session(&self) -> Option<Session> {
+        (!self.session.is_invalid()).then(|| self.session.clone())
     }
 }
 

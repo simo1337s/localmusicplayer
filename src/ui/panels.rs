@@ -275,14 +275,27 @@ fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
         theme::icon_font(12.5),
         src_color,
     );
-    text_trunc(
+    let mut line = format!("{prefix}{}", src.label());
+    if let Some(q) = &cx.player.quality {
+        line.push_str(" · ");
+        line.push_str(&q.label());
+    }
+    let badge_w = if cx.player.quality.as_ref().is_some_and(|q| q.lossless) {
+        66.0
+    } else {
+        0.0
+    };
+    let used = text_trunc(
         ui,
         Pos2::new(x + 17.0, y),
-        &format!("{prefix}{}", src.label()),
+        &line,
         theme::font(11.5),
         src_color,
-        w - 17.0,
+        w - 17.0 - badge_w,
     );
+    if let Some(q) = &cx.player.quality {
+        widgets::quality_badge(ui, Pos2::new(used.right() + 6.0, used.center().y), q);
+    }
 
     // Like button.
     let liked = cx.lib.is_liked(&t.id);
