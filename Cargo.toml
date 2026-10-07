@@ -1,0 +1,51 @@
+[package]
+name = "medley"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, lightweight, native music player for local files, Spotify and SoundCloud"
+license = "MIT"
+rust-version = "1.85"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.36"
+egui-phosphor = "0.14"
+librespot-core = { version = "0.8", default-features = false, features = ["native-tls"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "native-tls"] }
+librespot-oauth = { version = "0.8", default-features = false, features = ["native-tls"] }
+lofty = "0.25"
+rusqlite = { version = "0.40", features = ["bundled"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "http2", "charset", "gzip", "json", "form", "query"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process", "fs"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+walkdir = "2"
+plist = "1"
+directories = "6"
+md-5 = "0.11"
+regex = "1"
+toml = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+discord-rich-presence = "1"
+souvlaki = { version = "0.8", default-features = false, features = ["use_zbus"] }
+rand = "0.9"
+open = "5"
+urlencoding = "2"
+
+[features]
+default = []
+# Use PulseAudio (pipewire-pulse) instead of ALSA (pipewire-alsa) for Spotify output
+pulseaudio = ["librespot-playback/pulseaudio-backend"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+[profile.dev.package."*"]
+opt-level = 2
