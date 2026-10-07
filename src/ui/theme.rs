@@ -86,6 +86,24 @@ pub fn bold_font(size: f32) -> FontId {
 }
 
 /// Mixes `a` towards `b` by `t` (0..1).
+/// Uploads the bundled logo once at startup.
+pub fn load_logo(ctx: &egui::Context) -> egui::TextureHandle {
+    let img = image::load_from_memory(include_bytes!("../../assets/icon-64.png"))
+        .expect("bundled logo is a valid PNG")
+        .to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    let color = egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw());
+    ctx.load_texture("multimusic-logo", color, egui::TextureOptions::LINEAR)
+}
+
+/// The logo at `size` points, as a widget.
+pub fn logo(ui: &mut egui::Ui, texture: egui::TextureId, size: f32) -> egui::Response {
+    ui.add(egui::Image::from_texture(egui::load::SizedTexture::new(
+        texture,
+        egui::vec2(size, size),
+    )))
+}
+
 /// Soft drop shadow under artwork.
 pub fn art_shadow(ui: &egui::Ui, rect: egui::Rect, radius: u8) {
     let shadow = Shadow {

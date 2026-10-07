@@ -162,16 +162,44 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.checkbox(&mut cfg.spotify.normalisation, "Normalize volume");
                 });
                 ui.checkbox(&mut cfg.spotify.cache_audio, "Cache audio on disk (saves bandwidth, up to 2 GB)");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Audio output").color(TEXT_DIM));
+                    let label = |v: &str| match v {
+                        "pulseaudio" => "PipeWire / PulseAudio",
+                        "alsa" => "ALSA",
+                        _ => "Automatic",
+                    };
+                    egui::ComboBox::from_id_salt("spotify-output")
+                        .selected_text(label(&cfg.spotify.audio_output))
+                        .show_ui(ui, |ui| {
+                            for v in ["auto", "pulseaudio", "alsa"] {
+                                ui.selectable_value(&mut cfg.spotify.audio_output, v.to_string(), label(v));
+                            }
+                        });
+                });
+                hint(
+                    ui,
+                    "Automatic uses PipeWire/PulseAudio when it's running (it follows your system's output device). \
+                     A change takes effect the next time Spotify playback starts (or after restarting MultiMusic).",
+                );
                 ui.collapsing("Advanced", |ui| {
                     st.show_spotify_advanced = true;
                     ui.label(RichText::new("Your own Spotify app (recommended for search)").strong());
                     hint(
                         ui,
-                        "Your playlists import through Medley's direct Spotify connection. Search and syncing likes use \
+                        "Your playlists import through MultiMusic's direct Spotify connection. Search and syncing likes use \
                          Spotify's Web API, whose shared key is often rate limited (HTTP 429). Fix it with a free app: \
-                         developer.spotify.com → Dashboard → Create app, redirect URI http://127.0.0.1:8899/login, \
-                         tick \"Web API\", then paste its Client ID here and click Authorize.",
+                         developer.spotify.com → Dashboard → Create app → tick \"Web API\" and add this exact \
+                         Redirect URI (then Save):",
                     );
+                    let redirect = crate::player::oauth::redirect_uri(cfg.spotify.web_api_redirect_port);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Label::new(RichText::new(&redirect).monospace().color(TEXT)).selectable(true));
+                        if ui.small_button(theme::ic(icon::COPY, "Copy")).clicked() {
+                            ui.ctx().copy_text(redirect.clone());
+                        }
+                    });
+                    hint(ui, "Then paste the app's Client ID below and click Authorize.");
                     text_field(ui, "Client ID", &mut cfg.spotify.web_api_client_id, "e.g. 1a2b3c4d5e6f…", false);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Redirect port").color(TEXT_DIM));
@@ -215,7 +243,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
             section(ui, icon::APPLE_LOGO, source_color(Source::AppleMusic), "Apple Music", |ui| {
                 hint(
                     ui,
-                    "Apple Music streams are DRM-protected and can't play on Linux. Medley imports your library and \
+                    "Apple Music streams are DRM-protected and can't play on Linux. MultiMusic imports your library and \
                      playlists, then plays each song from your local files, Spotify or SoundCloud.",
                 );
                 ui.add_space(6.0);
@@ -276,7 +304,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.checkbox(&mut cfg.discord.song_as_activity_name, "Show the song title as \"Listening to …\"");
                 hint(
                     ui,
-                    "Create a free app at discord.com/developers/applications (name it e.g. \"Medley\") and paste its \
+                    "Create a free app at discord.com/developers/applications (name it e.g. \"MultiMusic\") and paste its \
                      Application ID. Works with the Discord desktop app, Vesktop and arRPC.",
                 );
             });
@@ -353,8 +381,15 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
             });
 
             // ---------------------------------------------------------- about
-            section(ui, icon::WAVEFORM, cx.accent, "About", |ui| {
-                ui.label(format!("Medley {}", env!("CARGO_PKG_VERSION")));
+            section(ui, icon::INFO, TEXT_DIM, "About", |ui| {
+                ui.horizontal(|ui| {
+                    theme::logo(ui, cx.logo, 40.0);
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("MultiMusic").font(theme::bold_font(18.0)));
+                        ui.label(RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION"))).color(TEXT_DIM));
+                    });
+                });
+                ui.add_space(4.0);
                 ui.label(RichText::new(format!("Memory in use: {rss_mb:.0} MB (mpv runs as a separate process)")).color(TEXT_DIM));
                 ui.label(RichText::new(format!("Config: {}", paths.config_file().display())).color(TEXT_FAINT).small());
                 ui.label(RichText::new(format!("Data: {}", paths.data_dir.display())).color(TEXT_FAINT).small());

@@ -1,4 +1,6 @@
-# Medley
+<p align="center"><img src="assets/icon-256.png" width="128" alt="MultiMusic logo"></p>
+
+# MultiMusic
 
 A fast, lightweight, native music player for Arch Linux that puts **your local files, Spotify, SoundCloud and your Apple Music library** in one place, with **synced lyrics**, **Discord Rich Presence**, **Last.fm scrobbling** and media-key / MPRIS support.
 
@@ -16,7 +18,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
   - **Local files**: MP3, FLAC, Opus, OGG, M4A/ALAC, WAV, AIFF, APE, WavPack and more. Tags and embedded or folder cover art are read automatically, and rescans are incremental.
   - **Spotify**: imports all your playlists and Liked Songs and plays them in the app through [librespot](https://github.com/librespot-org/librespot) (Spotify Premium is needed for playback). Gapless playback, 96/160/320 kbps, volume normalisation.
   - **SoundCloud**: imports your likes and playlists (your own and liked ones), searches the catalogue and plays streams.
-  - **Apple Music**: imports your library and playlists from a `Library.xml` export or the Apple Music API. Apple Music streams are DRM-protected and can't play on Linux, so each song plays from a matching local file, Spotify track or SoundCloud upload. Medley finds the match automatically and remembers it.
+  - **Apple Music**: imports your library and playlists from a `Library.xml` export or the Apple Music API. Apple Music streams are DRM-protected and can't play on Linux, so each song plays from a matching local file, Spotify track or SoundCloud upload. MultiMusic finds the match automatically and remembers it.
   - **M3U/M3U8** playlist import and export.
 - **Custom playlists that mix sources**: drop a Spotify song, a SoundCloud upload and a FLAC into the same playlist. A cross-source **Liked Songs** collection (♥) also syncs likes back to Spotify and Last.fm.
 - **Synced lyrics**: reads `.lrc` files next to your music, then embedded lyrics tags, then [LRCLIB](https://lrclib.net). Lyrics are shown in a side panel and in a full-screen *Now playing* view with a large cover. Click a line to jump to it.
@@ -32,22 +34,21 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 sudo pacman -S --needed base-devel git rust mpv
 git clone https://github.com/simo1337s/localmusicplayer.git
 cd localmusicplayer
-makepkg -si          # builds and installs the `medley` package
+makepkg -si          # builds and installs the `multimusic` package
 ```
 
-Then launch **Medley** from your app launcher, or run `medley`.
+Then launch **MultiMusic** from your app launcher, or run `multimusic`.
 
 Optional extras:
 
 ```sh
-sudo pacman -S pipewire-alsa noto-fonts-cjk inter-font
+sudo pacman -S noto-fonts-cjk inter-font
 ```
 
-- `pipewire-alsa`: Spotify output on PipeWire systems.
 - `noto-fonts-cjk`: Japanese, Chinese and Korean titles.
-- `inter-font`: a nicer UI font. Medley uses Inter, Noto Sans, Cantarell or DejaVu, whichever is installed.
+- `inter-font`: a nicer UI font. MultiMusic uses Inter, Noto Sans, Cantarell or DejaVu, whichever is installed.
 
-To run without packaging: `cargo build --release && ./target/release/medley`.
+To run without packaging: `cargo build --release && ./target/release/multimusic`.
 
 ## Setting up your accounts
 
@@ -56,16 +57,16 @@ Everything is under **Settings** (gear icon in the sidebar).
 | Service | What to do |
 | --- | --- |
 | **Local files** | `~/Music` is scanned by default. Add more folders in Settings, or drag a folder onto the window. |
-| **Spotify** | Click **Log in with Spotify**. Your browser opens Spotify's login page; approve it and your playlists and Liked Songs import automatically. The import goes through Medley's own Spotify connection, so it isn't affected by Web API rate limits. Playback needs **Spotify Premium**. **Search** uses Spotify's Web API, whose shared key is often rate limited (HTTP 429). To fix that, create a free app at [developer.spotify.com](https://developer.spotify.com/dashboard) (redirect URI `http://127.0.0.1:8899/login`, tick *Web API*), paste its Client ID under *Settings → Spotify → Advanced*, and click **Authorize**. |
+| **Spotify** | Click **Log in with Spotify**. Your browser opens Spotify's login page; approve it and your playlists and Liked Songs import automatically. The import goes through MultiMusic's own Spotify connection, so it isn't affected by Web API rate limits. Playback needs **Spotify Premium**. **Search** uses Spotify's Web API, whose shared key is often rate limited (HTTP 429). To fix that, create a free app at [developer.spotify.com](https://developer.spotify.com/dashboard) (tick *Web API* and add the redirect URI **exactly** as `http://127.0.0.1:8899/login`; Settings shows it with a Copy button), paste its Client ID under *Settings → Spotify → Advanced*, and click **Authorize**. |
 | **SoundCloud** | Paste your profile URL (`https://soundcloud.com/you`) and click **Sync**. Private likes and playlists also need your `oauth_token` cookie from soundcloud.com (DevTools → Application → Cookies). |
-| **Apple Music** | On a Mac or in iTunes on Windows: *File → Library → Export Library…*, then drop the `Library.xml` onto Medley or paste its path. You can also paste your `media-user-token` cookie from music.apple.com and use *Import with the Apple Music API*. Songs play from local files, Spotify or SoundCloud. |
+| **Apple Music** | On a Mac or in iTunes on Windows: *File → Library → Export Library…*, then drop the `Library.xml` onto MultiMusic or paste its path. You can also paste your `media-user-token` cookie from music.apple.com and use *Import with the Apple Music API*. Songs play from local files, Spotify or SoundCloud. |
 | **Last.fm** | Create an API account at [last.fm/api/account/create](https://www.last.fm/api/account/create), paste the key and secret, click **Connect account** and approve in the browser. |
-| **Discord** | Create an application at [discord.com/developers/applications](https://discord.com/developers/applications) (call it "Medley", or anything you like), and paste its **Application ID**. |
+| **Discord** | Create an application at [discord.com/developers/applications](https://discord.com/developers/applications) (call it "MultiMusic", or anything you like), and paste its **Application ID**. |
 
 ## Lossless & hi-res
 
 - Local **FLAC, ALAC, WAV, AIFF, APE and WavPack** play at their native bit depth and sample rate. The player bar shows the format (e.g. `FLAC · 24-bit / 96 kHz`) with a **LOSSLESS** or **HI-RES** badge.
-- **Settings → Playback → Output device** picks the exact output (e.g. your USB DAC). **Bit-perfect output** opens the device exclusively and skips ReplayGain. For true bit-perfect playback, choose an `alsa/hw:…` device, keep Medley's volume at 100% and use your DAC or amp for volume.
+- **Settings → Playback → Output device** picks the exact output (e.g. your USB DAC). **Bit-perfect output** opens the device exclusively and skips ReplayGain. For true bit-perfect playback, choose an `alsa/hw:…` device, keep MultiMusic's volume at 100% and use your DAC or amp for volume.
 - On **PipeWire**, everything is resampled to PipeWire's rate unless you let it switch rates. Create `~/.config/pipewire/pipewire.conf.d/10-rates.conf`:
 
   ```
@@ -75,7 +76,7 @@ Everything is under **Settings** (gear icon in the sidebar).
   ```
 
   Then run `systemctl --user restart pipewire`.
-- **Spotify lossless isn't possible.** Spotify only streams its FLAC files to the official Spotify apps, so librespot-based players (including Medley) get 320 kbps Ogg Vorbis at most.
+- **Spotify lossless isn't possible.** Spotify only streams its FLAC files to the official Spotify apps, so librespot-based players (including MultiMusic) get 320 kbps Ogg Vorbis at most.
 
 ## Keyboard shortcuts
 
@@ -98,10 +99,10 @@ I measured this in a VM while a local song was playing, with the album view and 
 
 | Process | Resident memory |
 | --- | --- |
-| `medley` | ~157 MB in total, but ~66 MB of that is the VM's *software* OpenGL renderer (llvmpipe). Expect roughly **~90 MB** with a real GPU. I estimated that figure and haven't measured it on real hardware. |
+| `multimusic` | ~157 MB in total, but ~66 MB of that is the VM's *software* OpenGL renderer (llvmpipe). Expect roughly **~90 MB** with a real GPU. I estimated that figure and haven't measured it on real hardware. |
 | `mpv` (playback of local files & SoundCloud) | ~54 MB RSS, of which only ~13 MB is private; the rest is shared ffmpeg libraries. It only runs while you play local files or SoundCloud. |
 
-Spotify playback runs inside the Medley process (librespot) and doesn't start another process. The official Spotify client usually uses 400–800 MB.
+Spotify playback runs inside the MultiMusic process (librespot) and doesn't start another process. The official Spotify client usually uses 400–800 MB.
 
 To keep memory low: lower *Covers kept in memory* in Settings → Appearance, and close the lyrics panel (it repaints 10× per second while playing, compared with twice per second otherwise).
 
@@ -109,20 +110,22 @@ To keep memory low: lower *Covers kept in memory* in Settings → Appearance, an
 
 | What | Where |
 | --- | --- |
-| Settings | `~/.config/medley/config.toml` (also editable by hand) |
-| Library database, Spotify login, scrobble queue | `~/.local/share/medley/` |
-| Cover art and lyrics cache | `~/.cache/medley/` |
+| Settings | `~/.config/multimusic/config.toml` (also editable by hand) |
+| Library database, Spotify login, scrobble queue | `~/.local/share/multimusic/` |
+| Cover art and lyrics cache | `~/.cache/multimusic/` |
 
-Logs: run `MEDLEY_LOG=medley=debug medley` in a terminal.
+Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 
 ## Troubleshooting
 
-- **No sound from Spotify on PipeWire**: install `pipewire-alsa`. You can also build with PulseAudio output: `cargo build --release --features pulseaudio` (needs `libpulse`).
+- **No sound from Spotify**: Spotify plays through PipeWire/PulseAudio (`pipewire-pulse`) and follows your default output device. If you use plain ALSA without a sound server, set *Settings → Spotify → Audio output* to ALSA.
+- **Spotify login says "redirect_uri: Not matching configuration"**: the redirect URI registered in your own Spotify app must match exactly, e.g. `http://127.0.0.1:8899/login` (use `127.0.0.1`, not `localhost`), and you have to click Save in the Spotify dashboard. A login you abandon times out after 5 minutes; clicking Log in / Authorize again restarts it right away.
+- **Upgrading from Medley**: your settings, library and logins move to the new `multimusic` folders automatically on first start.
 - **Spotify "HTTP 429 Too Many Requests"**: that's the shared Web API key being rate limited. Library import no longer uses it. For search, add your own Spotify app (see *Setting up your accounts*).
 - **Spotify says Premium is required**: playlists and search work on free accounts, but librespot can only stream with Premium.
 - **Some SoundCloud tracks won't play**: SoundCloud Go+ tracks only offer 30-second previews to third-party apps, and some tracks are region-locked.
-- **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. Medley loads a CJK font only when your library needs it.
-- **Media keys don't work**: Medley registers as `org.mpris.MediaPlayer2.medley`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has.
+- **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. MultiMusic loads a CJK font only when your library needs it.
+- **Media keys don't work**: MultiMusic registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has.
 - **Interface too small or too large**: Settings → Appearance → *Interface scale*.
 
 ## How it works
@@ -142,7 +145,7 @@ The UI thread only draws. Playback, network and disk work run on a small tokio r
 
 ## Disclaimer
 
-Medley is an unofficial client and isn't affiliated with Spotify, SoundCloud, Apple or Discord. Spotify support uses librespot. Use the integrations in line with each service's terms.
+MultiMusic is an unofficial client and isn't affiliated with Spotify, SoundCloud, Apple or Discord. Spotify support uses librespot. Use the integrations in line with each service's terms.
 
 ## License
 

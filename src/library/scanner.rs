@@ -228,7 +228,7 @@ mod tests {
 
     #[test]
     fn scan_finds_new_and_removed_files() {
-        let dir = std::env::temp_dir().join(format!("medley-scan-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("multimusic-scan-test-{}", std::process::id()));
         let album = dir.join("Artist").join("Album");
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("01 Song.mp3"), b"not really audio").unwrap();

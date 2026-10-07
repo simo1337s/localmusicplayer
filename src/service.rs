@@ -295,6 +295,8 @@ enum Internal {
         quality: Option<AudioQuality>,
     },
     AudioDevices(Vec<(String, String)>),
+    /// Status text while the Spotify library syncs.
+    SyncProgress(String),
 }
 
 struct SpotifySync {
@@ -387,7 +389,7 @@ pub fn start(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let tx = cmd_tx.clone();
     let handle = std::thread::Builder::new()
-        .name("medley-service".into())
+        .name("multimusic-service".into())
         .spawn(move || {
             rt.block_on(async move {
                 match Service::new(shared.clone(), paths, cfg, tx) {
@@ -1786,7 +1788,11 @@ impl Service {
         let web = self.web_auth().map(|a| (a, self.spotify_api.clone()));
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
-            let r = match spotify_sync_internal(session, known).await {
+            let progress_tx = tx.clone();
+            let progress = move |text: String| {
+                let _ = progress_tx.send(Internal::SyncProgress(text));
+            };
+            let r = match spotify_sync_internal(session, known, progress).await {
                 Ok(sync) => Ok(sync),
                 Err(e) => {
                     tracing::warn!("Spotify library import via session failed: {e:#}; trying the Web API");
@@ -2083,7 +2089,7 @@ impl Service {
         };
         self.set_account(
             |f| &mut f.lastfm,
-            AccountStatus::Working("Approve Medley in your browser…".into()),
+            AccountStatus::Working("Approve MultiMusic in your browser…".into()),
         );
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -2383,6 +2389,11 @@ impl Service {
                     self.publish_player();
                 }
             }
+            Internal::SyncProgress(text) => {
+                if self.spotify_syncing {
+                    self.set_account(|f| &mut f.spotify, AccountStatus::Working(text));
+                }
+            }
             Internal::AudioDevices(devices) => {
                 self.shared.feed.write().unwrap().audio_devices = devices;
                 self.shared.repaint();
@@ -2422,21 +2433,52 @@ fn make_lastfm(cfg: &Config, http: &reqwest::Client, paths: &Paths) -> Option<Ar
 async fn spotify_sync_internal(
     session: librespot_core::session::Session,
     known: HashSet<String>,
+    progress: impl Fn(String),
 ) -> Result<SpotifySync> {
     use crate::providers::spotify_internal as si;
-    let user = si::display_name(&session).await;
-    let ids = si::rootlist(&session).await?;
-    let mut lists = Vec::with_capacity(ids.len());
-    for id in &ids {
-        match si::playlist(&session, id).await {
-            Ok(p) => lists.push(p),
-            Err(e) => tracing::warn!("skipping Spotify playlist {id}: {e:#}"),
+    use futures_util::StreamExt;
+
+    /// Spotify requests that hang shouldn't stall the sync forever.
+    async fn timed<T>(what: &str, fut: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(Duration::from_secs(45), fut)
+            .await
+            .map_err(|_| anyhow!("timed out {what}"))?
+    }
+
+    progress("Loading your playlists…".into());
+    let user = tokio::time::timeout(Duration::from_secs(15), si::display_name(&session))
+        .await
+        .unwrap_or_else(|_| session.username());
+    let ids = timed("loading your playlists", si::rootlist(&session)).await?;
+    let total = ids.len();
+    let mut lists = Vec::with_capacity(total);
+    {
+        let mut results = futures_util::stream::iter(ids)
+            .map(|id| {
+                let session = session.clone();
+                async move {
+                    let result = timed("loading a playlist", si::playlist(&session, &id)).await;
+                    (id, result)
+                }
+            })
+            .buffered(4);
+        let mut done = 0;
+        while let Some((id, result)) = results.next().await {
+            done += 1;
+            progress(format!("Loading playlists… {done}/{total}"));
+            match result {
+                Ok(p) => lists.push(p),
+                Err(e) => tracing::warn!("skipping Spotify playlist {id}: {e:#}"),
+            }
         }
     }
-    let liked = si::liked(&session).await.unwrap_or_else(|e| {
-        tracing::warn!("Spotify Liked Songs: {e:#}");
-        Vec::new()
-    });
+    progress("Loading Liked Songs…".into());
+    let liked = timed("loading Liked Songs", si::liked(&session))
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!("Spotify Liked Songs: {e:#}");
+            Vec::new()
+        });
 
     let mut need = Vec::new();
     let mut seen = HashSet::new();
@@ -2449,7 +2491,25 @@ async fn spotify_sync_internal(
             need.push(uri.clone());
         }
     }
-    let mut fetched = si::tracks(&session, &need).await?;
+    let mut fetched: HashMap<String, Track> = HashMap::with_capacity(need.len());
+    {
+        let chunks: Vec<Vec<String>> = need.chunks(500).map(|c| c.to_vec()).collect();
+        let mut batches = futures_util::stream::iter(chunks)
+            .map(|chunk| {
+                let session = session.clone();
+                async move {
+                    let result = timed("loading song details", si::tracks(&session, &chunk)).await;
+                    (chunk.len(), result)
+                }
+            })
+            .buffered(2);
+        let mut done = 0;
+        while let Some((n, result)) = batches.next().await {
+            done += n;
+            progress(format!("Loading song details… {done}/{}", need.len()));
+            fetched.extend(result?);
+        }
+    }
     for (uri, at) in &liked {
         if let Some(t) = fetched.get_mut(uri) {
             t.added_at = *at;

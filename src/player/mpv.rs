@@ -61,7 +61,7 @@ impl Mpv {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let name = format!("medley-mpv-{}.sock", std::process::id());
+        let name = format!("multimusic-mpv-{}.sock", std::process::id());
         let mut socket = runtime_dir.join(&name);
         // Unix socket paths are limited to ~108 bytes.
         if socket.as_os_str().len() > 100 {
@@ -78,7 +78,7 @@ impl Mpv {
             .arg("--ytdl=no")
             .arg("--keep-open=no")
             .arg("--prefetch-playlist=yes")
-            .arg("--audio-client-name=Medley")
+            .arg("--audio-client-name=MultiMusic")
             // Cache network streams only; a few MB of demuxer buffer is plenty for audio.
             .arg("--cache=auto")
             .arg("--demuxer-max-bytes=4MiB")
@@ -412,7 +412,7 @@ mod tests {
         if std::process::Command::new("mpv").arg("--version").output().is_err() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("medley-mpv-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("multimusic-mpv-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("tone.wav");
         write_test_wav(&wav, 2.0);

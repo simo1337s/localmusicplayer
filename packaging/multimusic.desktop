@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
-Name=Medley
+Name=MultiMusic
 GenericName=Music Player
 Comment=Local files, Spotify and SoundCloud in one lightweight player
-Exec=medley
-Icon=medley
+Exec=multimusic
+Icon=multimusic
 Terminal=false
 Categories=AudioVideo;Audio;Player;Music;
 Keywords=music;player;spotify;soundcloud;apple music;lyrics;mp3;flac;
-StartupWMClass=medley
+StartupWMClass=multimusic

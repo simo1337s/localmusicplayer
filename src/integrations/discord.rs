@@ -189,7 +189,7 @@ fn build_activity(p: &Presence, song_as_name: bool) -> Activity<'_> {
     if let Some(art) = t.art.as_deref().filter(|a| a.starts_with("https://")) {
         assets = assets.large_image(art.to_string());
     }
-    assets = assets.small_text(format!("{} · Medley", t.source.label()));
+    assets = assets.small_text(format!("{} · MultiMusic", t.source.label()));
     activity = activity.assets(assets);
 
     if p.playing {

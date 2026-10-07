@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::model::{Source, Track};
+use crate::model::{ArtistHit, Source, Track};
 
 const API_BASE: &str = "https://api.spotify.com/v1";
 
@@ -270,6 +270,49 @@ impl SpotifyApi {
         }
         out.truncate(limit as usize);
         Ok(out)
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// Tracks and artists in one request (keeps rate-limit use low). First page only.
+    pub async fn search_with_artists(
+        &self,
+        token: &str,
+        query: &str,
+        limit: u32,
+    ) -> Result<(Vec<Track>, Vec<ArtistHit>)> {
+        let query = query.trim();
+        let limit = limit.min(MAX_SEARCH_LIMIT);
+        if query.is_empty() || limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let base = format!(
+            "{}/search?type=track,artist&q={}",
+            self.base,
+            urlencoding::encode(query)
+        );
+        let page = match self.get_json(token, &with_param(&base, "limit", limit)).await {
+            Ok(page) => page,
+            Err(e) if error_status(&e) == Some(400) && limit > DEV_MODE_SEARCH_LIMIT => self
+                .get_json(token, &with_param(&base, "limit", DEV_MODE_SEARCH_LIMIT))
+                .await
+                .with_context(|| format!("searching Spotify for {query:?}"))?,
+            Err(e) => return Err(e.context(format!("searching Spotify for {query:?}"))),
+        };
+        let items = |key: &str| {
+            page.get(key)
+                .and_then(|p| p.get("items"))
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
+        let mut tracks: Vec<Track> = Vec::new();
+        for t in items("tracks").iter().filter_map(|t| parse_track(t, None)) {
+            if !tracks.iter().any(|o| o.id == t.id) {
+                tracks.push(t);
+            }
+        }
+        let artists = items("artists").iter().filter_map(parse_artist_hit).collect();
+        Ok((tracks, artists))
     }
 
     /// Save (`liked = true`) or remove a track from the user's Liked Songs.
@@ -658,6 +701,36 @@ pub fn parse_user(v: &Value) -> Option<SpotifyUser> {
         id: id.to_owned(),
         display_name,
         image: v.get("images").and_then(pick_image),
+    })
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// Maps a Web API artist object to a search hit.
+pub fn parse_artist_hit(v: &Value) -> Option<ArtistHit> {
+    let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let name = v.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let followers = v.get("followers").and_then(|f| f.get("total")).and_then(Value::as_u64);
+    let genre = v
+        .get("genres")
+        .and_then(Value::as_array)
+        .and_then(|g| g.first())
+        .and_then(Value::as_str);
+    let subtitle = match (followers, genre) {
+        (Some(n), _) => format!("{} followers", crate::model::human_count(n)),
+        (None, Some(g)) => {
+            let mut c = g.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        }
+        (None, None) => "Artist".into(),
+    };
+    Some(ArtistHit {
+        key: format!("spotify:artist:{id}"),
+        name: name.to_string(),
+        image: v.get("images").and_then(pick_image),
+        source: Source::Spotify,
+        subtitle,
     })
 }
 
@@ -1182,26 +1255,26 @@ mod tests {
     #[test]
     fn user_parsing() {
         let v = json!({
-            "display_name": "Medley User",
-            "external_urls": {"spotify": "https://open.spotify.com/user/medley"},
-            "id": "medley",
+            "display_name": "MultiMusic User",
+            "external_urls": {"spotify": "https://open.spotify.com/user/multimusic"},
+            "id": "multimusic",
             "images": [
                 {"url": "https://i.scdn.co/image/small", "height": 64, "width": 64},
                 {"url": "https://i.scdn.co/image/big", "height": 300, "width": 300}
             ],
             "type": "user",
-            "uri": "spotify:user:medley"
+            "uri": "spotify:user:multimusic"
         });
         assert_eq!(
             parse_user(&v),
             Some(SpotifyUser {
-                id: "medley".into(),
-                display_name: "Medley User".into(),
+                id: "multimusic".into(),
+                display_name: "MultiMusic User".into(),
                 image: Some("https://i.scdn.co/image/big".into()),
             })
         );
-        let v = json!({"id": "medley", "display_name": null, "images": []});
-        assert_eq!(parse_user(&v).unwrap().display_name, "medley");
+        let v = json!({"id": "multimusic", "display_name": null, "images": []});
+        assert_eq!(parse_user(&v).unwrap().display_name, "multimusic");
     }
 
     #[test]
@@ -1651,5 +1724,25 @@ mod tests {
             .map(|p| (p.id.as_str(), p.total, p.owner.as_str()))
             .collect();
         assert_eq!(summary, [("a", 3, "Me"), ("b", 7, "Other")]);
+    }
+
+    #[test]
+    fn artist_hits() {
+        let v = json!({
+            "id": "4tZwfgrHOc3mvqYlEYSvVi",
+            "name": "Daft Punk",
+            "genres": ["filter house", "electro"],
+            "images": [{"url": "https://i.scdn.co/image/big", "width": 640, "height": 640},
+                       {"url": "https://i.scdn.co/image/mid", "width": 320, "height": 320}],
+            "followers": {"total": 9_800_000}
+        });
+        let hit = parse_artist_hit(&v).unwrap();
+        assert_eq!(hit.key, "spotify:artist:4tZwfgrHOc3mvqYlEYSvVi");
+        assert_eq!(hit.image.as_deref(), Some("https://i.scdn.co/image/mid"));
+        assert_eq!(hit.subtitle, "9.8M followers");
+        // Dev-mode responses no longer include followers.
+        let v = json!({"id": "x1", "name": "Somebody", "genres": ["indie pop"], "images": []});
+        assert_eq!(parse_artist_hit(&v).unwrap().subtitle, "Indie pop");
+        assert!(parse_artist_hit(&json!({"id": "", "name": "x"})).is_none());
     }
 }

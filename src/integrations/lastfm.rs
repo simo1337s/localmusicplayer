@@ -574,7 +574,7 @@ mod tests {
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir()
             .join(format!(
-                "medley-lastfm-test-{}-{}",
+                "multimusic-lastfm-test-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)

@@ -32,8 +32,8 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                 // Logo.
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(icon::WAVEFORM).family(theme::icons()).size(24.0).color(cx.accent));
-                    ui.label(egui::RichText::new("Medley").font(theme::bold_font(21.0)));
+                    theme::logo(ui, cx.logo, 28.0);
+                    ui.label(egui::RichText::new("MultiMusic").font(theme::bold_font(21.0)));
                 });
                 ui.add_space(8.0);
                 nav_item(ui, cx, icon::HOUSE, "Home", View::Home, view);
@@ -128,7 +128,7 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                                 }
                             } else if p.kind != PlaylistKind::Liked {
                                 ui.separator();
-                                if ui.button(theme::ic(icon::TRASH, "Remove from Medley")).clicked() {
+                                if ui.button(theme::ic(icon::TRASH, "Remove from MultiMusic")).clicked() {
                                     cx.actions.push(Action::Delete(p.id.clone()));
                                     ui.close();
                                 }

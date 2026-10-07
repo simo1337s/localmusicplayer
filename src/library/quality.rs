@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn reads_wav_quality() {
-        let dir = std::env::temp_dir().join(format!("medley-quality-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("multimusic-quality-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wav = dir.join("t.wav");
         // 24-bit mono 96 kHz, 0.1 s of silence.

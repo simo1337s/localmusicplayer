@@ -11,7 +11,6 @@ use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_core::SpotifyUri;
-use librespot_oauth::OAuthClientBuilder;
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, Bitrate, PlayerConfig};
 use librespot_playback::mixer::{self, Mixer, MixerConfig};
@@ -32,11 +31,6 @@ pub const SCOPES: &[&str] = &[
     "user-library-modify",
 ];
 
-const LOGIN_DONE_PAGE: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Medley</title>
-<style>body{background:#121218;color:#eee;font-family:sans-serif;display:grid;place-items:center;height:100vh;margin:0}
-h1{font-weight:600}p{color:#999}</style></head><body><div><h1>Logged in to Spotify ✓</h1>
-<p>You can close this tab and go back to Medley.</p></div></body></html>"#;
-
 #[derive(Serialize, Deserialize)]
 struct StoredToken {
     client_id: String,
@@ -51,8 +45,10 @@ struct AuthState {
 /// OAuth (PKCE) login and token refresh. The refresh token is stored in the data dir.
 pub struct SpotifyAuth {
     client_id: String,
-    redirect_uri: String,
+    port: u16,
     file: PathBuf,
+    /// The login in progress, aborted (freeing its port) when a new one starts.
+    login_task: Mutex<Option<tokio::task::AbortHandle>>,
     state: Mutex<AuthState>,
     /// Serializes refreshes so parallel requests don't refresh twice.
     refresh_lock: tokio::sync::Mutex<()>,
@@ -80,8 +76,9 @@ impl SpotifyAuth {
             .map(|t| t.refresh_token);
         SpotifyAuth {
             client_id: client_id.to_string(),
-            redirect_uri: format!("http://127.0.0.1:{port}/login"),
+            port,
             file,
+            login_task: Mutex::new(None),
             state: Mutex::new(AuthState { access: None, refresh }),
             refresh_lock: tokio::sync::Mutex::new(()),
         }
@@ -91,32 +88,34 @@ impl SpotifyAuth {
         self.state.lock().unwrap().refresh.is_some()
     }
 
-    fn builder(&self) -> Result<librespot_oauth::OAuthClient> {
-        OAuthClientBuilder::new(&self.client_id, &self.redirect_uri, SCOPES.to_vec())
-            .open_in_browser()
-            .with_custom_message(LOGIN_DONE_PAGE)
-            .build()
-            .map_err(|e| anyhow!("OAuth setup failed: {e}"))
-    }
-
     /// Opens the browser for the Spotify login page and waits for the redirect.
+    /// Starting a new login cancels a previous one that is still waiting.
     pub async fn login(&self) -> Result<String> {
-        let client = self.builder()?;
-        let token = tokio::task::spawn_blocking(move || client.get_access_token())
-            .await?
-            .map_err(|e| anyhow!("Spotify login failed: {e}"))?;
+        let (client_id, port) = (self.client_id.clone(), self.port);
+        let task = tokio::spawn(async move { super::oauth::login(&client_id, port, SCOPES).await });
+        let previous = self.login_task.lock().unwrap().replace(task.abort_handle());
+        if let Some(old) = previous {
+            old.abort();
+            // Give the aborted task a moment to drop its listener.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let token = match task.await {
+            Ok(r) => r.map_err(|e| anyhow!("Spotify login failed: {e:#}"))?,
+            Err(e) if e.is_cancelled() => return Err(anyhow!("Spotify login cancelled")),
+            Err(e) => return Err(anyhow!("Spotify login failed: {e}")),
+        };
         self.store(&token);
         Ok(token.access_token)
     }
 
-    fn store(&self, token: &librespot_oauth::OAuthToken) {
+    fn store(&self, token: &super::oauth::Token) {
         let mut st = self.state.lock().unwrap();
         st.access = Some((token.access_token.clone(), token.expires_at));
-        if !token.refresh_token.is_empty() {
-            st.refresh = Some(token.refresh_token.clone());
+        if let Some(refresh) = token.refresh_token.clone() {
+            st.refresh = Some(refresh.clone());
             let stored = StoredToken {
                 client_id: self.client_id.clone(),
-                refresh_token: token.refresh_token.clone(),
+                refresh_token: refresh,
             };
             if let Ok(text) = serde_json::to_string(&stored) {
                 let _ = std::fs::write(&self.file, text);
@@ -145,11 +144,9 @@ impl SpotifyAuth {
             .refresh
             .clone()
             .ok_or_else(|| anyhow!("not logged in to Spotify"))?;
-        let client = self.builder()?;
-        let token = client
-            .refresh_token_async(&refresh)
+        let token = super::oauth::refresh(&self.client_id, &refresh)
             .await
-            .map_err(|e| anyhow!("Spotify token refresh failed: {e}"))?;
+            .map_err(|e| anyhow!("Spotify token refresh failed: {e:#}"))?;
         self.store(&token);
         Ok(token.access_token)
     }
@@ -220,12 +217,8 @@ impl SpotifyEngine {
             .map_err(|e| anyhow!("mixer: {e}"))?;
         mixer.set_volume(volume_to_u16(volume));
 
-        let backend = if cfg!(feature = "pulseaudio") {
-            audio_backend::find(Some("pulseaudio".into())).or_else(|| audio_backend::find(None))
-        } else {
-            audio_backend::find(None)
-        }
-        .ok_or_else(|| anyhow!("no audio backend compiled in"))?;
+        let (backend_name, backend) = select_backend(&cfg.audio_output)?;
+        tracing::info!("Spotify audio output: {backend_name}");
 
         let player_config = PlayerConfig {
             bitrate: match cfg.bitrate {
@@ -325,6 +318,33 @@ impl SpotifyEngine {
     }
 }
 
+/// Picks librespot's audio output. PipeWire desktops answer on the PulseAudio socket
+/// (pipewire-pulse), which follows the system's default output device; plain ALSA may
+/// point at another card (e.g. HDMI) when pipewire-alsa isn't installed.
+fn select_backend(pref: &str) -> Result<(&'static str, audio_backend::SinkBuilder)> {
+    let order: &[&'static str] = match pref {
+        "alsa" => &["rodio", "pulseaudio"],
+        "pulseaudio" => &["pulseaudio", "rodio"],
+        _ if pulse_server_available() => &["pulseaudio", "rodio"],
+        _ => &["rodio", "pulseaudio"],
+    };
+    order
+        .iter()
+        .find_map(|name| audio_backend::find(Some((*name).to_string())).map(|b| (*name, b)))
+        .or_else(|| audio_backend::find(None).map(|b| ("default", b)))
+        .ok_or_else(|| anyhow!("no audio output compiled in"))
+}
+
+/// True if a PulseAudio-compatible server (PulseAudio or pipewire-pulse) is listening.
+pub fn pulse_server_available() -> bool {
+    if std::env::var_os("PULSE_SERVER").is_some() {
+        return true;
+    }
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|d| Path::new(&d).join("pulse").join("native").exists())
+        .unwrap_or(false)
+}
+
 async fn new_session(auth: &SpotifyAuth, cache: &Cache) -> Result<Session> {
     // Reusable credentials from a previous login avoid an OAuth round trip.
     if let Some(creds) = cache.credentials() {
@@ -350,4 +370,37 @@ fn volume_to_u16(volume: f32) -> u16 {
 /// Removes stored librespot credentials (used on logout).
 pub fn clear_credentials(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("credentials.json"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use librespot_playback::convert::Converter;
+    use librespot_playback::decoder::AudioPacket;
+
+    #[test]
+    fn explicit_output_choice_wins() {
+        assert_eq!(select_backend("alsa").unwrap().0, "rodio");
+        #[cfg(feature = "pulseaudio")]
+        assert_eq!(select_backend("pulseaudio").unwrap().0, "pulseaudio");
+    }
+
+    /// Plays half a second of a tone through the PulseAudio/PipeWire output if a server runs.
+    #[cfg(feature = "pulseaudio")]
+    #[test]
+    fn pulse_output_plays_when_server_present() {
+        if !pulse_server_available() {
+            return;
+        }
+        let (name, builder) = select_backend("auto").unwrap();
+        assert_eq!(name, "pulseaudio");
+        let mut sink = builder(None, AudioFormat::default());
+        let mut converter = Converter::new(None);
+        sink.start().unwrap();
+        let samples: Vec<f64> = (0..44_100)
+            .map(|i| ((i / 2) as f64 * 440.0 * std::f64::consts::TAU / 44_100.0).sin() * 0.1)
+            .collect();
+        sink.write(AudioPacket::Samples(samples), &mut converter).unwrap();
+        sink.stop().unwrap();
+    }
 }

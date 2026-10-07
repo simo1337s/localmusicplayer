@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn export_then_parse() {
         let dir = std::env::temp_dir();
-        let file = dir.join(format!("medley-test-{}.m3u", std::process::id()));
+        let file = dir.join(format!("multimusic-test-{}.m3u", std::process::id()));
         let t = Track {
             id: "local:/x/y.flac".into(),
             source: Source::Local,

@@ -1,5 +1,5 @@
 /target
 /pkg
-/src/medley-*
+/src/multimusic-*
 *.pkg.tar.zst
 /.claude/worktrees/

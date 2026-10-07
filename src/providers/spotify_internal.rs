@@ -159,9 +159,9 @@ pub async fn liked(session: &Session) -> Result<Vec<(String, i64)>> {
     Ok(out)
 }
 
-/// Fetches metadata for `spotify:track:` URIs in batches.
-pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String, Track>> {
-    let mut out = HashMap::with_capacity(uris.len());
+/// Raw extended-metadata payloads for many URIs, in batches.
+async fn fetch_batch(session: &Session, uris: &[String], kind: ExtensionKind) -> Result<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(uris.len());
     for chunk in uris.chunks(METADATA_BATCH) {
         let request = BatchedEntityRequest {
             entity_request: chunk
@@ -169,7 +169,7 @@ pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String
                 .map(|uri| EntityRequest {
                     entity_uri: uri.clone(),
                     query: vec![ExtensionQuery {
-                        extension_kind: EnumOrUnknown::new(ExtensionKind::TRACK_V4),
+                        extension_kind: EnumOrUnknown::new(kind),
                         ..Default::default()
                     }],
                     ..Default::default()
@@ -181,22 +181,179 @@ pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String
             .spclient()
             .get_extended_metadata(request)
             .await
-            .map_err(|e| anyhow!("loading track details: {e}"))?;
+            .map_err(|e| anyhow!("loading details from Spotify: {e}"))?;
         for array in response.extended_metadata.iter() {
             for data in array.extension_data.iter() {
-                let Some(any) = data.extension_data.as_ref() else {
-                    continue;
-                };
-                let Ok(track) = metadata::Track::parse_from_bytes(&any.value) else {
-                    continue;
-                };
-                if let Some(t) = convert_track(&data.entity_uri, &track) {
-                    out.insert(t.id.clone(), t);
+                if let Some(any) = data.extension_data.as_ref() {
+                    out.push((data.entity_uri.clone(), any.value.clone()));
                 }
             }
         }
     }
     Ok(out)
+}
+
+/// Fetches metadata for `spotify:track:` URIs in batches.
+pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String, Track>> {
+    let mut out = HashMap::with_capacity(uris.len());
+    for (uri, bytes) in fetch_batch(session, uris, ExtensionKind::TRACK_V4).await? {
+        let Ok(track) = metadata::Track::parse_from_bytes(&bytes) else {
+            continue;
+        };
+        if let Some(t) = convert_track(&uri, &track) {
+            out.insert(t.id.clone(), t);
+        }
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// Header and tracks of an artist / album / playlist page.
+pub struct PageData {
+    pub title: String,
+    pub subtitle: String,
+    pub image: Option<String>,
+    pub tracks: Vec<Track>,
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// Tracks for `uris`, in that order, skipping anything without metadata.
+async fn ordered_tracks(session: &Session, uris: &[String]) -> Result<Vec<Track>> {
+    let mut seen = std::collections::HashSet::new();
+    let unique: Vec<String> = uris
+        .iter()
+        .filter(|u| u.starts_with("spotify:track:") && seen.insert(u.as_str()))
+        .cloned()
+        .collect();
+    let mut map = tracks(session, &unique).await?;
+    Ok(unique.iter().filter_map(|u| map.remove(u)).collect())
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+fn gid_uri(kind: &str, gid: &[u8]) -> Option<String> {
+    let id = librespot_core::SpotifyId::from_raw(gid).ok()?.to_base62().ok()?;
+    Some(format!("spotify:{kind}:{id}"))
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+fn pick_image<'a>(group: &'a [metadata::Image], fallback: &'a [metadata::Image]) -> Option<String> {
+    let imgs = if group.is_empty() { fallback } else { group };
+    imgs.iter()
+        .find(|i| i.size() == metadata::image::Size::LARGE)
+        .or_else(|| imgs.iter().find(|i| i.size() == metadata::image::Size::DEFAULT))
+        .or_else(|| imgs.first())
+        .map(|i| image_url(i.file_id()))
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// An artist's popular tracks followed by tracks of their latest releases.
+pub async fn artist_page(session: &Session, id: &str) -> Result<PageData> {
+    let uri = format!("spotify:artist:{id}");
+    let (_, bytes) = fetch_batch(session, std::slice::from_ref(&uri), ExtensionKind::ARTIST_V4)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("Spotify returned nothing for this artist"))?;
+    let artist = metadata::Artist::parse_from_bytes(&bytes).context("parsing artist")?;
+    let country = session.country();
+    let top = artist
+        .top_track
+        .iter()
+        .find(|t| t.country() == country)
+        .or_else(|| artist.top_track.first());
+    let mut uris: Vec<String> = top
+        .map(|t| t.track.iter().filter_map(|t| gid_uri("track", t.gid())).collect())
+        .unwrap_or_default();
+
+    // Then the most recent albums and singles (Spotify lists them newest first).
+    let album_uris: Vec<String> = artist
+        .album_group
+        .iter()
+        .take(6)
+        .chain(artist.single_group.iter().take(6))
+        .filter_map(|g| g.album.first())
+        .filter_map(|a| gid_uri("album", a.gid()))
+        .collect();
+    if !album_uris.is_empty() {
+        for (_, bytes) in fetch_batch(session, &album_uris, ExtensionKind::ALBUM_V4)
+            .await
+            .unwrap_or_default()
+        {
+            if let Ok(album) = metadata::Album::parse_from_bytes(&bytes) {
+                uris.extend(
+                    album
+                        .disc
+                        .iter()
+                        .flat_map(|d| d.track.iter())
+                        .filter_map(|t| gid_uri("track", t.gid())),
+                );
+            }
+        }
+    }
+    uris.truncate(400);
+    let tracks = ordered_tracks(session, &uris).await?;
+    Ok(PageData {
+        title: artist.name().to_string(),
+        subtitle: format!("Artist · {} songs", tracks.len()),
+        image: pick_image(&artist.portrait_group.image, &artist.portrait),
+        tracks,
+    })
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+pub async fn album_page(session: &Session, id: &str) -> Result<PageData> {
+    let uri = format!("spotify:album:{id}");
+    let (_, bytes) = fetch_batch(session, std::slice::from_ref(&uri), ExtensionKind::ALBUM_V4)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("Spotify returned nothing for this album"))?;
+    let album = metadata::Album::parse_from_bytes(&bytes).context("parsing album")?;
+    let uris: Vec<String> = album
+        .disc
+        .iter()
+        .flat_map(|d| d.track.iter())
+        .filter_map(|t| gid_uri("track", t.gid()))
+        .collect();
+    let tracks = ordered_tracks(session, &uris).await?;
+    let artists = album.artist.iter().map(|a| a.name()).collect::<Vec<_>>().join(", ");
+    Ok(PageData {
+        title: album.name().to_string(),
+        subtitle: format!("Album · {artists} · {} songs", tracks.len()),
+        image: pick_image(&album.cover_group.image, &album.cover),
+        tracks,
+    })
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+pub async fn playlist_page(session: &Session, id: &str) -> Result<PageData> {
+    let list = playlist(session, id).await?;
+    let uris: Vec<String> = list.items.iter().map(|(u, _)| u.clone()).collect();
+    let tracks = ordered_tracks(session, &uris).await?;
+    let mut subtitle = format!("Playlist · {} songs", tracks.len());
+    if !list.meta.owner.is_empty() {
+        subtitle = format!("Playlist · {} · {} songs", list.meta.owner, tracks.len());
+    }
+    Ok(PageData {
+        title: list.meta.name,
+        subtitle,
+        image: list.meta.art.or_else(|| tracks.iter().find_map(|t| t.art.clone())),
+        tracks,
+    })
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+pub async fn track_page(session: &Session, id: &str) -> Result<PageData> {
+    let tracks = ordered_tracks(session, &[format!("spotify:track:{id}")]).await?;
+    let t = tracks
+        .first()
+        .ok_or_else(|| anyhow!("Spotify returned nothing for this track"))?;
+    Ok(PageData {
+        title: t.title.clone(),
+        subtitle: format!("Song · {}", t.artist),
+        image: t.art.clone(),
+        tracks,
+    })
 }
 
 /// The user's display name, falling back to the username.

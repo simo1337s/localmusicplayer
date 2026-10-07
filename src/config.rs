@@ -1,4 +1,4 @@
-//! User configuration (`~/.config/medley/config.toml`) and XDG paths.
+//! User configuration (`~/.config/multimusic/config.toml`) and XDG paths.
 
 use std::path::{Path, PathBuf};
 
@@ -96,8 +96,10 @@ pub struct SpotifyConfig {
     pub web_api_client_id: String,
     /// Redirect port registered for `web_api_client_id` (http://127.0.0.1:<port>/login).
     pub web_api_redirect_port: u16,
-    /// Keep downloaded audio in ~/.cache/medley/spotify (uses disk, saves bandwidth).
+    /// Keep downloaded audio in ~/.cache/multimusic/spotify (uses disk, saves bandwidth).
     pub cache_audio: bool,
+    /// Spotify audio output: "auto" (PipeWire/PulseAudio when available), "pulseaudio" or "alsa".
+    pub audio_output: String,
 }
 
 impl Default for SpotifyConfig {
@@ -111,6 +113,7 @@ impl Default for SpotifyConfig {
             web_api_client_id: String::new(),
             web_api_redirect_port: 8899,
             cache_audio: false,
+            audio_output: "auto".into(),
         }
     }
 }
@@ -233,7 +236,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Self {
-        let dirs = directories::ProjectDirs::from("", "", "medley");
+        let dirs = directories::ProjectDirs::from("", "", "multimusic");
         let (config_dir, data_dir, cache_dir) = match dirs {
             Some(d) => (
                 d.config_dir().to_path_buf(),
@@ -241,10 +244,16 @@ impl Paths {
                 d.cache_dir().to_path_buf(),
             ),
             None => {
-                let base = std::env::temp_dir().join("medley");
+                let base = std::env::temp_dir().join("multimusic");
                 (base.join("config"), base.join("data"), base.join("cache"))
             }
         };
+        // The app used to be called Medley: carry its settings, library and logins over.
+        if let Some(old) = directories::ProjectDirs::from("", "", "medley") {
+            migrate_dir(old.config_dir(), &config_dir);
+            migrate_dir(old.data_dir(), &data_dir);
+            migrate_dir(old.cache_dir(), &cache_dir);
+        }
         for d in [&config_dir, &data_dir, &cache_dir] {
             let _ = std::fs::create_dir_all(d);
         }
@@ -273,6 +282,20 @@ impl Paths {
 
     pub fn lyrics_cache(&self) -> PathBuf {
         self.cache_dir.join("lyrics")
+    }
+}
+
+/// Moves `old` to `new` if `new` doesn't exist yet.
+fn migrate_dir(old: &Path, new: &Path) {
+    if !old.is_dir() || new.exists() {
+        return;
+    }
+    if let Some(parent) = new.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::rename(old, new) {
+        Ok(()) => tracing::info!("moved {} to {}", old.display(), new.display()),
+        Err(e) => tracing::warn!("could not move {} to {}: {e}", old.display(), new.display()),
     }
 }
 
@@ -320,6 +343,24 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migrates_old_directory_once() {
+        let base = std::env::temp_dir().join(format!("multimusic-migrate-{}", std::process::id()));
+        let old = base.join("medley");
+        let new = base.join("multimusic");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("library.db"), b"x").unwrap();
+        migrate_dir(&old, &new);
+        assert!(new.join("library.db").exists());
+        assert!(!old.exists());
+        // An existing new directory is never overwritten.
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("library.db"), b"old").unwrap();
+        migrate_dir(&old, &new);
+        assert_eq!(std::fs::read(new.join("library.db")).unwrap(), b"x");
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[test]
     fn config_roundtrip() {

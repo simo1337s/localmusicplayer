@@ -22,7 +22,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::model::{ImportedPlaylist, Source, Track};
+use crate::model::{ArtistHit, ImportedPlaylist, Source, Track};
 
 const API_BASE: &str = "https://api-v2.soundcloud.com";
 const WEB_BASE: &str = "https://soundcloud.com/";
@@ -54,6 +54,16 @@ pub struct ScUser {
     /// Avatar URL (500x500), `None` for the default avatar.
     pub avatar: Option<String>,
     pub permalink_url: String,
+    pub followers: Option<u64>,
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// What a soundcloud.com URL points at.
+#[derive(Debug, Clone)]
+pub enum ScResolved {
+    User(ScUser),
+    Track(Track),
+    Playlist(ImportedPlaylist),
 }
 
 /// SoundCloud api-v2 client. Cheap to share behind an `Arc`; all methods take `&self`.
@@ -251,6 +261,98 @@ impl SoundCloud {
             .await
             .with_context(|| format!("SoundCloud search for \"{query}\" failed"))?;
         Ok(items.iter().filter_map(parse_track).collect())
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// Artists / users matching `query`.
+    pub async fn search_users(&self, query: &str, limit: usize) -> Result<Vec<ArtistHit>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit_s = limit.min(50).to_string();
+        let v = self
+            .get_json(&api("/search/users"), &[("q", query), ("limit", limit_s.as_str())])
+            .await
+            .with_context(|| format!("SoundCloud artist search for \"{query}\" failed"))?;
+        Ok(v.get("collection")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(parse_user).map(|u| artist_hit(&u)).collect())
+            .unwrap_or_default())
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// One user by numeric id.
+    pub async fn user(&self, id: u64) -> Result<ScUser> {
+        let v = self
+            .get_json(&api(&format!("/users/{id}")), &[])
+            .await
+            .with_context(|| format!("couldn't load SoundCloud user {id}"))?;
+        parse_user(&v).context("unexpected SoundCloud user response")
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// A user's popular tracks first, then the rest of their uploads (newest first).
+    pub async fn user_tracks(&self, id: u64) -> Result<Vec<Track>> {
+        let top_url = api(&format!("/users/{id}/toptracks"));
+        let uploads_url = api(&format!("/users/{id}/tracks"));
+        let (top, uploads) = tokio::join!(
+            self.get_json(&top_url, &[("limit", "20")]),
+            self.paginate(&uploads_url, &[("limit", "100"), ("linked_partitioning", "1")], 300),
+        );
+        let top: Vec<Track> = top
+            .ok()
+            .and_then(|v| v.get("collection").and_then(Value::as_array).cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(parse_track)
+            .collect();
+        let uploads: Vec<Track> = uploads
+            .with_context(|| format!("couldn't load tracks of SoundCloud user {id}"))?
+            .iter()
+            .filter_map(parse_track)
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        Ok(top
+            .into_iter()
+            .chain(uploads)
+            .filter(|t| seen.insert(t.id.clone()))
+            .collect())
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// Resolves any soundcloud.com URL (profile, track or playlist/album).
+    pub async fn resolve_url(&self, url: &str) -> Result<ScResolved> {
+        let v = self
+            .get_json(&api("/resolve"), &[("url", url)])
+            .await
+            .with_context(|| format!("couldn't open {url} on SoundCloud"))?;
+        match v.get("kind").and_then(Value::as_str) {
+            Some("user") => Ok(ScResolved::User(parse_user(&v).context("unexpected user response")?)),
+            Some("track") => Ok(ScResolved::Track(parse_track(&v).context("unexpected track response")?)),
+            Some("playlist") | Some("system-playlist") => {
+                let mut cache = HashMap::new();
+                Ok(ScResolved::Playlist(self.load_playlist(v, &mut cache).await?))
+            }
+            other => bail!("{url} isn't a SoundCloud profile, track or playlist ({other:?})"),
+        }
+    }
+
+    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+    /// Seeds the client_id cache (e.g. from disk) so the first request doesn't need to scrape.
+    /// A seeded id that gets rejected is re-scraped right away.
+    pub async fn seed_client_id(&self, id: &str) {
+        let id = id.trim();
+        if self.client_id_override.is_some() || id.len() != 32 {
+            return;
+        }
+        let mut cached = self.client_id.lock().await;
+        if cached.is_none() {
+            let old = Instant::now()
+                .checked_sub(MIN_RESCRAPE_INTERVAL * 2)
+                .unwrap_or_else(Instant::now);
+            *cached = Some((id.to_string(), old));
+        }
     }
 
     /// Direct stream URL for mpv. Accepts a Track whose id is "soundcloud:<numeric id>" (uri = permalink URL).
@@ -654,11 +756,26 @@ fn parse_user(v: &Value) -> Option<ScUser> {
         username,
         avatar,
         permalink_url,
+        followers: v.get("followers_count").and_then(Value::as_u64),
     })
 }
 
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// Builds the playlist from its JSON and the (ordered) track ids, looking the tracks up in
 /// `tracks`. Ids that couldn't be loaded are dropped.
+pub fn artist_hit(u: &ScUser) -> ArtistHit {
+    ArtistHit {
+        key: format!("soundcloud:user:{}", u.id),
+        name: u.username.clone(),
+        image: u.avatar.clone(),
+        source: Source::SoundCloud,
+        subtitle: match u.followers {
+            Some(n) => format!("{} followers", crate::model::human_count(n)),
+            None => "SoundCloud artist".into(),
+        },
+    }
+}
+
 fn assemble_playlist(pl: &Value, order: &[u64], tracks: &HashMap<u64, Track>) -> ImportedPlaylist {
     let tracks: Vec<Track> = order.iter().filter_map(|id| tracks.get(id).cloned()).collect();
     let art = non_empty(pl.get("artwork_url"))
@@ -1016,8 +1133,23 @@ mod tests {
                 username: "Forss".into(),
                 avatar: Some("https://i1.sndcdn.com/avatars-000005478225-7ec8jg-t500x500.jpg".into()),
                 permalink_url: "https://soundcloud.com/forss".into(),
+                followers: None,
             }
         );
+        let mut with_followers = full_track_fixture()["user"].clone();
+        with_followers["followers_count"] = serde_json::json!(1234);
+        assert_eq!(parse_user(&with_followers).unwrap().followers, Some(1234));
+    }
+
+    #[test]
+    fn artist_hits_from_users() {
+        let mut v = full_track_fixture()["user"].clone();
+        v["followers_count"] = serde_json::json!(2_500_000);
+        let hit = artist_hit(&parse_user(&v).unwrap());
+        assert_eq!(hit.key, "soundcloud:user:183");
+        assert_eq!(hit.name, "Forss");
+        assert_eq!(hit.subtitle, "2.5M followers");
+        assert_eq!(hit.source, Source::SoundCloud);
     }
 
     #[test]

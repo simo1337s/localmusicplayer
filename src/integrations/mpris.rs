@@ -18,8 +18,8 @@ pub struct Mpris {
 impl Mpris {
     pub fn new(commands: UnboundedSender<Command>) -> Mpris {
         let config = PlatformConfig {
-            display_name: "Medley",
-            dbus_name: "medley",
+            display_name: "MultiMusic",
+            dbus_name: "multimusic",
             hwnd: None,
         };
         let controls = session_bus_available()

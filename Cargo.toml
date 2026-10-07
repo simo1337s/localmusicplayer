@@ -1,5 +1,5 @@
 [package]
-name = "medley"
+name = "multimusic"
 version = "0.1.0"
 edition = "2021"
 description = "A fast, lightweight, native music player for local files, Spotify and SoundCloud"
@@ -12,7 +12,6 @@ egui = "0.36"
 egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
 librespot-core = { version = "0.8", default-features = false, features = ["native-tls"] }
 librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "native-tls"] }
-librespot-oauth = { version = "0.8", default-features = false, features = ["native-tls"] }
 librespot-protocol = "0.8"
 protobuf = "3"
 http = "1"
@@ -39,10 +38,14 @@ open = "5"
 urlencoding = "2"
 libc = "0.2"
 memmap2 = "0.9"
+sha2 = "0.10"
+base64 = "0.22"
+futures-util = "0.3"
 
 [features]
-default = []
-# Use PulseAudio (pipewire-pulse) instead of ALSA (pipewire-alsa) for Spotify output
+default = ["pulseaudio"]
+# Spotify output through PulseAudio / PipeWire (pipewire-pulse). Without it Spotify
+# plays through ALSA only.
 pulseaudio = ["librespot-playback/pulseaudio-backend"]
 
 [profile.release]

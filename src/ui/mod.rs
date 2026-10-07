@@ -60,6 +60,8 @@ pub struct Cx<'a> {
     pub art: &'a mut ArtCache,
     pub accent: Color32,
     pub actions: &'a mut Vec<Action>,
+    /// The app logo (same artwork as the window and launcher icon).
+    pub logo: egui::TextureId,
 }
 
 enum Dialog {
@@ -76,6 +78,7 @@ pub struct App {
     cfg_changed_at: Option<Instant>,
     paths: Paths,
     art: ArtCache,
+    logo: egui::TextureHandle,
     view: View,
     history: Vec<View>,
     right_tab: RightTab,
@@ -111,6 +114,7 @@ impl App {
         theme::apply_style(&ctx, accent);
         ctx.set_zoom_factor(cfg.ui.scale.clamp(0.6, 2.5));
         let art = ArtCache::new(rt, paths.art_cache(), cfg.ui.art_cache_size);
+        let logo = theme::load_logo(&ctx);
         App {
             shared,
             cmd,
@@ -119,6 +123,7 @@ impl App {
             cfg_changed_at: None,
             paths,
             art,
+            logo,
             view: View::Home,
             history: Vec::new(),
             right_tab: RightTab::Lyrics,
@@ -421,7 +426,7 @@ impl App {
                     ui.label(egui::RichText::new("Delete playlist?").font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
                     ui.label(format!(
-                        "“{name}” will be removed from Medley. Songs stay in your library."
+                        "“{name}” will be removed from MultiMusic. Songs stay in your library."
                     ));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -549,6 +554,7 @@ impl eframe::App for App {
                 art: &mut self.art,
                 accent,
                 actions: &mut actions,
+                logo: self.logo.id(),
             };
 
             panels::player_bar(ui, &mut cx, show_right.then_some(right_tab));

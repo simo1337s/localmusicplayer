@@ -225,6 +225,32 @@ pub struct ImportedPlaylist {
     pub tracks: Vec<Track>,
 }
 
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// An artist (or SoundCloud user) in search results; `key` opens their page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtistHit {
+    /// Page key: `local:artist:<name>`, `soundcloud:user:<id>`, `spotify:artist:<id>`, ...
+    pub key: String,
+    pub name: String,
+    pub image: Option<String>,
+    pub source: Source,
+    pub subtitle: String,
+}
+
+#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
+/// 1234 -> "1.2K", 2500000 -> "2.5M".
+pub fn human_count(n: u64) -> String {
+    let f = |v: f64, unit: &str| {
+        let s = format!("{v:.1}");
+        format!("{}{unit}", s.strip_suffix(".0").unwrap_or(&s))
+    };
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => f(n as f64 / 1_000.0, "K"),
+        _ => f(n as f64 / 1_000_000.0, "M"),
+    }
+}
+
 /// One line of time-synced lyrics.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LyricLine {
@@ -293,6 +319,14 @@ mod tests {
             match_key("The Beatles", "Let It Be - Remastered 2009"),
             match_key("the beatles", "Let It Be")
         );
+    }
+
+    #[test]
+    fn human_counts() {
+        assert_eq!(human_count(999), "999");
+        assert_eq!(human_count(1_234), "1.2K");
+        assert_eq!(human_count(10_000), "10K");
+        assert_eq!(human_count(2_500_000), "2.5M");
     }
 
     #[test]
