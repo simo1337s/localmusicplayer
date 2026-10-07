@@ -2765,7 +2765,7 @@ impl Service {
             ));
         }
         if old.spotify.web_api_client_id != self.cfg.spotify.web_api_client_id
-            || old.spotify.web_api_redirect_port != self.cfg.spotify.web_api_redirect_port
+            || old.spotify.web_api_redirect() != self.cfg.spotify.web_api_redirect()
         {
             self.spotify_web_auth = SpotifyAuth::web_api(&self.cfg.spotify, &self.paths.spotify_dir()).map(Arc::new);
             self.publish_accounts();

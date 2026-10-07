@@ -45,8 +45,9 @@ struct AuthState {
 /// OAuth (PKCE) login and token refresh. The refresh token is stored in the data dir.
 pub struct SpotifyAuth {
     client_id: String,
-    port: u16,
     file: PathBuf,
+    /// Redirect URI registered for `client_id`.
+    redirect: String,
     /// The login in progress, aborted (freeing its port) when a new one starts.
     login_task: Mutex<Option<tokio::task::AbortHandle>>,
     state: Mutex<AuthState>,
@@ -57,16 +58,17 @@ pub struct SpotifyAuth {
 impl SpotifyAuth {
     /// The main login (playback and library import).
     pub fn new(cfg: &SpotifyConfig, dir: &Path) -> SpotifyAuth {
-        Self::with_client(&cfg.client_id, cfg.redirect_port, dir, "oauth.json")
+        let redirect = super::oauth::redirect_uri(cfg.redirect_port);
+        Self::with_client(&cfg.client_id, &redirect, dir, "oauth.json")
     }
 
     /// Login with the user's own developer app, used only for Web API calls.
     pub fn web_api(cfg: &SpotifyConfig, dir: &Path) -> Option<SpotifyAuth> {
         let id = cfg.web_api_client_id.trim();
-        (!id.is_empty()).then(|| Self::with_client(id, cfg.web_api_redirect_port, dir, "oauth-webapi.json"))
+        (!id.is_empty()).then(|| Self::with_client(id, &cfg.web_api_redirect(), dir, "oauth-webapi.json"))
     }
 
-    pub fn with_client(client_id: &str, port: u16, dir: &Path, file_name: &str) -> SpotifyAuth {
+    pub fn with_client(client_id: &str, redirect: &str, dir: &Path, file_name: &str) -> SpotifyAuth {
         let _ = std::fs::create_dir_all(dir);
         let file = dir.join(file_name);
         let refresh = std::fs::read_to_string(&file)
@@ -76,7 +78,7 @@ impl SpotifyAuth {
             .map(|t| t.refresh_token);
         SpotifyAuth {
             client_id: client_id.to_string(),
-            port,
+            redirect: redirect.to_string(),
             file,
             login_task: Mutex::new(None),
             state: Mutex::new(AuthState { access: None, refresh }),
@@ -91,8 +93,8 @@ impl SpotifyAuth {
     /// Opens the browser for the Spotify login page and waits for the redirect.
     /// Starting a new login cancels a previous one that is still waiting.
     pub async fn login(&self) -> Result<String> {
-        let (client_id, port) = (self.client_id.clone(), self.port);
-        let task = tokio::spawn(async move { super::oauth::login(&client_id, port, SCOPES).await });
+        let (client_id, redirect) = (self.client_id.clone(), self.redirect.clone());
+        let task = tokio::spawn(async move { super::oauth::login(&client_id, &redirect, SCOPES).await });
         let previous = self.login_task.lock().unwrap().replace(task.abort_handle());
         if let Some(old) = previous {
             old.abort();

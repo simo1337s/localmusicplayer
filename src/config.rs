@@ -101,11 +101,25 @@ pub struct SpotifyConfig {
     /// (search, likes). The shared default client id is often rate limited.
     pub web_api_client_id: String,
     /// Redirect port registered for `web_api_client_id` (http://127.0.0.1:<port>/login).
+    /// Only used when `web_api_redirect_uri` is empty.
     pub web_api_redirect_port: u16,
+    /// The exact Redirect URI registered in the user's Spotify app, e.g.
+    /// `http://127.0.0.1:8899/callback`. Empty = `http://127.0.0.1:<web_api_redirect_port>/login`.
+    pub web_api_redirect_uri: String,
     /// Keep downloaded audio in ~/.cache/multimusic/spotify (uses disk, saves bandwidth).
     pub cache_audio: bool,
     /// Spotify audio output: "auto" (PipeWire/PulseAudio when available), "pulseaudio" or "alsa".
     pub audio_output: String,
+}
+
+impl SpotifyConfig {
+    /// Redirect URI used when authorizing the user's own Spotify app.
+    pub fn web_api_redirect(&self) -> String {
+        match self.web_api_redirect_uri.trim() {
+            "" => crate::player::oauth::redirect_uri(self.web_api_redirect_port),
+            uri => uri.to_string(),
+        }
+    }
 }
 
 impl Default for SpotifyConfig {
@@ -118,6 +132,7 @@ impl Default for SpotifyConfig {
             redirect_port: 8898,
             web_api_client_id: String::new(),
             web_api_redirect_port: 8899,
+            web_api_redirect_uri: String::new(),
             cache_audio: false,
             audio_output: "auto".into(),
         }
@@ -421,6 +436,16 @@ mod tests {
         assert_eq!(cfg.playback.volume, 30.0);
         assert_eq!(cfg.playback.mpv_path, "mpv");
         assert_eq!(cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID);
+    }
+
+    #[test]
+    fn web_api_redirect_defaults_to_the_port() {
+        let mut cfg = SpotifyConfig::default();
+        assert_eq!(cfg.web_api_redirect(), "http://127.0.0.1:8899/login");
+        cfg.web_api_redirect_port = 9001;
+        assert_eq!(cfg.web_api_redirect(), "http://127.0.0.1:9001/login");
+        cfg.web_api_redirect_uri = " http://127.0.0.1:8888/callback ".into();
+        assert_eq!(cfg.web_api_redirect(), "http://127.0.0.1:8888/callback");
     }
 
     #[test]

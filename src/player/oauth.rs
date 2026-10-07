@@ -47,6 +47,67 @@ pub fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}/login")
 }
 
+/// A redirect URI MultiMusic can catch on this computer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Redirect {
+    pub uri: String,
+    pub host: &'static str,
+    pub port: u16,
+    pub path: String,
+}
+
+/// Checks that `uri` is a loopback address with a port (what Spotify allows for desktop apps
+/// and what MultiMusic can listen on), e.g. `http://127.0.0.1:8899/callback`.
+pub fn parse_redirect(uri: &str) -> Result<Redirect> {
+    let uri = uri.trim();
+    let example = "e.g. http://127.0.0.1:8899/login";
+    let Some(rest) = uri.strip_prefix("http://") else {
+        bail!(
+            "the redirect URI must start with http://127.0.0.1:<port>/ so MultiMusic can catch the login ({example})"
+        );
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    let (host, port) = if let Some(port) = authority.strip_prefix("127.0.0.1:") {
+        ("127.0.0.1", port)
+    } else if let Some(port) = authority.strip_prefix("[::1]:") {
+        ("::1", port)
+    } else if authority.starts_with("localhost") {
+        bail!("Spotify no longer accepts \"localhost\" in redirect URIs: use 127.0.0.1 instead, in your Spotify app and here ({example})");
+    } else if authority == "127.0.0.1" || authority == "[::1]" {
+        bail!("add a port to the redirect URI ({example})");
+    } else {
+        bail!("the redirect URI must point to this computer: http://127.0.0.1:<port>/… ({example})");
+    };
+    let port: u16 = port
+        .parse()
+        .ok()
+        .filter(|p| *p >= 1024)
+        .ok_or_else(|| anyhow!("the redirect URI needs a port between 1024 and 65535 ({example})"))?;
+    Ok(Redirect {
+        uri: uri.to_string(),
+        host,
+        port,
+        path: path.to_string(),
+    })
+}
+
+/// True if a request for `requested` reached the redirect `path` (a trailing slash doesn't matter).
+fn same_path(requested: &str, path: &str) -> bool {
+    let norm = |p: &str| {
+        let p = p.trim_end_matches('/');
+        if p.is_empty() {
+            "/".to_string()
+        } else {
+            p.to_string()
+        }
+    };
+    norm(requested) == norm(path)
+}
+
 /// (verifier, S256 challenge)
 pub fn pkce_pair() -> (String, String) {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -68,11 +129,14 @@ pub fn authorize_url(client_id: &str, redirect: &str, scopes: &[&str], challenge
     )
 }
 
-/// Runs the whole browser login and returns the token.
-pub async fn login(client_id: &str, port: u16, scopes: &[&str]) -> Result<Token> {
-    let redirect = redirect_uri(port);
-    let listener = TcpListener::bind(("127.0.0.1", port)).await.map_err(|e| {
-        anyhow!("couldn't listen on 127.0.0.1:{port} for the login redirect ({e}). Is another login window still open?")
+/// Runs the whole browser login and returns the token. `redirect_uri` must be registered
+/// for `client_id` exactly as given.
+pub async fn login(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Result<Token> {
+    let target = parse_redirect(redirect_uri)?;
+    let redirect = target.uri.clone();
+    let (host, port) = (target.host, target.port);
+    let listener = TcpListener::bind((host, port)).await.map_err(|e| {
+        anyhow!("couldn't listen on {host}:{port} for the login redirect ({e}). Is another login window still open?")
     })?;
     let (verifier, challenge) = pkce_pair();
     let state: String = (0..16).map(|_| format!("{:x}", rand::random_range(0..16u8))).collect();
@@ -81,7 +145,7 @@ pub async fn login(client_id: &str, port: u16, scopes: &[&str]) -> Result<Token>
     if open::that_detached(&url).is_err() {
         tracing::warn!("couldn't open a browser; open this URL manually: {url}");
     }
-    let code = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_code(&listener, &state))
+    let code = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_code(&listener, &state, &target.path))
         .await
         .map_err(|_| anyhow!("timed out waiting for the Spotify login to finish in the browser"))??;
     drop(listener);
@@ -135,8 +199,9 @@ async fn request_token(form: &[(&str, &str)]) -> Result<Token> {
     })
 }
 
-/// Accepts connections until the `/login` redirect arrives; returns the authorization code.
-async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
+/// Accepts connections until the redirect to `path` arrives; returns the authorization code.
+async fn wait_for_code(listener: &TcpListener, state: &str, path: &str) -> Result<String> {
+    let expected = path;
     loop {
         let (mut stream, _) = listener.accept().await?;
         let request = match read_request(&mut stream).await {
@@ -149,10 +214,11 @@ async fn wait_for_code(listener: &TcpListener, state: &str) -> Result<String> {
             .and_then(|l| l.split_whitespace().nth(1))
             .unwrap_or("/")
             .to_string();
-        let Some(query) = path.strip_prefix("/login") else {
+        let (requested, query) = path.split_once('?').unwrap_or((path.as_str(), ""));
+        if !same_path(requested, expected) {
             respond(&mut stream, "404 Not Found", "").await;
             continue;
-        };
+        }
         let params = parse_query(query.trim_start_matches('?'));
         let get = |k: &str| params.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
         if let Some(err) = get("error") {
@@ -287,7 +353,7 @@ mod tests {
     async fn catches_redirect() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiter = tokio::spawn(async move { wait_for_code(&listener, "xyz").await });
+        let waiter = tokio::spawn(async move { wait_for_code(&listener, "xyz", "/login").await });
         // A stray request first (favicon), then the redirect.
         for path in ["/favicon.ico", "/login?code=the-code&state=xyz"] {
             let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -301,11 +367,60 @@ mod tests {
         assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
     }
 
+    #[test]
+    fn redirect_uris() {
+        let r = parse_redirect("http://127.0.0.1:8899/login").unwrap();
+        assert_eq!((r.host, r.port, r.path.as_str()), ("127.0.0.1", 8899, "/login"));
+        let r = parse_redirect(" http://127.0.0.1:8888/callback ").unwrap();
+        assert_eq!(
+            (r.port, r.path.as_str(), r.uri.as_str()),
+            (8888, "/callback", "http://127.0.0.1:8888/callback")
+        );
+        assert_eq!(parse_redirect("http://127.0.0.1:9000").unwrap().path, "/");
+        assert_eq!(parse_redirect("http://[::1]:9000/cb").unwrap().host, "::1");
+        for bad in [
+            "http://localhost:8899/login",
+            "https://127.0.0.1:8899/login",
+            "http://127.0.0.1/login",
+            "http://127.0.0.1:80/login",
+            "http://example.com:8899/login",
+            "127.0.0.1:8899/login",
+            "",
+        ] {
+            assert!(parse_redirect(bad).is_err(), "{bad}");
+        }
+        assert!(format!("{:#}", parse_redirect("http://localhost:8899/login").unwrap_err()).contains("127.0.0.1"));
+        assert!(same_path("/callback/", "/callback"));
+        assert!(same_path("/", ""));
+        assert!(!same_path("/login", "/callback"));
+    }
+
+    /// The redirect is caught on whatever path the user's app registered.
+    #[tokio::test]
+    async fn catches_redirect_on_a_custom_path() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(async move { wait_for_code(&listener, "st", "/callback").await });
+        for (path, ok) in [
+            ("/login?code=wrong&state=st", false),
+            ("/callback?code=right&state=st", true),
+        ] {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).await.unwrap();
+            assert_eq!(resp.starts_with("HTTP/1.1 200"), ok, "{resp}");
+        }
+        assert_eq!(waiter.await.unwrap().unwrap(), "right");
+    }
+
     #[tokio::test]
     async fn denied_login_is_an_error() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let waiter = tokio::spawn(async move { wait_for_code(&listener, "s").await });
+        let waiter = tokio::spawn(async move { wait_for_code(&listener, "s", "/login").await });
         let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         s.write_all(b"GET /login?error=access_denied&state=s HTTP/1.1\r\n\r\n")
             .await

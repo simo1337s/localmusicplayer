@@ -185,30 +185,64 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         ui,
                         "Your playlists import through MultiMusic's direct Spotify connection. Search and syncing likes use \
                          Spotify's Web API, whose shared key is often rate limited (HTTP 429). Fix it with a free app: \
-                         developer.spotify.com → Dashboard → Create app → tick \"Web API\" and add this exact \
-                         Redirect URI (then Save):",
+                         developer.spotify.com → Dashboard → Create app → tick \"Web API\" and add a Redirect URI.",
                     );
-                    let redirect = crate::player::oauth::redirect_uri(cfg.spotify.web_api_redirect_port);
+                    ui.add_space(4.0);
+                    ui.label(RichText::new("Redirect URI (must match your app's exactly)").color(TEXT_DIM));
+                    let default_uri = crate::player::oauth::redirect_uri(cfg.spotify.web_api_redirect_port);
                     ui.horizontal(|ui| {
-                        ui.add(egui::Label::new(RichText::new(&redirect).monospace().color(TEXT)).selectable(true));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut cfg.spotify.web_api_redirect_uri)
+                                .hint_text(&default_uri)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(ui.available_width() - 80.0),
+                        );
                         if ui.small_button(theme::ic(icon::COPY, "Copy")).clicked() {
-                            ui.ctx().copy_text(redirect.clone());
+                            ui.ctx().copy_text(cfg.spotify.web_api_redirect());
                         }
                     });
-                    hint(ui, "Then paste the app's Client ID below and click Authorize.");
+                    let redirect_ok = match crate::player::oauth::parse_redirect(&cfg.spotify.web_api_redirect()) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            ui.label(RichText::new(format!("{e}")).size(12.0).color(DANGER));
+                            false
+                        }
+                    };
+                    hint(
+                        ui,
+                        &format!(
+                            "Leave it empty to use {default_uri}, or paste the Redirect URI your app already lists."
+                        ),
+                    );
+                    ui.add_space(4.0);
                     text_field(ui, "Client ID", &mut cfg.spotify.web_api_client_id, "e.g. 1a2b3c4d5e6f…", false);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Redirect port").color(TEXT_DIM));
-                        ui.add(egui::DragValue::new(&mut cfg.spotify.web_api_redirect_port).range(1024..=65535));
-                        let saved = !cfg.spotify.web_api_client_id.trim().is_empty();
-                        if ui.add_enabled(saved, egui::Button::new(theme::ic(icon::SIGN_IN, "Authorize"))).clicked() {
-                            cx.actions.push(Action::Cmd(Command::SpotifyWebApiLogin));
-                        }
-                    });
+                    let ready = !cfg.spotify.web_api_client_id.trim().is_empty() && redirect_ok;
+                    if ui
+                        .add_enabled(ready, egui::Button::new(theme::ic(icon::SIGN_IN, "Authorize")))
+                        .clicked()
+                    {
+                        cx.actions.push(Action::Cmd(Command::SpotifyWebApiLogin));
+                    }
                     status(ui, &cx.feed.spotify_web_api);
+                    hint(
+                        ui,
+                        "If Spotify says \"redirect_uri: Not matching configuration\", your app doesn't list the Redirect URI \
+                         above: on developer.spotify.com open the app → Settings → Edit, add it under Redirect URIs exactly as \
+                         shown (127.0.0.1, not localhost), click Add, then Save at the bottom, and Authorize again.",
+                    );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Login client").strong());
                     text_field(ui, "Login client ID", &mut cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID, false);
+                    if cfg.spotify.client_id.trim() != SPOTIFY_DEFAULT_CLIENT_ID {
+                        ui.label(
+                            RichText::new(
+                                "Playback and library import only work with Spotify's own ID here. Put your own app's \
+                                 Client ID in the field above instead, then click Reset.",
+                            )
+                            .size(12.0)
+                            .color(DANGER),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Login redirect port").color(TEXT_DIM));
                         ui.add(egui::DragValue::new(&mut cfg.spotify.redirect_port).range(1024..=65535));
