@@ -386,8 +386,10 @@ mod tests {
     }
 
     /// Plays half a second of a tone through the PulseAudio/PipeWire output if a server runs.
+    /// Audible, so it only runs on request: `cargo test -- --ignored`.
     #[cfg(feature = "pulseaudio")]
     #[test]
+    #[ignore = "plays a tone through the speakers"]
     fn pulse_output_plays_when_server_present() {
         if !pulse_server_available() {
             return;

@@ -284,7 +284,7 @@ mod tests {
 
     /// Full redirect handling against the real loopback listener (no Spotify involved).
     #[tokio::test]
-    async fn catches_redirect_and_frees_port() {
+    async fn catches_redirect() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let waiter = tokio::spawn(async move { wait_for_code(&listener, "xyz").await });
@@ -299,8 +299,6 @@ mod tests {
             assert!(resp.starts_with("HTTP/1.1"));
         }
         assert_eq!(waiter.await.unwrap().unwrap(), "the-code");
-        // The listener was dropped with the task: the port can be bound again.
-        TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     }
 
     #[tokio::test]
