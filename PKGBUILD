@@ -14,6 +14,9 @@ optdepends=('pipewire-pulse: Spotify output on PipeWire desktops (usually alread
             'noto-fonts-cjk: Japanese, Chinese and Korean song titles'
             'inter-font: nicer interface font'
             'discord: Rich Presence (also works with Vesktop / arRPC)')
+provides=('multimusic')
+conflicts=('medley')
+replaces=('medley')
 options=('!lto' '!debug')
 
 _root() {
