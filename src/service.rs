@@ -313,20 +313,18 @@ pub struct Service {
     last_tick: Instant,
 }
 
-/// Starts the service on a small tokio runtime. Returns the command sender.
-pub fn start(shared: Arc<Shared>, paths: Paths, cfg: Config) -> (UnboundedSender<Command>, std::thread::JoinHandle<()>) {
+/// Starts the service on its own thread, driving futures on `rt`. Returns the command sender.
+pub fn start(
+    rt: tokio::runtime::Handle,
+    shared: Arc<Shared>,
+    paths: Paths,
+    cfg: Config,
+) -> (UnboundedSender<Command>, std::thread::JoinHandle<()>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let tx = cmd_tx.clone();
     let handle = std::thread::Builder::new()
         .name("medley-service".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .max_blocking_threads(4)
-                .thread_name("medley-rt")
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
             rt.block_on(async move {
                 match Service::new(shared.clone(), paths, cfg, tx) {
                     Ok((svc, mpv_rx, sp_rx, int_rx)) => svc.run(cmd_rx, mpv_rx, sp_rx, int_rx).await,
@@ -335,7 +333,6 @@ pub fn start(shared: Arc<Shared>, paths: Paths, cfg: Config) -> (UnboundedSender
                     }
                 }
             });
-            rt.shutdown_timeout(Duration::from_millis(500));
         })
         .expect("spawn service thread");
     (cmd_tx, handle)
@@ -1087,7 +1084,8 @@ impl Service {
         }
         match ev {
             MpvEvent::FileLoaded => {
-                self.set_position(self.resume_position.take().unwrap_or(self.position));
+                let start = self.resume_position.take().unwrap_or(self.position);
+                self.set_position(start);
                 self.status = PlayStatus::Playing;
                 self.on_track_started();
                 self.publish_player();

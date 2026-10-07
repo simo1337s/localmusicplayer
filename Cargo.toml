@@ -9,7 +9,7 @@ rust-version = "1.85"
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 egui = "0.36"
-egui-phosphor = "0.14"
+egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
 librespot-core = { version = "0.8", default-features = false, features = ["native-tls"] }
 librespot-playback = { version = "0.8", default-features = false, features = ["rodio-backend", "native-tls"] }
 librespot-oauth = { version = "0.8", default-features = false, features = ["native-tls"] }
