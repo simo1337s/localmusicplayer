@@ -10,10 +10,12 @@ use super::{Action, Cx, View};
 use crate::library::Album;
 use crate::links;
 use crate::model::{ArtistHit, Playlist, PlaylistKind, Source, Track};
-use crate::service::{Command, PlayStatus};
+use crate::service::{Command, DownloadState, PlayStatus};
 
 pub struct ViewState<'a> {
     pub view: &'a View,
+    /// Where SoundCloud downloads are saved.
+    pub download_dir: &'a std::path::Path,
     /// What's typed in the top bar.
     pub search_text: &'a str,
     pub search_cache: &'a mut (String, u64, Vec<String>),
@@ -32,6 +34,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         View::Artist(key) => library_artist(ui, cx, st, &key),
         View::Page(key) => remote_page(ui, cx, st, &key),
         View::NowPlaying => now_playing(ui, cx),
+        View::Downloads => downloads(ui, cx, st),
         View::Settings => {}
     }
 }
@@ -736,7 +739,10 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
             st,
             &header,
             |ui, r, cx| widgets::playlist_cover(ui, cx.art, p, r, 12),
-            |ui, cx| playlist_actions(ui, cx, p),
+            |ui, cx| {
+                playlist_actions(ui, cx, p);
+                widgets::download_button(ui, cx, &all, 22.0);
+            },
         );
         let tracks = filter(all, st.filter_text);
         if play || shuffle {
@@ -998,6 +1004,7 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
                         tracks: p.tracks.clone(),
                     }));
                 }
+                widgets::download_button(ui, cx, &p.tracks.iter().collect::<Vec<_>>(), 24.0);
                 if let Some(url) = &p.external_url {
                     let tip = format!("Open on {}", service_name(p.source));
                     if widgets::icon_button(ui, icon::ARROW_SQUARE_OUT, 24.0, TEXT_DIM, &tip).clicked() {
@@ -1557,6 +1564,262 @@ fn browse(ui: &mut Ui, cx: &mut Cx) {
 }
 
 // ------------------------------------------------------------------ now playing
+
+// ------------------------------------------------------------------ downloads
+
+/// One line of the Downloads page.
+struct DownloadRow {
+    track: Track,
+    state: DownloadState,
+}
+
+/// SoundCloud downloads: what's going on now, then everything saved earlier.
+fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
+    // This session's downloads: running, waiting, failed, then the newest saved first.
+    let mut rows: Vec<DownloadRow> = Vec::new();
+    let rank = |s: &DownloadState| match s {
+        DownloadState::Running(_) => 0,
+        DownloadState::Queued => 1,
+        DownloadState::Failed(_) => 2,
+        DownloadState::Done { .. } => 3,
+    };
+    for group in 0..4 {
+        let items = cx.feed.downloads.iter().filter(|d| rank(&d.state) == group);
+        let items: Vec<_> = if group == 3 {
+            items.rev().collect()
+        } else {
+            items.collect()
+        };
+        rows.extend(items.into_iter().map(|d| DownloadRow {
+            track: d.track.clone(),
+            state: d.state.clone(),
+        }));
+    }
+    // Earlier downloads, as far as the library still knows the song.
+    let session: std::collections::HashSet<&str> = cx.feed.downloads.iter().map(|d| d.track.id.as_str()).collect();
+    let mut earlier: Vec<DownloadRow> = cx
+        .feed
+        .downloaded
+        .iter()
+        .filter(|(id, _)| !session.contains(id.as_str()))
+        .filter_map(|(id, path)| {
+            let track = cx
+                .lib
+                .get(id)
+                .or_else(|| cx.lib.get(&Track::local_id(&path.to_string_lossy())))?;
+            Some(DownloadRow {
+                track: track.clone(),
+                state: DownloadState::Done {
+                    path: path.clone(),
+                    original: false,
+                },
+            })
+        })
+        .collect();
+    earlier.sort_by_cached_key(|r| (r.track.artist.to_lowercase(), r.track.title.to_lowercase()));
+    let active = rows.iter().filter(|r| r.state.active()).count();
+    let finished = rows.len() - active;
+
+    page(ui, "downloads", |ui, _viewport, _origin| {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Downloads").font(theme::bold_font(30.0)));
+        ui.add_space(4.0);
+        let dir = st.download_dir.to_string_lossy().to_string();
+        let home = directories::BaseDirs::new()
+            .map(|b| b.home_dir().to_string_lossy().to_string())
+            .unwrap_or_default();
+        let shown = match dir.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() => format!("~{rest}"),
+            _ => dir.clone(),
+        };
+        ui.label(egui::RichText::new(format!("SoundCloud songs are saved to {shown}")).color(TEXT_DIM));
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if widgets::pill(ui, "Open folder", HOVER, TEXT).clicked() {
+                let _ = std::fs::create_dir_all(st.download_dir);
+                cx.actions.push(Action::OpenUrl(dir.clone()));
+            }
+            if finished > 0 && widgets::pill(ui, "Clear list", HOVER, TEXT).clicked() {
+                cx.actions.push(Action::Cmd(Command::ClearDownloads));
+            }
+            if widgets::pill(ui, "Change folder", HOVER, TEXT).clicked() {
+                cx.actions.push(Action::Go(View::Settings));
+            }
+        });
+        ui.add_space(18.0);
+
+        if rows.is_empty() && earlier.is_empty() {
+            panels::empty_state(
+                ui,
+                icon::DOWNLOAD_SIMPLE,
+                "Songs you download from SoundCloud show up here",
+            );
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Right-click a SoundCloud song and choose Download, or use the download button on a \
+                         SoundCloud playlist or profile.",
+                    )
+                    .size(12.5)
+                    .color(TEXT_FAINT),
+                );
+            });
+        }
+        if !rows.is_empty() {
+            let title = if active > 0 {
+                format!("Downloading · {active} left")
+            } else {
+                "This session".to_string()
+            };
+            ui.label(egui::RichText::new(title).font(theme::bold_font(18.0)));
+            ui.add_space(6.0);
+            let tracks: Vec<Track> = rows.iter().map(|r| r.track.clone()).collect();
+            for (i, row) in rows.iter().enumerate() {
+                download_row(ui, cx, row, &tracks, i);
+            }
+            ui.add_space(18.0);
+        }
+        if !earlier.is_empty() {
+            ui.label(egui::RichText::new("Downloaded earlier").font(theme::bold_font(18.0)));
+            ui.add_space(6.0);
+            let tracks: Vec<Track> = earlier.iter().map(|r| r.track.clone()).collect();
+            for (i, row) in earlier.iter().enumerate() {
+                download_row(ui, cx, row, &tracks, i);
+            }
+            ui.add_space(18.0);
+        }
+        ui.label(
+            egui::RichText::new(
+                "Only SoundCloud songs can be downloaded: Spotify and Apple Music audio is DRM-protected.",
+            )
+            .size(12.0)
+            .color(TEXT_FAINT),
+        );
+    });
+}
+
+fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i: usize) {
+    const H: f32 = 56.0;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(vec2(w, H), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let t = &row.track;
+    let id = Id::new(("download-row", &t.id));
+    let hovered = ui.rect_contains_pointer(rect) || resp.context_menu_opened();
+    widgets::fade_fill(ui, id, rect, 10, hovered, HOVER);
+    let art = Rect::from_min_size(rect.min + vec2(8.0, (H - 40.0) / 2.0), vec2(40.0, 40.0));
+    widgets::cover(ui, cx.art, t.art.as_deref(), art, 6, widgets::track_fallback(t));
+
+    // The state on the right decides how much room the titles get.
+    let right_w = match row.state {
+        DownloadState::Failed(_) => (w * 0.5).clamp(160.0, 420.0),
+        _ => 220.0_f32.min(w * 0.4),
+    };
+    let tx = art.right() + 12.0;
+    let tw = (rect.right() - right_w - tx - 12.0).max(40.0);
+    text_trunc(
+        ui,
+        Pos2::new(tx, rect.top() + 9.0),
+        &t.title,
+        theme::font(14.5),
+        TEXT,
+        tw,
+    );
+    text_trunc(
+        ui,
+        Pos2::new(tx, rect.top() + 30.0),
+        &t.artist,
+        theme::font(12.5),
+        TEXT_DIM,
+        tw,
+    );
+
+    let right = Rect::from_min_max(
+        Pos2::new(rect.right() - right_w, rect.top()),
+        rect.right_bottom() - vec2(8.0, 0.0),
+    );
+    let painter = ui.painter();
+    let mut button: Option<(&str, &str)> = None;
+    match &row.state {
+        DownloadState::Queued => {
+            painter.text(
+                right.right_center(),
+                Align2::RIGHT_CENTER,
+                "Waiting…",
+                theme::font(13.0),
+                TEXT_FAINT,
+            );
+        }
+        DownloadState::Running(p) => {
+            let bar = Rect::from_min_size(
+                Pos2::new(right.left(), right.center().y - 2.0),
+                vec2(right.width() - 48.0, 4.0),
+            );
+            painter.rect_filled(bar, CornerRadius::same(2), SELECTED);
+            let filled = Rect::from_min_size(bar.min, vec2(bar.width() * p.clamp(0.0, 1.0), bar.height()));
+            painter.rect_filled(filled, CornerRadius::same(2), cx.accent);
+            painter.text(
+                right.right_center(),
+                Align2::RIGHT_CENTER,
+                format!("{:.0}%", p * 100.0),
+                theme::font(13.0),
+                TEXT_DIM,
+            );
+        }
+        DownloadState::Done { original, .. } => {
+            let label = if *original { "Saved · original file" } else { "Saved" };
+            painter.text(
+                right.right_center() - vec2(40.0, 0.0),
+                Align2::RIGHT_CENTER,
+                label,
+                theme::font(13.0),
+                TEXT_DIM,
+            );
+            button = Some((icon::FOLDER_OPEN, "Show in folder"));
+        }
+        DownloadState::Failed(e) => {
+            let used = text_trunc(
+                ui,
+                Pos2::new(right.left(), right.center().y - 8.0),
+                e,
+                theme::font(13.0),
+                DANGER,
+                right.width() - 44.0,
+            );
+            let _ = ui.interact(used, id.with("error"), Sense::hover()).on_hover_text(e);
+            button = Some((icon::ARROW_CLOCKWISE, "Try again"));
+        }
+    }
+    let mut button_clicked = false;
+    if let Some((glyph, tip)) = button {
+        let r = Rect::from_center_size(Pos2::new(right.right() - 14.0, right.center().y), vec2(30.0, 30.0));
+        let b = ui.interact(r, id.with("button"), Sense::click());
+        let color = if b.hovered() { TEXT } else { TEXT_DIM };
+        theme::paint_icon(ui.painter(), r.center(), glyph, theme::icon_font(18.0), color);
+        if b.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip).clicked() {
+            button_clicked = true;
+            match &row.state {
+                DownloadState::Done { path, .. } => {
+                    if let Some(dir) = path.parent() {
+                        cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
+                    }
+                }
+                _ => cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()]))),
+            }
+        }
+    }
+    if resp.double_clicked() && !button_clicked {
+        cx.actions.push(Action::Cmd(Command::Play {
+            tracks: tracks.to_vec(),
+            start: i,
+            context: "Downloads".into(),
+        }));
+    }
+    resp.context_menu(|ui| widgets::track_menu(ui, cx, t, None));
+}
 
 fn now_playing(ui: &mut Ui, cx: &mut Cx) {
     let full = ui.max_rect();

@@ -1,14 +1,12 @@
 //! Settings page.
 
-use std::path::PathBuf;
-
 use egui::{Color32, RichText, Ui};
 use egui_phosphor::regular as icon;
 
 use super::theme::{self, *};
 use super::widgets;
 use super::{Action, Cx};
-use crate::config::{Config, Paths, SPOTIFY_DEFAULT_CLIENT_ID};
+use crate::config::{expand_home, Config, Paths, SPOTIFY_DEFAULT_CLIENT_ID};
 use crate::model::Source;
 use crate::service::{AccountStatus, Command};
 
@@ -18,16 +16,6 @@ pub struct SettingsState {
     import_path: String,
     show_spotify_advanced: bool,
     devices_requested: bool,
-}
-
-fn expand_home(s: &str) -> PathBuf {
-    let s = s.trim();
-    if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = directories::BaseDirs::new() {
-            return home.home_dir().join(rest);
-        }
-    }
-    PathBuf::from(s)
 }
 
 fn section(ui: &mut Ui, glyph: &str, color: Color32, title: &str, add: impl FnOnce(&mut Ui)) {
@@ -267,6 +255,14 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync likes & playlists")).clicked() {
                     cx.actions.push(Action::Cmd(Command::SyncSoundCloud));
                 }
+                ui.add_space(10.0);
+                let default_dir = cfg.default_download_dir().to_string_lossy().into_owned();
+                text_field(ui, "Download folder", &mut cfg.soundcloud.download_folder, &default_dir, false);
+                hint(
+                    ui,
+                    "Downloads are the uploader's original file when they allow it (often WAV or FLAC), otherwise the \
+                     stream SoundCloud plays. Saved inside a library folder, they show up in Local Files too.",
+                );
             });
 
             // ---------------------------------------------------------- apple music

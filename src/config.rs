@@ -149,6 +149,8 @@ pub struct SoundCloudConfig {
     pub oauth_token: String,
     /// Optional API client id override (scraped from soundcloud.com automatically when empty).
     pub client_id: String,
+    /// Where downloaded songs go. Empty = a "SoundCloud" folder in the first library folder.
+    pub download_folder: String,
 }
 
 impl Default for SoundCloudConfig {
@@ -158,6 +160,7 @@ impl Default for SoundCloudConfig {
             profile_url: String::new(),
             oauth_token: String::new(),
             client_id: String::new(),
+            download_folder: String::new(),
         }
     }
 }
@@ -377,6 +380,26 @@ impl Config {
         }
     }
 
+    /// Folder SoundCloud downloads are saved in.
+    pub fn download_dir(&self) -> PathBuf {
+        let custom = self.soundcloud.download_folder.trim();
+        if !custom.is_empty() {
+            return expand_home(custom);
+        }
+        self.default_download_dir()
+    }
+
+    /// A "SoundCloud" folder in the first library folder, so downloads join the library.
+    pub fn default_download_dir(&self) -> PathBuf {
+        self.library
+            .folders
+            .first()
+            .cloned()
+            .or_else(|| Config::default().library.folders.first().cloned())
+            .unwrap_or_else(|| PathBuf::from("Music"))
+            .join("SoundCloud")
+    }
+
     /// Adjusts settings saved by older versions.
     fn upgrade(&mut self) {
         if self.ui.accent == OLD_DEFAULT_ACCENT {
@@ -397,6 +420,17 @@ impl Config {
         }
         std::fs::rename(tmp, file)?;
         Ok(())
+    }
+}
+
+/// `~/x` → `$HOME/x`.
+pub fn expand_home(path: &str) -> PathBuf {
+    let path = path.trim();
+    match path.strip_prefix("~/").or(if path == "~" { Some("") } else { None }) {
+        Some(rest) => directories::BaseDirs::new()
+            .map(|b| b.home_dir().join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
     }
 }
 
@@ -446,6 +480,18 @@ mod tests {
         assert_eq!(cfg.web_api_redirect(), "http://127.0.0.1:9001/login");
         cfg.web_api_redirect_uri = " http://127.0.0.1:8888/callback ".into();
         assert_eq!(cfg.web_api_redirect(), "http://127.0.0.1:8888/callback");
+    }
+
+    #[test]
+    fn download_dir_defaults_to_the_library() {
+        let mut cfg = Config::default();
+        cfg.library.folders = vec![PathBuf::from("/music"), PathBuf::from("/more")];
+        assert_eq!(cfg.download_dir(), PathBuf::from("/music/SoundCloud"));
+        cfg.soundcloud.download_folder = " /data/sc ".into();
+        assert_eq!(cfg.download_dir(), PathBuf::from("/data/sc"));
+        cfg.soundcloud.download_folder = "~/sc".into();
+        assert!(cfg.download_dir().ends_with("sc"));
+        assert!(cfg.download_dir().is_absolute());
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod db;
 pub mod m3u;
 pub mod quality;
 pub mod scanner;
+pub mod tags;
 
 use std::collections::{HashMap, HashSet};
 

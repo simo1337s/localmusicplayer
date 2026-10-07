@@ -8,7 +8,7 @@ use super::widgets::{self, text_trunc, CONTROL};
 use super::{Action, Cx, RightTab, View};
 use crate::library::LIKED_ID;
 use crate::links;
-use crate::model::{PlaylistKind, RepeatMode};
+use crate::model::{PlaylistKind, RepeatMode, Source, Track};
 use crate::service::{Command, PlayStatus};
 
 /// Space around the panels.
@@ -101,6 +101,23 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, size: SidebarSiz
                 st.view,
                 st.collapsed,
             );
+            if !cx.feed.downloads.is_empty() || !cx.feed.downloaded.is_empty() {
+                let left = cx.feed.downloads.iter().filter(|d| d.state.active()).count();
+                let label = if left > 0 {
+                    format!("Downloads · {left}")
+                } else {
+                    "Downloads".to_string()
+                };
+                nav_item(
+                    ui,
+                    cx,
+                    icon::DOWNLOAD_SIMPLE,
+                    &label,
+                    View::Downloads,
+                    st.view,
+                    st.collapsed,
+                );
+            }
             ui.add_space(10.0);
             playlists_header(ui, cx, st.collapsed);
             if let Some((done, total)) = cx.feed.scan {
@@ -992,7 +1009,8 @@ fn now_playing_panel(ui: &mut Ui, cx: &mut Cx) {
             widgets::cover(ui, cx.art, src.as_deref(), art, 8, widgets::track_fallback(&t));
             ui.add_space(14.0);
             let (row, _) = ui.allocate_exact_size(vec2(w, 54.0), Sense::hover());
-            let text_w = w - 40.0;
+            let soundcloud = t.source == Source::SoundCloud;
+            let text_w = w - if soundcloud { 76.0 } else { 40.0 };
             text_trunc(ui, row.min, &t.title, theme::bold_font(22.0), TEXT, text_w);
             let artist = widgets::link_text(
                 ui,
@@ -1021,6 +1039,10 @@ fn now_playing_panel(ui: &mut Ui, cx: &mut Cx) {
             theme::paint_icon(ui.painter(), heart.center(), glyph, font, color);
             if hr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 cx.actions.push(Action::Cmd(Command::ToggleLike(t.clone())));
+            }
+            if soundcloud {
+                let r = heart.translate(vec2(-(CONTROL + 4.0), 0.0));
+                download_control(ui, cx, &t, r);
             }
             ui.add_space(6.0);
             let source = cx.player.via.as_ref().map(|v| v.source).unwrap_or(t.source);
@@ -1232,6 +1254,70 @@ fn provider(ui: &mut Ui, name: &str) {
                 .size(11.0)
                 .color(TEXT_FAINT),
         );
+    }
+}
+
+/// Download button for one SoundCloud song: a ring fills while it downloads, and once saved
+/// it shows the file in its folder.
+fn download_control(ui: &mut Ui, cx: &mut Cx, t: &Track, rect: Rect) {
+    let resp = ui.interact(rect, Id::new(("download", &t.id)), Sense::click());
+    let state = widgets::downloaded(cx.feed, &t.id);
+    let hovered = resp.hovered();
+    let center = rect.center();
+    let (glyph, color, tip) = match state {
+        widgets::Downloaded::Yes => (
+            icon::ARROW_CIRCLE_DOWN,
+            cx.accent,
+            "Downloaded · show in folder".to_string(),
+        ),
+        widgets::Downloaded::Busy(p) => {
+            // Progress ring around a small arrow.
+            let radius = 10.0;
+            let painter = ui.painter();
+            painter.circle_stroke(center, radius, Stroke::new(2.0, HOVER));
+            if p > 0.0 {
+                let n = 40;
+                let points: Vec<Pos2> = (0..=n)
+                    .map(|k| {
+                        let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * p * k as f32 / n as f32;
+                        center + radius * vec2(a.cos(), a.sin())
+                    })
+                    .collect();
+                painter.add(egui::Shape::line(points, Stroke::new(2.0, cx.accent)));
+            }
+            let tip = if p > 0.0 {
+                format!("Downloading… {:.0}%", p * 100.0)
+            } else {
+                "Waiting to download…".to_string()
+            };
+            (icon::ARROW_DOWN, TEXT_DIM, tip)
+        }
+        widgets::Downloaded::No => (
+            icon::DOWNLOAD_SIMPLE,
+            if hovered { TEXT } else { TEXT_DIM },
+            "Download".to_string(),
+        ),
+    };
+    let size = if matches!(state, widgets::Downloaded::Busy(_)) {
+        11.0
+    } else {
+        20.0
+    };
+    theme::paint_icon(ui.painter(), center, glyph, theme::icon_font(size), color);
+    if resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text(tip)
+        .clicked()
+    {
+        match state {
+            widgets::Downloaded::Yes => {
+                if let Some(dir) = cx.feed.downloaded.get(&t.id).and_then(|f| f.parent()) {
+                    cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
+                }
+            }
+            widgets::Downloaded::Busy(_) => cx.actions.push(Action::Go(View::Downloads)),
+            widgets::Downloaded::No => cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()]))),
+        }
     }
 }
 

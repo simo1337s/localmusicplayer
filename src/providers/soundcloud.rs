@@ -10,6 +10,7 @@
 //!   that mpv can play.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -400,6 +401,145 @@ impl SoundCloud {
             .filter(|u| !u.is_empty())
             .map(str::to_owned)
             .with_context(|| format!("SoundCloud returned no stream URL for \"{title}\""))
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Downloads
+    // ---------------------------------------------------------------------------------------
+
+    /// Saves `track` into `dir`: the uploader's original file when they allow downloads,
+    /// otherwise the stream SoundCloud plays (encrypted Go+ streams and 30 second previews are
+    /// refused). Returns the saved file. `progress` is called with 0..=1 while downloading.
+    pub async fn download(
+        &self,
+        track: &Track,
+        dir: &Path,
+        progress: &(dyn Fn(f32) + Send + Sync),
+    ) -> Result<(PathBuf, DownloadKind)> {
+        let json = self.track_json(track).await?;
+        let title = json
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(track.title.as_str())
+            .to_owned();
+        if json
+            .get("policy")
+            .and_then(Value::as_str)
+            .is_some_and(|p| p.eq_ignore_ascii_case("BLOCK"))
+        {
+            bail!("\"{title}\" is not available in your region");
+        }
+        tokio::fs::create_dir_all(dir)
+            .await
+            .with_context(|| format!("couldn't create {}", dir.display()))?;
+        let id = json_id(&json).unwrap_or_default();
+        let part = dir.join(format!(".multimusic-{id}.part"));
+        let stem = file_stem(&track.artist, &title);
+
+        let downloadable = json.get("downloadable").and_then(Value::as_bool) == Some(true)
+            && json.get("has_downloads_left").and_then(Value::as_bool) != Some(false);
+        let mut kind = DownloadKind::Stream;
+        let saved = if downloadable {
+            match self.download_original(id, &part, progress).await {
+                Ok(()) => {
+                    kind = DownloadKind::Original;
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("SoundCloud: original file of \"{title}\" unavailable ({e:#}); saving the stream");
+                    self.download_stream(&json, &title, &part, progress).await
+                }
+            }
+        } else {
+            self.download_stream(&json, &title, &part, progress).await
+        };
+        if let Err(e) = saved {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        let ext = sniff_file_ext(&part).await.unwrap_or("mp3");
+        let path = unique_path(dir, &stem, ext);
+        tokio::fs::rename(&part, &path)
+            .await
+            .with_context(|| format!("couldn't save {}", path.display()))?;
+        info!("SoundCloud: saved \"{title}\" to {}", path.display());
+        Ok((path, kind))
+    }
+
+    /// The file the uploader put up for download.
+    async fn download_original(&self, id: u64, part: &Path, progress: &(dyn Fn(f32) + Send + Sync)) -> Result<()> {
+        let v = self.get_json(&api(&format!("/tracks/{id}/download")), &[]).await?;
+        let url = v
+            .get("redirectUri")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .context("SoundCloud returned no download link")?;
+        save_body(&self.http, url, part, progress).await
+    }
+
+    /// The regular stream: progressive MP3, or the segments of an HLS stream joined together.
+    async fn download_stream(
+        &self,
+        json: &Value,
+        title: &str,
+        part: &Path,
+        progress: &(dyn Fn(f32) + Send + Sync),
+    ) -> Result<()> {
+        let transcodings: &[Value] = json
+            .get("media")
+            .and_then(|m| m.get("transcodings"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(chosen) = pick_download_transcoding(transcodings) else {
+            bail!("\"{title}\" can't be downloaded: SoundCloud only offers it encrypted (Go+) or not at all");
+        };
+        if chosen.get("snipped").and_then(Value::as_bool) == Some(true) {
+            bail!("\"{title}\" can't be downloaded: only a 30 second preview is available (Go+ track)");
+        }
+        let endpoint = chosen
+            .get("url")
+            .and_then(Value::as_str)
+            .context("transcoding without url")?;
+        let protocol = chosen
+            .pointer("/format/protocol")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut params = Vec::new();
+        if let Some(auth) = json.get("track_authorization").and_then(Value::as_str) {
+            params.push(("track_authorization", auth));
+        }
+        let url = self
+            .get_json(endpoint, &params)
+            .await?
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned)
+            .context("SoundCloud returned no stream URL")?;
+        if protocol == "progressive" {
+            return save_body(&self.http, &url, part, progress).await;
+        }
+        let playlist = self.fetch_text(&url).await?;
+        let hls = parse_hls(&playlist, &url)?;
+        let mut file = tokio::fs::File::create(part).await?;
+        let total = hls.segments.len() + usize::from(hls.init.is_some());
+        for (i, segment) in hls.init.iter().chain(hls.segments.iter()).enumerate() {
+            let bytes = self
+                .http
+                .get(segment)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .with_context(|| format!("downloading part {} of {total}", i + 1))?
+                .bytes()
+                .await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
+            progress((i + 1) as f32 / total as f32);
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        Ok(())
     }
 
     // ---------------------------------------------------------------------------------------
@@ -799,6 +939,187 @@ fn upscale_art(url: &str) -> String {
 
 fn is_default_avatar(url: &str) -> bool {
     url.contains("default_avatar")
+}
+
+/// Where a downloaded file came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadKind {
+    /// The uploader's own file (they allow downloads); often lossless.
+    Original,
+    /// The stream SoundCloud plays.
+    Stream,
+}
+
+/// Best stream to save: MP3 first (plays and tags everywhere), then Opus, then AAC. Encrypted
+/// streams are never picked; previews only as a last resort (and then refused).
+fn pick_download_transcoding(transcodings: &[Value]) -> Option<&Value> {
+    fn rank(t: &Value) -> Option<u32> {
+        t.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+        let protocol = t.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("");
+        let mime = t.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
+        if protocol.contains("encrypted") {
+            return None;
+        }
+        let format = match (protocol, mime) {
+            ("progressive", m) if m.starts_with("audio/mpeg") => 0,
+            ("hls", m) if m.starts_with("audio/mpeg") => 1,
+            ("hls", m) if m.starts_with("audio/ogg") => 2,
+            ("hls", m) if m.starts_with("audio/mp4") => 3,
+            _ => return None,
+        };
+        let snipped = t.get("snipped").and_then(Value::as_bool).unwrap_or(false);
+        let hq = t.get("quality").and_then(Value::as_str) == Some("hq");
+        Some(u32::from(snipped) * 100 + format * 2 + u32::from(!hq))
+    }
+    transcodings
+        .iter()
+        .filter_map(|t| rank(t).map(|r| (r, t)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, t)| t)
+}
+
+/// Segments of an HLS media playlist (plus the fMP4 init segment, if any).
+#[derive(Debug, PartialEq, Eq)]
+struct Hls {
+    init: Option<String>,
+    segments: Vec<String>,
+}
+
+fn parse_hls(text: &str, base: &str) -> Result<Hls> {
+    let base = Url::parse(base).context("bad playlist URL")?;
+    let resolve = |uri: &str| -> Result<String> { Ok(base.join(uri).context("bad segment URL")?.to_string()) };
+    let mut init = None;
+    let mut segments = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(attrs) = line.strip_prefix("#EXT-X-KEY:") {
+            if !attrs.contains("METHOD=NONE") {
+                bail!("the stream is encrypted (DRM), so it can't be saved");
+            }
+        } else if let Some(attrs) = line.strip_prefix("#EXT-X-MAP:") {
+            let uri = attrs
+                .split("URI=\"")
+                .nth(1)
+                .and_then(|r| r.split('"').next())
+                .context("HLS init segment without URI")?;
+            init = Some(resolve(uri)?);
+        } else if !line.is_empty() && !line.starts_with('#') {
+            segments.push(resolve(line)?);
+        }
+    }
+    if segments.is_empty() {
+        bail!("the stream playlist is empty");
+    }
+    Ok(Hls { init, segments })
+}
+
+/// Streams a response body into `path`, reporting progress when the size is known.
+async fn save_body(
+    http: &reqwest::Client,
+    url: &str,
+    path: &Path,
+    progress: &(dyn Fn(f32) + Send + Sync),
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    // Files can be large (WAV originals): no overall time limit, but a stalled
+    // connection gives up after a minute.
+    let mut resp = http
+        .get(url)
+        .timeout(Duration::from_secs(4 * 3600))
+        .send()
+        .await
+        .context("download request failed")?
+        .error_for_status()?;
+    let total = resp.content_length().filter(|n| *n > 0);
+    let mut file = tokio::fs::File::create(path).await?;
+    let mut done = 0u64;
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(60), resp.chunk())
+            .await
+            .map_err(|_| anyhow!("the download stalled"))??;
+        let Some(chunk) = chunk else { break };
+        file.write_all(&chunk).await?;
+        done += chunk.len() as u64;
+        if let Some(total) = total {
+            progress((done as f32 / total as f32).min(1.0));
+        }
+    }
+    file.flush().await?;
+    if done == 0 {
+        bail!("the download was empty");
+    }
+    Ok(())
+}
+
+/// File extension for audio data, from its first bytes.
+fn sniff_ext(head: &[u8]) -> Option<&'static str> {
+    let at = |i: usize, sig: &[u8]| head.get(i..i + sig.len()) == Some(sig);
+    Some(if at(0, b"fLaC") {
+        "flac"
+    } else if at(0, b"RIFF") && at(8, b"WAVE") {
+        "wav"
+    } else if at(0, b"FORM") && (at(8, b"AIFF") || at(8, b"AIFC")) {
+        "aiff"
+    } else if at(0, b"OggS") {
+        if head.windows(8).any(|w| w == b"OpusHead") {
+            "opus"
+        } else {
+            "ogg"
+        }
+    } else if at(4, b"ftyp") {
+        "m4a"
+    } else if at(0, b"ID3") || (head.len() > 1 && head[0] == 0xFF && head[1] & 0xE0 == 0xE0) {
+        "mp3"
+    } else {
+        return None;
+    })
+}
+
+async fn sniff_file_ext(path: &Path) -> Option<&'static str> {
+    use tokio::io::AsyncReadExt;
+    let mut head = [0u8; 64];
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let n = file.read(&mut head).await.ok()?;
+    sniff_ext(&head[..n])
+}
+
+/// "Artist - Title" as a safe file name (the title alone when it already names the artist).
+pub fn file_stem(artist: &str, title: &str) -> String {
+    let (artist, title) = (artist.trim(), title.trim());
+    let name = if artist.is_empty() || title.contains(" - ") || title.to_lowercase().starts_with(&artist.to_lowercase())
+    {
+        title.to_string()
+    } else {
+        format!("{artist} - {title}")
+    };
+    let clean: String = name
+        .chars()
+        .map(|c| {
+            if c.is_control() || r#"/\:*?"<>|"#.contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
+        .take(150)
+        .collect();
+    let clean = clean.trim().trim_matches('.').trim().to_string();
+    if clean.is_empty() {
+        "SoundCloud track".into()
+    } else {
+        clean
+    }
+}
+
+/// `dir/stem.ext`, or `dir/stem (2).ext` and so on if that exists.
+fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if !first.exists() {
+        return first;
+    }
+    (2..1000)
+        .map(|n| dir.join(format!("{stem} ({n}).{ext}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 /// Picks the best transcoding mpv can play: progressive MP3 > HLS Opus > HLS MP3 > HLS AAC >
@@ -1388,5 +1709,194 @@ mod tests {
         assert!(!found.is_empty());
         let url = sc.stream_url(&found[0]).await.unwrap();
         assert!(url.starts_with("https://"), "{url}");
+    }
+
+    #[test]
+    fn download_picks_mp3_and_never_encrypted_streams() {
+        let t = |protocol: &str, mime: &str, snipped: bool| {
+            json!({
+                "url": format!("https://api-v2.soundcloud.com/media/{protocol}/{mime}/{snipped}"),
+                "format": { "protocol": protocol, "mime_type": mime },
+                "snipped": snipped,
+            })
+        };
+        let all = vec![
+            t("ctr-encrypted-hls", "audio/mp4; codecs=\"mp4a.40.2\"", false),
+            t("hls", "audio/ogg; codecs=\"opus\"", false),
+            t("hls", "audio/mpeg", false),
+            t("progressive", "audio/mpeg", true),
+        ];
+        let pick = |list: &[Value]| pick_download_transcoding(list).map(|v| v["url"].as_str().unwrap().to_string());
+        // A full MP3 stream beats a progressive preview and Opus.
+        assert!(pick(&all).unwrap().ends_with("/hls/audio/mpeg/false"));
+        assert!(pick(&all[..2]).unwrap().contains("/hls/audio/ogg"));
+        // Only a preview left: it is picked (and then refused by the caller).
+        assert!(pick(&all[3..]).unwrap().ends_with("/true"));
+        // Encrypted streams are never used.
+        assert_eq!(pick(&all[..1]), None);
+    }
+
+    #[test]
+    fn hls_playlists() {
+        let text = "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:10.0,\nseg/0.m4s?x=1\n\
+                    #EXTINF:5.0,\nhttps://cdn.example/abs/1.m4s\n#EXT-X-ENDLIST\n";
+        let hls = parse_hls(
+            text,
+            "https://cf-hls-media.sndcdn.com/playlist/abc/playlist.m3u8?Policy=p",
+        )
+        .unwrap();
+        assert_eq!(
+            hls.init.as_deref(),
+            Some("https://cf-hls-media.sndcdn.com/playlist/abc/init.mp4")
+        );
+        assert_eq!(
+            hls.segments,
+            vec![
+                "https://cf-hls-media.sndcdn.com/playlist/abc/seg/0.m4s?x=1".to_string(),
+                "https://cdn.example/abs/1.m4s".to_string()
+            ]
+        );
+        let plain = "#EXTM3U\n#EXT-X-KEY:METHOD=NONE\n#EXTINF:1,\na.mp3\n";
+        assert_eq!(parse_hls(plain, "https://h/p.m3u8").unwrap().segments.len(), 1);
+        let encrypted = "#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://x\"\n#EXTINF:1,\na.mp4\n";
+        let err = parse_hls(encrypted, "https://h/p.m3u8").unwrap_err().to_string();
+        assert!(err.contains("encrypted"), "{err}");
+        assert!(parse_hls("#EXTM3U\n#EXT-X-ENDLIST\n", "https://h/p.m3u8").is_err());
+    }
+
+    #[test]
+    fn sniffs_audio_formats() {
+        assert_eq!(sniff_ext(b"fLaC\0\0\0\x22"), Some("flac"));
+        assert_eq!(sniff_ext(b"RIFF\x24\0\0\0WAVEfmt "), Some("wav"));
+        assert_eq!(sniff_ext(b"FORM\0\0\0\0AIFF"), Some("aiff"));
+        assert_eq!(
+            sniff_ext(b"OggS\0\x02\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\x01\x13OpusHead"),
+            Some("opus")
+        );
+        assert_eq!(sniff_ext(b"OggS\0\x02\0\0\x01vorbis"), Some("ogg"));
+        assert_eq!(sniff_ext(b"\0\0\0\x20ftypM4A "), Some("m4a"));
+        assert_eq!(sniff_ext(b"ID3\x04\0"), Some("mp3"));
+        assert_eq!(sniff_ext(&[0xFF, 0xFB, 0x90, 0x64]), Some("mp3"));
+        assert_eq!(sniff_ext(b"<html>"), None);
+        assert_eq!(sniff_ext(b""), None);
+    }
+
+    #[test]
+    fn download_file_names() {
+        assert_eq!(file_stem("Flume", "Never Be Like You"), "Flume - Never Be Like You");
+        // Titles that already name the artist are kept as they are.
+        assert_eq!(
+            file_stem("someuploader", "Flume - Never Be Like You"),
+            "Flume - Never Be Like You"
+        );
+        assert_eq!(file_stem("Flume", "flume x chet faker"), "flume x chet faker");
+        assert_eq!(file_stem("", "Song"), "Song");
+        // Characters file systems (or other OSes) reject are replaced.
+        assert_eq!(file_stem("A/B", "What?: \"Yes\" <3"), "A_B - What__ _Yes_ _3");
+        assert_eq!(file_stem("", " ..."), "SoundCloud track");
+        assert!(file_stem("x", &"long ".repeat(100)).chars().count() <= 150);
+
+        let dir = std::env::temp_dir().join(format!("multimusic-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = unique_path(&dir, "Song", "mp3");
+        assert_eq!(first, dir.join("Song.mp3"));
+        std::fs::write(&first, b"x").unwrap();
+        assert_eq!(unique_path(&dir, "Song", "mp3"), dir.join("Song (2).mp3"));
+        assert_eq!(unique_path(&dir, "Song", "flac"), dir.join("Song.flac"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Serves a fake stream endpoint, HLS playlist and segments; returns the base URL and the
+    /// request lines it saw.
+    async fn media_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (b, log) = (base.clone(), seen.clone());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = head.lines().next().unwrap_or("").to_string();
+                let path = line.split(' ').nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(path.clone());
+                let (ctype, body): (&str, Vec<u8>) = match path.split('?').next().unwrap() {
+                    "/stream/hls" => (
+                        "application/json",
+                        format!("{{\"url\":\"{b}/media/list.m3u8\"}}").into_bytes(),
+                    ),
+                    "/stream/progressive" => (
+                        "application/json",
+                        format!("{{\"url\":\"{b}/media/full.mp3\"}}").into_bytes(),
+                    ),
+                    "/media/list.m3u8" => (
+                        "application/vnd.apple.mpegurl",
+                        b"#EXTM3U\n#EXTINF:10,\nseg0.mp3\n#EXTINF:10,\nseg1.mp3\n#EXT-X-ENDLIST\n".to_vec(),
+                    ),
+                    "/media/seg0.mp3" => ("audio/mpeg", b"ID3\x04first-".to_vec()),
+                    "/media/seg1.mp3" => ("audio/mpeg", b"second".to_vec()),
+                    "/media/full.mp3" => ("audio/mpeg", [&[0xFF, 0xFB][..], &[7u8; 5000]].concat()),
+                    _ => ("text/plain", Vec::new()),
+                };
+                let status = if body.is_empty() { "404 Not Found" } else { "200 OK" };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+        (base, seen)
+    }
+
+    #[tokio::test]
+    async fn downloads_streams_from_hls_and_progressive() {
+        let (base, seen) = media_server().await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let sc = SoundCloud::new(http, "testid", "");
+        let dir = std::env::temp_dir().join(format!("multimusic-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join(".part");
+        let progress = std::sync::Mutex::new(Vec::new());
+        let report = |p: f32| progress.lock().unwrap().push(p);
+
+        let json = json!({
+            "track_authorization": "tok",
+            "media": { "transcodings": [
+                { "url": format!("{base}/stream/encrypted"), "format": { "protocol": "ctr-encrypted-hls", "mime_type": "audio/mp4" } },
+                { "url": format!("{base}/stream/hls"), "format": { "protocol": "hls", "mime_type": "audio/mpeg" } },
+            ]},
+        });
+        sc.download_stream(&json, "Song", &part, &report).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"ID3\x04first-second");
+        assert_eq!(sniff_file_ext(&part).await, Some("mp3"));
+        assert_eq!(*progress.lock().unwrap(), vec![0.5, 1.0]);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .contains(&"/stream/hls?track_authorization=tok&client_id=testid".to_string()));
+
+        let json = json!({ "media": { "transcodings": [
+            { "url": format!("{base}/stream/progressive"), "format": { "protocol": "progressive", "mime_type": "audio/mpeg" } },
+        ]}});
+        sc.download_stream(&json, "Song", &part, &report).await.unwrap();
+        assert_eq!(std::fs::metadata(&part).unwrap().len(), 5002);
+        assert_eq!(progress.lock().unwrap().last(), Some(&1.0));
+
+        // Go+ previews and encrypted-only songs are refused, not saved as 30 second clips.
+        let json = json!({ "media": { "transcodings": [
+            { "url": format!("{base}/stream/progressive"), "snipped": true, "format": { "protocol": "progressive", "mime_type": "audio/mpeg" } },
+        ]}});
+        let err = sc.download_stream(&json, "Song", &part, &report).await.unwrap_err();
+        assert!(err.to_string().contains("30 second preview"), "{err}");
+        let json = json!({ "media": { "transcodings": [
+            { "url": format!("{base}/stream/encrypted"), "format": { "protocol": "ctr-encrypted-hls", "mime_type": "audio/mp4" } },
+        ]}});
+        let err = sc.download_stream(&json, "Song", &part, &report).await.unwrap_err();
+        assert!(err.to_string().contains("encrypted"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

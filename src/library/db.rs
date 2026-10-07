@@ -266,6 +266,23 @@ impl Db {
         Ok(())
     }
 
+    /// Entries whose key starts with `prefix`, with the prefix cut off.
+    pub fn kv_with_prefix(&self, prefix: &str) -> Vec<(String, String)> {
+        let rows = self
+            .conn
+            .prepare("SELECT key, value FROM kv WHERE substr(key, 1, ?2) = ?1")
+            .and_then(|mut stmt| {
+                stmt.query_map(params![prefix, prefix.chars().count() as i64], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            });
+        rows.unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, v)| Some((k.strip_prefix(prefix)?.to_string(), v)))
+            .collect()
+    }
+
     /// Removes tracks of remote sources that are no longer referenced by any playlist.
     pub fn prune_orphans(&mut self) -> Result<usize> {
         let n = self.conn.execute(
@@ -339,5 +356,17 @@ mod tests {
         assert_eq!(db.top_plays(1).unwrap(), vec!["a".to_string()]);
         db.set_kv("k", "v").unwrap();
         assert_eq!(db.get_kv("k").as_deref(), Some("v"));
+        db.set_kv("download:soundcloud:1", "/a.mp3").unwrap();
+        db.set_kv("download:soundcloud:2", "/b.mp3").unwrap();
+        db.set_kv("downloads", "x").unwrap();
+        let mut got = db.kv_with_prefix("download:");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("soundcloud:1".to_string(), "/a.mp3".to_string()),
+                ("soundcloud:2".to_string(), "/b.mp3".to_string())
+            ]
+        );
     }
 }

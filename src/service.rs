@@ -2,7 +2,7 @@
 //! The UI talks to it with [`Command`]s and reads state from [`Shared`].
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::player::mpv::{Mpv, MpvEvent, MpvOptions, MpvSender};
 use crate::player::queue::Queue;
 use crate::player::spotify::{self, SpotifyAuth, SpotifyDeck, SpotifyEngine, SpotifyEvent, SpotifySender};
 use crate::providers::apple_music::{self, AppleMusicApi};
-use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
+use crate::providers::soundcloud::{self, DownloadKind, ScResolved, ScUser, SoundCloud};
 use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
 
 /// Requests from the UI (and MPRIS).
@@ -89,6 +89,10 @@ pub enum Command {
     Search(String),
     /// Load an artist / album / playlist / song page: a page key or a pasted link.
     OpenPage(String),
+    /// Save SoundCloud songs as files (other sources are skipped with a note why).
+    Download(Vec<Track>),
+    /// Remove finished and failed entries from the Downloads list.
+    ClearDownloads,
     UpdateConfig(Box<Config>),
     Raise,
     Quit,
@@ -219,6 +223,32 @@ pub struct PageState {
     pub external_url: Option<String>,
 }
 
+/// One song in the Downloads list.
+#[derive(Debug, Clone)]
+pub struct DownloadItem {
+    pub track: Track,
+    pub state: DownloadState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DownloadState {
+    Queued,
+    /// Progress 0..=1.
+    Running(f32),
+    /// `original`: the uploader's own file rather than the stream.
+    Done {
+        path: PathBuf,
+        original: bool,
+    },
+    Failed(String),
+}
+
+impl DownloadState {
+    pub fn active(&self) -> bool {
+        matches!(self, DownloadState::Queued | DownloadState::Running(_))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LyricsState {
     pub track_id: String,
@@ -233,6 +263,10 @@ pub struct Feed {
     pub search: SearchState,
     pub page: PageState,
     pub lyrics: LyricsState,
+    /// Downloads started this session, oldest first.
+    pub downloads: Vec<DownloadItem>,
+    /// Downloaded SoundCloud songs: track id → file.
+    pub downloaded: HashMap<String, PathBuf>,
     pub spotify: AccountStatus,
     /// True while a Spotify login is stored, whatever the current status message says.
     pub spotify_logged_in: bool,
@@ -340,6 +374,10 @@ enum Internal {
         quality: Option<AudioQuality>,
     },
     AudioDevices(Vec<(String, String)>),
+    DownloadDone {
+        track: Track,
+        result: Result<(PathBuf, DownloadKind)>,
+    },
     /// Status text while the Spotify library syncs.
     SyncProgress(String),
 }
@@ -478,6 +516,10 @@ pub struct Service {
     discord: Discord,
     mpris: Mpris,
     last_tick: Instant,
+
+    downloads_running: usize,
+    /// Title and error (if any) of each download finished since the queue was last empty.
+    download_batch: Vec<(String, Option<String>)>,
 }
 
 /// Starts the service on its own thread, driving futures on `rt`. Returns the command sender.
@@ -590,6 +632,8 @@ impl Service {
             discord,
             mpris,
             last_tick: Instant::now(),
+            downloads_running: 0,
+            download_batch: Vec::new(),
             cfg,
         };
         let (a, b, c) = receivers;
@@ -630,6 +674,7 @@ impl Service {
 
     fn startup(&mut self) {
         self.publish_accounts();
+        self.load_downloads();
         self.restore_session();
         if self.cfg.library.scan_on_startup && !self.cfg.library.folders.is_empty() {
             self.start_scan();
@@ -919,6 +964,11 @@ impl Service {
             }
             Command::Search(q) => self.search(q),
             Command::OpenPage(key) => self.open_page(key),
+            Command::Download(tracks) => self.download(tracks),
+            Command::ClearDownloads => {
+                self.shared.feed.write().unwrap().downloads.retain(|d| d.state.active());
+                self.shared.repaint();
+            }
             Command::UpdateConfig(cfg) => self.update_config(*cfg).await,
             Command::Raise => {
                 self.shared.feed.write().unwrap().raise = true;
@@ -987,6 +1037,10 @@ impl Service {
                 self.start_mpv(track, &path, start).await;
             }
             Source::SoundCloud => {
+                if let Some(file) = self.downloaded_file(&track) {
+                    self.start_mpv(track, &file, start).await;
+                    return;
+                }
                 let sc = self.soundcloud.clone();
                 let tx = self.internal_tx.clone();
                 tokio::spawn(async move {
@@ -1388,20 +1442,21 @@ impl Service {
         if self.engine != Engine::Mpv || !self.cfg.playback.gapless || self.will_crossfade() {
             return;
         }
+        // Local files and downloaded songs; streams are resolved when they start.
+        let next = self
+            .queue
+            .peek_next()
+            .and_then(|t| Some((t.id.clone(), self.file_of(t)?)));
         let Some(mpv) = &self.mpv else { return };
-        let next = self.queue.peek_next().cloned();
-        let want = next
-            .as_ref()
-            .filter(|t| t.source == Source::Local)
-            .map(|t| t.id.clone());
+        let want = next.as_ref().map(|(id, _)| id.clone());
         if want == self.mpv_preloaded {
             return;
         }
         let _ = mpv.clear_upcoming().await;
         self.mpv_preloaded = None;
-        if let Some(t) = next.filter(|t| t.source == Source::Local) {
-            if mpv.append(&t.uri).await.is_ok() {
-                self.mpv_preloaded = Some(t.id);
+        if let Some((id, file)) = next {
+            if mpv.append(&file).await.is_ok() {
+                self.mpv_preloaded = Some(id);
             }
         }
     }
@@ -2648,6 +2703,206 @@ impl Service {
         }
     }
 
+    // ---------------------------------------------------------------- downloads
+
+    fn load_downloads(&mut self) {
+        // Files that are gone (or on a drive that isn't mounted) are left out, not forgotten.
+        let downloaded = self
+            .db
+            .kv_with_prefix(DOWNLOAD_KEY)
+            .into_iter()
+            .map(|(id, path)| (id, PathBuf::from(path)))
+            .filter(|(_, path)| path.exists())
+            .collect();
+        self.shared.feed.write().unwrap().downloaded = downloaded;
+    }
+
+    /// The file to play for `track` when it is one: a local file or a downloaded song.
+    fn file_of(&self, track: &Track) -> Option<String> {
+        match track.source {
+            Source::Local => Some(track.uri.clone()),
+            Source::SoundCloud => self.downloaded_file(track),
+            _ => None,
+        }
+    }
+
+    fn downloaded_file(&self, track: &Track) -> Option<String> {
+        let feed = self.shared.feed.read().unwrap();
+        let path = feed.downloaded.get(&track.id)?;
+        path.exists().then(|| path.to_string_lossy().into_owned())
+    }
+
+    fn download(&mut self, tracks: Vec<Track>) {
+        let (mut spotify, mut apple, mut already) = (0, 0, 0);
+        let mut added: Vec<String> = Vec::new();
+        {
+            let mut feed = self.shared.feed.write().unwrap();
+            let mut seen = HashSet::new();
+            for track in tracks {
+                match track.source {
+                    Source::Spotify => spotify += 1,
+                    Source::AppleMusic => apple += 1,
+                    Source::Local => {}
+                    Source::SoundCloud => {
+                        if !seen.insert(track.id.clone()) {
+                            continue;
+                        }
+                        if feed.downloaded.get(&track.id).is_some_and(|p| p.exists()) {
+                            already += 1;
+                            continue;
+                        }
+                        match feed.downloads.iter_mut().find(|d| d.track.id == track.id) {
+                            Some(d) if d.state.active() => continue,
+                            // Failed before, or the file was deleted since: try again.
+                            Some(d) => d.state = DownloadState::Queued,
+                            None => feed.downloads.push(DownloadItem {
+                                track: track.clone(),
+                                state: DownloadState::Queued,
+                            }),
+                        }
+                        added.push(track.title);
+                    }
+                }
+            }
+        }
+        match added.as_slice() {
+            [] if already == 1 => self.shared.info("Already downloaded"),
+            [] if already > 1 => self.shared.info(format!("All {already} songs are already downloaded")),
+            [] => {}
+            [title] => self.shared.info(format!("Downloading “{title}”…")),
+            many => self.shared.info(format!("Downloading {} songs…", many.len())),
+        }
+        let skipped = |n: usize, service: &str| match n {
+            1 => format!("{service} songs can't be downloaded: their audio is DRM-protected"),
+            n => format!(
+                "Skipped {n} {service} songs: their audio is DRM-protected, so only SoundCloud songs can be saved"
+            ),
+        };
+        if spotify > 0 {
+            self.shared.info(skipped(spotify, "Spotify"));
+        }
+        if apple > 0 {
+            self.shared.info(skipped(apple, "Apple Music"));
+        }
+        self.pump_downloads();
+    }
+
+    /// Starts queued downloads, a couple at a time.
+    fn pump_downloads(&mut self) {
+        const PARALLEL: usize = 2;
+        while self.downloads_running < PARALLEL {
+            let track = {
+                let mut feed = self.shared.feed.write().unwrap();
+                let Some(item) = feed.downloads.iter_mut().find(|d| d.state == DownloadState::Queued) else {
+                    break;
+                };
+                item.state = DownloadState::Running(0.0);
+                item.track.clone()
+            };
+            self.downloads_running += 1;
+            let sc = self.soundcloud.clone();
+            let http = self.http.clone();
+            let dir = self.cfg.download_dir();
+            let shared = self.shared.clone();
+            let tx = self.internal_tx.clone();
+            tokio::spawn(async move {
+                let id = track.id.clone();
+                let last = std::sync::Mutex::new(Instant::now());
+                let progress = |p: f32| {
+                    {
+                        let mut last = last.lock().unwrap();
+                        if p < 1.0 && last.elapsed() < Duration::from_millis(150) {
+                            return;
+                        }
+                        *last = Instant::now();
+                    }
+                    let mut feed = shared.feed.write().unwrap();
+                    if let Some(d) = feed.downloads.iter_mut().find(|d| d.track.id == id) {
+                        if let DownloadState::Running(old) = &mut d.state {
+                            *old = p;
+                        }
+                    }
+                    drop(feed);
+                    shared.repaint();
+                };
+                let result = save_download(&sc, &http, &track, &dir, &progress).await;
+                let _ = tx.send(Internal::DownloadDone { track, result });
+            });
+        }
+        self.shared.repaint();
+    }
+
+    fn download_finished(&mut self, track: Track, result: Result<(PathBuf, DownloadKind)>) {
+        self.downloads_running = self.downloads_running.saturating_sub(1);
+        let state = match result {
+            Ok((path, kind)) => {
+                let _ = self
+                    .db
+                    .set_kv(&format!("{DOWNLOAD_KEY}{}", track.id), &path.to_string_lossy());
+                self.shared
+                    .feed
+                    .write()
+                    .unwrap()
+                    .downloaded
+                    .insert(track.id.clone(), path.clone());
+                self.add_downloaded_file(&path);
+                self.download_batch.push((track.title.clone(), None));
+                DownloadState::Done {
+                    path,
+                    original: kind == DownloadKind::Original,
+                }
+            }
+            Err(e) => {
+                let error = friendly_download_error(&e);
+                tracing::warn!("download of {} failed: {e:#}", track.id);
+                self.download_batch.push((track.title.clone(), Some(error.clone())));
+                DownloadState::Failed(error)
+            }
+        };
+        let idle = {
+            let mut feed = self.shared.feed.write().unwrap();
+            if let Some(d) = feed.downloads.iter_mut().find(|d| d.track.id == track.id) {
+                d.state = state;
+            }
+            !feed.downloads.iter().any(|d| d.state.active())
+        };
+        if idle {
+            let batch = std::mem::take(&mut self.download_batch);
+            let failed: Vec<_> = batch.iter().filter(|(_, e)| e.is_some()).collect();
+            let ok = batch.len() - failed.len();
+            match (ok, failed.as_slice()) {
+                (0, []) => {}
+                (1, []) => self.shared.info(format!("Downloaded “{}”", batch[0].0)),
+                (n, []) => self.shared.info(format!("Downloaded {n} songs")),
+                (0, [(title, Some(e))]) => self.shared.error(format!("Couldn't download “{title}”: {e}")),
+                (0, f) => self
+                    .shared
+                    .error(format!("{} downloads failed (see Downloads)", f.len())),
+                (n, f) => self
+                    .shared
+                    .error(format!("Downloaded {n} songs, {} failed (see Downloads)", f.len())),
+            }
+        }
+        self.pump_downloads();
+    }
+
+    /// Puts a finished download straight into the library when it was saved inside a library
+    /// folder (instead of waiting for the next scan).
+    fn add_downloaded_file(&mut self, path: &Path) {
+        if !self.cfg.library.folders.iter().any(|f| path.starts_with(f)) {
+            return;
+        }
+        let track = library::scanner::read_track(path, None, now_unix());
+        let mtimes = HashMap::from([(track.id.clone(), library::scanner::mtime_of(path))]);
+        if let Err(e) = self.db.upsert_tracks(std::slice::from_ref(&track), &mtimes) {
+            tracing::warn!("couldn't add {} to the library: {e:#}", path.display());
+            return;
+        }
+        let mut lib = self.shared.library.write().unwrap();
+        lib.tracks.insert(track.id.clone(), track);
+        lib.reindex();
+    }
+
     /// The Spotify session, or `None` while (re)connecting.
     fn spotify_session(&mut self) -> Option<librespot_core::session::Session> {
         if let Some(session) = self.spotify.as_ref().and_then(|e| e.session()) {
@@ -3035,6 +3290,7 @@ impl Service {
                 self.shared.feed.write().unwrap().audio_devices = devices;
                 self.shared.repaint();
             }
+            Internal::DownloadDone { track, result } => self.download_finished(track, result),
             Internal::LastfmSession(r) => match r {
                 Ok((key, user)) => {
                     self.cfg.lastfm.session_key = key;
@@ -3047,6 +3303,94 @@ impl Service {
                 Err(e) => self.set_account(|f| &mut f.lastfm, AccountStatus::Error(format!("{e:#}"))),
             },
         }
+    }
+}
+
+/// Database key prefix of downloaded songs (`download:<track id>` → file path).
+const DOWNLOAD_KEY: &str = "download:";
+
+/// Downloads a SoundCloud song and tags it with its title, artist and cover.
+async fn save_download(
+    sc: &SoundCloud,
+    http: &reqwest::Client,
+    track: &Track,
+    dir: &Path,
+    progress: &(dyn Fn(f32) + Send + Sync),
+) -> Result<(PathBuf, DownloadKind)> {
+    let (path, kind) = sc.download(track, dir, progress).await?;
+    // Streams in MP4 are fragmented, which tag writers can't safely rewrite; the stream's own
+    // metadata has to do there.
+    if kind == DownloadKind::Stream && path.extension().is_some_and(|e| e == "m4a") {
+        return Ok((path, kind));
+    }
+    let cover = match track.art.as_deref().filter(|a| a.starts_with("http")) {
+        Some(url) => fetch_image(http, url).await,
+        None => None,
+    };
+    let (file, track_) = (path.clone(), track.clone());
+    let tagged = tokio::task::spawn_blocking(move || {
+        let album = if track_.album.trim().is_empty() {
+            &track_.title
+        } else {
+            &track_.album
+        };
+        library::tags::write(
+            &file,
+            &library::tags::Tags {
+                title: &track_.title,
+                artist: &track_.artist,
+                album,
+                comment: &track_.uri,
+                cover: cover.as_deref(),
+                // The uploader's own file may be tagged already.
+                keep_existing: kind == DownloadKind::Original,
+            },
+        )
+    })
+    .await;
+    match tagged {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("{e:#}"),
+        Err(e) => tracing::warn!("tagging {} failed: {e}", path.display()),
+    }
+    Ok((path, kind))
+}
+
+/// Cover art for tagging; at most a few MB.
+async fn fetch_image(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
+    let resp = http.get(url).send().await.ok()?.error_for_status().ok()?;
+    if resp.content_length().is_some_and(|n| n > 8 << 20) {
+        return None;
+    }
+    let bytes = resp.bytes().await.ok()?;
+    (bytes.len() <= 8 << 20).then(|| bytes.to_vec())
+}
+
+/// Short reason for the Downloads list (the song's title is shown next to it).
+fn friendly_download_error(e: &anyhow::Error) -> String {
+    let offline = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout())
+    });
+    if offline {
+        return "Couldn't reach SoundCloud (offline?)".into();
+    }
+    // Drop wrappers that only repeat which song it was.
+    let parts: Vec<String> = e
+        .chain()
+        .map(|c| c.to_string())
+        .filter(|m| !(m.starts_with("couldn't load \"") && m.ends_with("from SoundCloud")))
+        .collect();
+    let text = if parts.is_empty() {
+        format!("{e}")
+    } else {
+        parts.join(": ")
+    };
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().chain(chars).collect(),
+        None => "Download failed".into(),
     }
 }
 
@@ -3536,6 +3880,18 @@ mod tests {
             links::target(&url),
             Some(Target::Spotify(LinkKind::Album, "4m2880jivSbbyEGAKfITCa".into()))
         );
+    }
+
+    #[test]
+    fn download_errors_are_short() {
+        let e =
+            anyhow!("SoundCloud /tracks/1 returned 404 Not Found").context("couldn't load \"Song\" from SoundCloud");
+        assert_eq!(
+            friendly_download_error(&e),
+            "SoundCloud /tracks/1 returned 404 Not Found"
+        );
+        let e = anyhow!("\"Song\" can't be downloaded: only a 30 second preview is available (Go+ track)");
+        assert!(friendly_download_error(&e).starts_with("\"Song\" can't be downloaded"));
     }
 
     fn track(source: Source, artist: &str, title: &str, dur: u64) -> Track {

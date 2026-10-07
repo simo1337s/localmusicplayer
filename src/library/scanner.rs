@@ -44,7 +44,7 @@ pub struct ScanResult {
     pub total_files: usize,
 }
 
-fn mtime_of(path: &Path) -> i64 {
+pub fn mtime_of(path: &Path) -> i64 {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()

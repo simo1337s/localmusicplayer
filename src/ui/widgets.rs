@@ -8,9 +8,9 @@ use egui_phosphor::regular as icon;
 
 use super::art::{ArtCache, MEDIUM, THUMB};
 use super::theme::{self, *};
-use super::{Action, Cx};
+use super::{Action, Cx, View};
 use crate::model::{Playlist, PlaylistKind, Source, Track};
-use crate::service::{Command, PlayStatus};
+use crate::service::{Command, DownloadState, Feed, PlayStatus};
 
 /// Draws `text` on one line, cut with an ellipsis at `max_w`. Returns the used rect.
 pub fn text_trunc(ui: &Ui, pos: Pos2, text: &str, font: FontId, color: Color32, max_w: f32) -> Rect {
@@ -277,6 +277,86 @@ pub fn action_button(ui: &mut Ui, glyph: &str, label: &str, primary: bool, accen
         fg,
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Where a SoundCloud song stands with downloads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Downloaded {
+    No,
+    /// Queued (0) or downloading.
+    Busy(f32),
+    Yes,
+}
+
+pub fn downloaded(feed: &Feed, track_id: &str) -> Downloaded {
+    if feed.downloaded.contains_key(track_id) {
+        return Downloaded::Yes;
+    }
+    match feed.downloads.iter().find(|d| d.track.id == track_id).map(|d| &d.state) {
+        Some(DownloadState::Queued) => Downloaded::Busy(0.0),
+        Some(DownloadState::Running(p)) => Downloaded::Busy(*p),
+        _ => Downloaded::No,
+    }
+}
+
+/// Download button for the SoundCloud songs among `tracks`; nothing when there are none.
+pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
+    let soundcloud: Vec<&Track> = tracks
+        .iter()
+        .copied()
+        .filter(|t| t.source == Source::SoundCloud)
+        .collect();
+    if soundcloud.is_empty() {
+        return;
+    }
+    let active: std::collections::HashSet<&str> = cx
+        .feed
+        .downloads
+        .iter()
+        .filter(|d| d.state.active())
+        .map(|d| d.track.id.as_str())
+        .collect();
+    let total = soundcloud.len();
+    let done = soundcloud
+        .iter()
+        .filter(|t| cx.feed.downloaded.contains_key(&t.id))
+        .count();
+    let busy = soundcloud.iter().filter(|t| active.contains(t.id.as_str())).count();
+    let others = tracks.len() - total;
+    let (glyph, color, tip) = if done == total {
+        let tip = if total == 1 {
+            "Downloaded".to_string()
+        } else {
+            format!("All {total} SoundCloud songs are downloaded")
+        };
+        (icon::CHECK_CIRCLE, cx.accent, tip)
+    } else if busy > 0 {
+        (
+            icon::DOWNLOAD_SIMPLE,
+            cx.accent,
+            format!("Downloading… {done} of {total} saved"),
+        )
+    } else {
+        let tip = match (total, done, others) {
+            (1, _, 0) => "Download".to_string(),
+            (n, 0, 0) => format!("Download {n} songs"),
+            (n, 0, _) => format!("Download the {n} SoundCloud songs (Spotify and Apple Music songs can't be saved)"),
+            (n, d, _) => format!("Download the other {} SoundCloud songs ({d} of {n} saved)", n - d),
+        };
+        (icon::DOWNLOAD_SIMPLE, TEXT_DIM, tip)
+    };
+    if icon_button(ui, glyph, size, color, &tip).clicked() {
+        if done == total || busy > 0 {
+            cx.actions.push(Action::Go(View::Downloads));
+        } else {
+            let todo = soundcloud
+                .into_iter()
+                .filter(|t| !cx.feed.downloaded.contains_key(&t.id))
+                .cloned()
+                .collect();
+            cx.actions.push(Action::Cmd(Command::Download(todo)));
+        }
+    }
 }
 
 /// Width [`pill`] will take for `text`.
@@ -578,14 +658,33 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             title_color,
             tw,
         );
+        // Downloaded (or downloading) SoundCloud songs get a small arrow before the artist.
+        let mut artist_x = tx;
+        if t.source == Source::SoundCloud {
+            let mark = match downloaded(cx.feed, &t.id) {
+                Downloaded::Yes => Some(cx.accent),
+                Downloaded::Busy(_) => Some(TEXT_FAINT),
+                Downloaded::No => None,
+            };
+            if let Some(color) = mark {
+                theme::paint_icon(
+                    ui.painter(),
+                    Pos2::new(tx + 6.0, row.top() + 38.0),
+                    icon::ARROW_CIRCLE_DOWN,
+                    theme::icon_font(13.0),
+                    color,
+                );
+                artist_x += 17.0;
+            }
+        }
         let artist = link_text(
             ui,
             Id::new((opts.id, i, "artist")),
-            Pos2::new(tx, row.top() + 30.0),
+            Pos2::new(artist_x, row.top() + 30.0),
             &t.artist,
             theme::font(12.5),
             if hovered { TEXT } else { TEXT_DIM },
-            tw,
+            tw - (artist_x - tx),
         );
         if artist.clicked() {
             cx.actions.push(artist_action(cx.lib, &t.artist));
@@ -796,6 +895,24 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             }
         }
         Source::SoundCloud => {
+            if let Some(file) = cx.feed.downloaded.get(&t.id) {
+                if ui.button(theme::ic(icon::FOLDER_OPEN, "Show in folder")).clicked() {
+                    if let Some(dir) = file.parent() {
+                        cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
+                    }
+                    ui.close();
+                }
+            } else {
+                let busy = cx.feed.downloads.iter().any(|d| d.track.id == t.id && d.state.active());
+                let label = if busy { "Downloading…" } else { "Download" };
+                if ui
+                    .add_enabled(!busy, egui::Button::new(theme::ic(icon::DOWNLOAD_SIMPLE, label)))
+                    .clicked()
+                {
+                    cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()])));
+                    ui.close();
+                }
+            }
             if t.uri.starts_with("http")
                 && ui
                     .button(theme::ic(icon::ARROW_SQUARE_OUT, "Open on SoundCloud"))
