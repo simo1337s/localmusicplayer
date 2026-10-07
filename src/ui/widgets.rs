@@ -350,6 +350,24 @@ pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
     }
 }
 
+/// Whether the yt-dlp `program` runs: its version, or why not. Asks the service the first time
+/// (and whenever the program changes); `None` until it has answered.
+pub fn ytdlp_status(ui: &Ui, cx: &mut Cx, program: &str) -> Option<Result<String, String>> {
+    let program = program.trim().to_string();
+    if let Some((checked, result)) = &cx.feed.ytdlp {
+        if *checked == program {
+            return Some(result.clone());
+        }
+    }
+    let id = Id::new("ytdlp-check");
+    let asked: Option<String> = ui.data(|d| d.get_temp(id));
+    if asked.as_deref() != Some(program.as_str()) {
+        ui.data_mut(|d| d.insert_temp(id, program.clone()));
+        cx.actions.push(Action::Cmd(Command::CheckYtDlp(program)));
+    }
+    None
+}
+
 /// Width [`pill`] will take for `text`.
 pub fn pill_width(ui: &Ui, text: &str) -> f32 {
     ui.painter()

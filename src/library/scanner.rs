@@ -58,7 +58,16 @@ pub fn mtime_of(path: &Path) -> i64 {
 pub fn scan(folders: &[PathBuf], known: &HashMap<String, i64>, progress: &(dyn Fn(usize, usize) + Sync)) -> ScanResult {
     let mut files = Vec::new();
     for folder in folders {
-        for entry in walkdir::WalkDir::new(folder).follow_links(true).into_iter().flatten() {
+        let entries = walkdir::WalkDir::new(folder)
+            .follow_links(true)
+            .into_iter()
+            // Downloads in progress.
+            .filter_entry(|e| {
+                !e.file_name()
+                    .to_string_lossy()
+                    .starts_with(crate::downloader::WORK_PREFIX)
+            });
+        for entry in entries.flatten() {
             if entry.file_type().is_file() && is_audio_file(entry.path()) {
                 files.push(entry.into_path());
             }
@@ -232,6 +241,9 @@ mod tests {
         let album = dir.join("Artist").join("Album");
         std::fs::create_dir_all(&album).unwrap();
         std::fs::write(album.join("01 Song.mp3"), b"not really audio").unwrap();
+        // A download in progress is not part of the library yet.
+        std::fs::create_dir_all(dir.join(".multimusic-1-1")).unwrap();
+        std::fs::write(dir.join(".multimusic-1-1").join("half.mp3"), b"x").unwrap();
         std::fs::write(album.join("cover.jpg"), b"jpg").unwrap();
 
         let mut known = HashMap::new();

@@ -786,6 +786,11 @@ impl eframe::App for App {
                             view: &self.view,
                             download_dir: &download_dir,
                             download_custom: !custom.is_empty(),
+                            ytdlp: self
+                                .cfg
+                                .downloads
+                                .youtube
+                                .then_some(self.cfg.downloads.ytdlp_path.as_str()),
                             search_text: &self.search_text,
                             search_cache: &mut self.search_cache,
                             filter_text: &mut self.filter_text,

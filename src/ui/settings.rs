@@ -270,6 +270,41 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.checkbox(&mut cfg.downloads.youtube, "Find Spotify and Apple Music songs on YouTube");
                 if cfg.downloads.youtube {
                     text_field(ui, "yt-dlp program", &mut cfg.downloads.ytdlp_path, "yt-dlp", false);
+                    let green = Color32::from_rgb(0x4a, 0xd6, 0x8a);
+                    match widgets::ytdlp_status(ui, cx, &cfg.downloads.ytdlp_path) {
+                        Some(Ok(version)) => {
+                            ui.label(RichText::new(format!("yt-dlp {version} is ready")).size(12.5).color(green));
+                        }
+                        Some(Err(why)) => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    RichText::new(format!("yt-dlp {why}. Install it with: sudo pacman -S yt-dlp"))
+                                        .size(12.5)
+                                        .color(DANGER),
+                                );
+                                if ui.small_button("Check again").clicked() {
+                                    let program = cfg.downloads.ytdlp_path.trim().to_string();
+                                    cx.actions.push(Action::Cmd(Command::CheckYtDlp(program)));
+                                }
+                            });
+                        }
+                        None => {
+                            ui.label(RichText::new("Checking yt-dlp…").size(12.5).color(TEXT_FAINT));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    text_field(
+                        ui,
+                        "Extra yt-dlp options",
+                        &mut cfg.downloads.ytdlp_args,
+                        "--cookies-from-browser firefox",
+                        false,
+                    );
+                    hint(
+                        ui,
+                        "If YouTube asks yt-dlp to confirm you're not a bot, --cookies-from-browser firefox (or \
+                         chrome) lets it use your browser's YouTube login.",
+                    );
                 }
                 hint(
                     ui,

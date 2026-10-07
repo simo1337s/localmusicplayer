@@ -56,13 +56,96 @@ const UNWANTED: &[&str] = &[
     "tutorial",
 ];
 
-fn command(ytdlp: &str) -> Command {
-    let mut cmd = Command::new(ytdlp);
-    // The user's own yt-dlp config could change file names or formats.
-    cmd.args(["--ignore-config", "--no-warnings"])
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    cmd
+/// The yt-dlp program and the user's extra options (e.g. `--cookies-from-browser firefox`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct YtDlp {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl YtDlp {
+    /// From the settings: the program and its extra options as typed (quotes allowed).
+    pub fn new(program: &str, args: &str) -> YtDlp {
+        YtDlp {
+            program: program.trim().to_string(),
+            args: split_args(args),
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(&self.program);
+        // The user's yt-dlp config file could change file names or formats; their extra
+        // options go first so the ones MultiMusic needs win.
+        cmd.args(["--ignore-config", "--no-warnings"])
+            .args(&self.args)
+            .stdin(Stdio::null())
+            .kill_on_drop(true);
+        cmd
+    }
+
+    /// yt-dlp's version, i.e. whether it is installed and runs.
+    pub async fn version(&self) -> Result<String> {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let out = tokio::time::timeout(Duration::from_secs(20), cmd.output())
+            .await
+            .map_err(|_| anyhow!("yt-dlp didn't answer"))?
+            .map_err(spawn_error)?;
+        if !out.status.success() {
+            bail!("{}", last_error(&String::from_utf8_lossy(&out.stderr)));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+}
+
+/// Splits options typed in a text field: by spaces, keeping "quoted parts" together.
+pub fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    out.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                current.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        out.push(current);
+    }
+    out
+}
+
+/// Turns YouTube's "Sign in to confirm you're not a bot" check, which browser cookies get
+/// past, into what to do about it.
+fn explain(reason: &str) -> String {
+    let lower = reason.to_lowercase();
+    if lower.contains("not a bot") {
+        format!(
+            "YouTube wants a signed-in browser: add --cookies-from-browser firefox (or chrome) under \
+             Settings → Downloads → Extra yt-dlp options ({reason})"
+        )
+    } else {
+        reason.to_string()
+    }
 }
 
 fn spawn_error(e: std::io::Error) -> anyhow::Error {
@@ -74,8 +157,8 @@ fn spawn_error(e: std::io::Error) -> anyhow::Error {
 }
 
 /// Searches YouTube for `query`.
-pub async fn search(ytdlp: &str, query: &str, limit: usize) -> Result<Vec<Video>> {
-    let mut cmd = command(ytdlp);
+pub async fn search(ytdlp: &YtDlp, query: &str, limit: usize) -> Result<Vec<Video>> {
+    let mut cmd = ytdlp.command();
     cmd.args(["--flat-playlist", "--dump-single-json"])
         .arg(format!("ytsearch{limit}:{query}"))
         .stdout(Stdio::piped())
@@ -87,7 +170,7 @@ pub async fn search(ytdlp: &str, query: &str, limit: usize) -> Result<Vec<Video>
     if !out.status.success() {
         bail!(
             "YouTube search failed: {}",
-            last_error(&String::from_utf8_lossy(&out.stderr))
+            explain(&last_error(&String::from_utf8_lossy(&out.stderr)))
         );
     }
     parse_search(&out.stdout)
@@ -196,7 +279,7 @@ pub fn rank<'a>(videos: &'a [Video], title: &str, artist: &str, duration: Option
 
 /// Saves the audio of video `id` into `dir` (Opus or AAC as YouTube has it, no re-encoding).
 /// Returns the file.
-pub async fn download(ytdlp: &str, id: &str, dir: &Path, progress: &(dyn Fn(f32) + Send + Sync)) -> Result<PathBuf> {
+pub async fn download(ytdlp: &YtDlp, id: &str, dir: &Path, progress: &(dyn Fn(f32) + Send + Sync)) -> Result<PathBuf> {
     let stem = format!(".multimusic-yt-{id}");
     let result = tokio::time::timeout(
         Duration::from_secs(30 * 60),
@@ -211,13 +294,13 @@ pub async fn download(ytdlp: &str, id: &str, dir: &Path, progress: &(dyn Fn(f32)
 }
 
 async fn run_download(
-    ytdlp: &str,
+    ytdlp: &YtDlp,
     id: &str,
     dir: &Path,
     stem: &str,
     progress: &(dyn Fn(f32) + Send + Sync),
 ) -> Result<PathBuf> {
-    let mut cmd = command(ytdlp);
+    let mut cmd = ytdlp.command();
     cmd.args([
         "--no-playlist",
         "--newline",
@@ -255,7 +338,7 @@ async fn run_download(
         if reason.contains("ffmpeg") || reason.contains("ffprobe") {
             bail!("yt-dlp needs ffmpeg to save audio (sudo pacman -S ffmpeg)");
         }
-        bail!("YouTube: {reason}");
+        bail!("YouTube: {}", explain(&reason));
     }
     let path = match file.map(PathBuf::from).filter(|p| p.exists()) {
         Some(p) => p,
@@ -455,6 +538,19 @@ mod tests {
     }
 
     #[test]
+    fn options_from_the_settings() {
+        assert_eq!(
+            split_args("  --cookies-from-browser   firefox "),
+            vec!["--cookies-from-browser", "firefox"]
+        );
+        assert_eq!(
+            split_args(r#"--cookies "/home/me/my cookies.txt" -4 --proxy ''"#),
+            vec!["--cookies", "/home/me/my cookies.txt", "-4", "--proxy", ""]
+        );
+        assert!(split_args("").is_empty());
+    }
+
+    #[test]
     fn readable_errors() {
         let out = "[youtube] Extracting URL\nERROR: [youtube] dQw4w9WgXcQ: Sign in to confirm your age. This video may be inappropriate\n";
         assert_eq!(
@@ -466,6 +562,11 @@ mod tests {
             "Postprocessing: ffprobe and ffmpeg not found."
         );
         assert_eq!(last_error(""), "yt-dlp failed");
+        assert!(explain("Sign in to confirm you're not a bot. Use --cookies-from-browser").contains("Settings"));
+        assert_eq!(
+            explain("Sign in to confirm your age. This video may be inappropriate"),
+            "Sign in to confirm your age. This video may be inappropriate"
+        );
     }
 
     /// Writes an executable stand-in for yt-dlp.
@@ -498,9 +599,13 @@ mod tests {
             "search",
             r#"echo '{"entries":[{"id":"dQw4w9WgXcQ","title":"Never Gonna Give You Up","channel":"Rick Astley - Topic","duration":213}]}'"#,
         );
-        let found = search(&search_tool, "Rick Astley - Never Gonna Give You Up", 10)
-            .await
-            .unwrap();
+        let found = search(
+            &YtDlp::new(&search_tool, ""),
+            "Rick Astley - Never Gonna Give You Up",
+            10,
+        )
+        .await
+        .unwrap();
         assert_eq!(found[0].id, "dQw4w9WgXcQ");
 
         // Download: progress on both streams, then the path of the saved file.
@@ -522,7 +627,8 @@ printf 'OggS' > "$file"
 echo "mmfile $file""#,
         );
         let seen = std::sync::Mutex::new(Vec::new());
-        let path = download(&download_tool, "dQw4w9WgXcQ", &out, &|p| seen.lock().unwrap().push(p))
+        let tool = YtDlp::new(&download_tool, "--cookies-from-browser firefox");
+        let path = download(&tool, "dQw4w9WgXcQ", &out, &|p| seen.lock().unwrap().push(p))
             .await
             .unwrap();
         assert_eq!(path, out.join(".multimusic-yt-dQw4w9WgXcQ.opus"));
@@ -541,13 +647,19 @@ touch "$dir/.multimusic-yt-abcdefghijk.webm.part"
 echo "ERROR: [youtube] abcdefghijk: Video unavailable" >&2
 exit 1"#,
         );
-        let err = download(&failing, "abcdefghijk", &out, &|_| {}).await.unwrap_err();
+        let err = download(&YtDlp::new(&failing, ""), "abcdefghijk", &out, &|_| {})
+            .await
+            .unwrap_err();
         assert_eq!(err.to_string(), "YouTube: Video unavailable");
         assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
 
         // Not installed.
-        let err = search("/nonexistent/yt-dlp", "x", 1).await.unwrap_err();
+        let missing = YtDlp::new("/nonexistent/yt-dlp", "");
+        let err = search(&missing, "x", 1).await.unwrap_err();
         assert!(err.is::<NotInstalled>());
+        assert!(missing.version().await.unwrap_err().is::<NotInstalled>());
+        let version = fake_ytdlp(&dir, "version", "echo 2026.09.30");
+        assert_eq!(YtDlp::new(&version, "").version().await.unwrap(), "2026.09.30");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

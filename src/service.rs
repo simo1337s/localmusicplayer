@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::config::{Config, Paths};
-use crate::downloader::{Downloader, Saved};
+use crate::downloader::{self, Downloader, Saved};
 use crate::integrations::discord::{Discord, Presence};
 use crate::integrations::lastfm::{Lastfm, ScrobbleTracker};
 use crate::integrations::lyrics::LyricsFetcher;
@@ -27,6 +27,7 @@ use crate::player::spotify::{self, SpotifyAuth, SpotifyDeck, SpotifyEngine, Spot
 use crate::providers::apple_music::{self, AppleMusicApi};
 use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
 use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
+use crate::providers::youtube::YtDlp;
 
 /// Requests from the UI (and MPRIS).
 #[derive(Debug, Clone)]
@@ -95,6 +96,12 @@ pub enum Command {
     Download(Vec<Track>),
     /// Remove finished and failed entries from the Downloads list.
     ClearDownloads,
+    /// Stop a waiting or running download (by track id).
+    CancelDownload(String),
+    /// Stop every waiting and running download.
+    CancelDownloads,
+    /// Find out whether this yt-dlp program runs (answer in `Feed::ytdlp`).
+    CheckYtDlp(String),
     UpdateConfig(Box<Config>),
     Raise,
     Quit,
@@ -267,8 +274,10 @@ pub struct Feed {
     pub lyrics: LyricsState,
     /// Downloads started this session, oldest first.
     pub downloads: Vec<DownloadItem>,
-    /// Downloaded SoundCloud songs: track id → file.
+    /// Downloaded songs: track id → file.
     pub downloaded: HashMap<String, PathBuf>,
+    /// The yt-dlp program last checked, and its version or why it doesn't run.
+    pub ytdlp: Option<(String, Result<String, String>)>,
     pub spotify: AccountStatus,
     /// True while a Spotify login is stored, whatever the current status message says.
     pub spotify_logged_in: bool,
@@ -379,6 +388,10 @@ enum Internal {
     DownloadDone {
         track: Track,
         result: Result<Saved>,
+    },
+    YtDlpChecked {
+        program: String,
+        result: Result<String, String>,
     },
     /// Status text while the Spotify library syncs.
     SyncProgress(String),
@@ -519,7 +532,9 @@ pub struct Service {
     mpris: Mpris,
     last_tick: Instant,
 
-    downloads_running: usize,
+    /// Running downloads by track id: their task and work folder.
+    download_jobs: HashMap<String, (tokio::task::AbortHandle, PathBuf)>,
+    download_seq: u64,
     /// Title and error (if any) of each download finished since the queue was last empty.
     download_batch: Vec<(String, Option<String>)>,
 }
@@ -634,7 +649,8 @@ impl Service {
             discord,
             mpris,
             last_tick: Instant::now(),
-            downloads_running: 0,
+            download_jobs: HashMap::new(),
+            download_seq: 0,
             download_batch: Vec::new(),
             cfg,
         };
@@ -677,6 +693,7 @@ impl Service {
     fn startup(&mut self) {
         self.publish_accounts();
         self.load_downloads();
+        self.clear_download_leftovers();
         self.restore_session();
         if self.cfg.library.scan_on_startup && !self.cfg.library.folders.is_empty() {
             self.start_scan();
@@ -970,6 +987,21 @@ impl Service {
             Command::ClearDownloads => {
                 self.shared.feed.write().unwrap().downloads.retain(|d| d.state.active());
                 self.shared.repaint();
+            }
+            Command::CancelDownload(id) => self.cancel_downloads(Some(&id)),
+            Command::CancelDownloads => self.cancel_downloads(None),
+            Command::CheckYtDlp(program) => {
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    let result = YtDlp::new(&program, "").version().await.map_err(|e| {
+                        if e.is::<crate::providers::youtube::NotInstalled>() {
+                            "not installed".to_string()
+                        } else {
+                            format!("{e:#}")
+                        }
+                    });
+                    let _ = tx.send(Internal::YtDlpChecked { program, result });
+                });
             }
             Command::UpdateConfig(cfg) => self.update_config(*cfg).await,
             Command::Raise => {
@@ -2777,7 +2809,7 @@ impl Service {
     /// Starts queued downloads, a couple at a time.
     fn pump_downloads(&mut self) {
         const PARALLEL: usize = 2;
-        while self.downloads_running < PARALLEL {
+        while self.download_jobs.len() < PARALLEL {
             let track = {
                 let mut feed = self.shared.feed.write().unwrap();
                 let Some(item) = feed.downloads.iter_mut().find(|d| d.state == DownloadState::Queued) else {
@@ -2786,9 +2818,14 @@ impl Service {
                 item.state = DownloadState::Running(0.0);
                 item.track.clone()
             };
-            self.downloads_running += 1;
-            let wants_spotify =
-                track.source == Source::Spotify && self.cfg.spotify.enabled && self.spotify_auth.has_login();
+            // Apple Music songs already matched to Spotify get Spotify's details.
+            let spotify_twin = (track.source == Source::AppleMusic)
+                .then(|| self.cached_resolution(&track))
+                .flatten()
+                .filter(|t| t.source == Source::Spotify);
+            let wants_spotify = (track.source == Source::Spotify || spotify_twin.is_some())
+                && self.cfg.spotify.enabled
+                && self.spotify_auth.has_login();
             let spotify = if wants_spotify { self.spotify_session() } else { None };
             let d = &self.cfg.downloads;
             let downloader = Downloader {
@@ -2796,16 +2833,17 @@ impl Service {
                 http: self.http.clone(),
                 lyrics: d.lyrics.then(|| self.lyrics.clone()),
                 spotify,
-                ytdlp: if d.youtube {
-                    d.ytdlp_path.trim().to_string()
-                } else {
-                    String::new()
-                },
+                spotify_twin,
+                ytdlp: d.youtube.then(|| YtDlp::new(&d.ytdlp_path, &d.ytdlp_args)),
             };
             let dir = self.cfg.download_dir(track.source);
+            self.download_seq += 1;
+            let work = dir.join(downloader::work_dir_name(self.download_seq));
+            let job_work = work.clone();
+            let job_id = track.id.clone();
             let shared = self.shared.clone();
             let tx = self.internal_tx.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let id = track.id.clone();
                 let last = std::sync::Mutex::new(Instant::now());
                 let progress = |p: f32| {
@@ -2825,15 +2863,16 @@ impl Service {
                     drop(feed);
                     shared.repaint();
                 };
-                let result = downloader.download(&track, &dir, &progress).await;
+                let result = downloader.download(&track, &dir, &job_work, &progress).await;
                 let _ = tx.send(Internal::DownloadDone { track, result });
             });
+            self.download_jobs.insert(job_id, (task.abort_handle(), work));
         }
         self.shared.repaint();
     }
 
     fn download_finished(&mut self, track: Track, result: Result<Saved>) {
-        self.downloads_running = self.downloads_running.saturating_sub(1);
+        self.download_jobs.remove(&track.id);
         let state = match result {
             Ok(Saved { path, from }) => {
                 let _ = self
@@ -2881,6 +2920,75 @@ impl Service {
             }
         }
         self.pump_downloads();
+    }
+
+    /// Stops the download of `id`, or all of them.
+    fn cancel_downloads(&mut self, id: Option<&str>) {
+        let cancelled: Vec<String> = {
+            let mut feed = self.shared.feed.write().unwrap();
+            let picked = |d: &DownloadItem| d.state.active() && id.is_none_or(|id| d.track.id == id);
+            let ids = feed
+                .downloads
+                .iter()
+                .filter(|d| picked(d))
+                .map(|d| d.track.id.clone())
+                .collect();
+            feed.downloads.retain(|d| !picked(d));
+            ids
+        };
+        for track_id in &cancelled {
+            if let Some((task, work)) = self.download_jobs.remove(track_id) {
+                task.abort();
+                // yt-dlp / ffmpeg are killed with the task; give them a moment to let go of
+                // the folder.
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = tokio::fs::remove_dir_all(&work).await;
+                });
+            }
+        }
+        if id.is_none() && !cancelled.is_empty() {
+            self.shared.info(match cancelled.len() {
+                1 => "Download cancelled".to_string(),
+                n => format!("{n} downloads cancelled"),
+            });
+        }
+        if !self
+            .shared
+            .feed
+            .read()
+            .unwrap()
+            .downloads
+            .iter()
+            .any(|d| d.state.active())
+        {
+            self.download_batch.clear();
+        }
+        self.pump_downloads();
+    }
+
+    /// Clears work folders a crash or power cut left in the download folders.
+    fn clear_download_leftovers(&self) {
+        let mut dirs: Vec<PathBuf> = [Source::SoundCloud, Source::Spotify, Source::AppleMusic]
+            .into_iter()
+            .map(|s| self.cfg.download_dir(s))
+            .collect();
+        dirs.dedup();
+        tokio::task::spawn_blocking(move || {
+            for dir in dirs {
+                let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+                for entry in entries.flatten() {
+                    if entry.file_name().to_string_lossy().starts_with(downloader::WORK_PREFIX) {
+                        let path = entry.path();
+                        let _ = if path.is_dir() {
+                            std::fs::remove_dir_all(&path)
+                        } else {
+                            std::fs::remove_file(&path)
+                        };
+                    }
+                }
+            }
+        });
     }
 
     /// Puts a finished download straight into the library when it was saved inside a library
@@ -3288,6 +3396,10 @@ impl Service {
                 self.shared.repaint();
             }
             Internal::DownloadDone { track, result } => self.download_finished(track, result),
+            Internal::YtDlpChecked { program, result } => {
+                self.shared.feed.write().unwrap().ytdlp = Some((program, result));
+                self.shared.repaint();
+            }
             Internal::LastfmSession(r) => match r {
                 Ok((key, user)) => {
                     self.cfg.lastfm.session_key = key;

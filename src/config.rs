@@ -177,6 +177,8 @@ pub struct DownloadsConfig {
     /// Look for Spotify and Apple Music songs on YouTube (needs yt-dlp) before SoundCloud.
     pub youtube: bool,
     pub ytdlp_path: String,
+    /// Extra yt-dlp options, e.g. `--cookies-from-browser firefox` for YouTube's bot check.
+    pub ytdlp_args: String,
     /// Embed lyrics (from LRCLIB, time-synced when available).
     pub lyrics: bool,
 }
@@ -187,6 +189,7 @@ impl Default for DownloadsConfig {
             folder: String::new(),
             youtube: true,
             ytdlp_path: "yt-dlp".into(),
+            ytdlp_args: String::new(),
             lyrics: true,
         }
     }

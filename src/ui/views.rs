@@ -18,6 +18,8 @@ pub struct ViewState<'a> {
     /// per-service folders.
     pub download_dir: &'a std::path::Path,
     pub download_custom: bool,
+    /// The yt-dlp program, when YouTube downloads are on.
+    pub ytdlp: Option<&'a str>,
     /// What's typed in the top bar.
     pub search_text: &'a str,
     pub search_cache: &'a mut (String, u64, Vec<String>),
@@ -1647,6 +1649,9 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                 let _ = std::fs::create_dir_all(st.download_dir);
                 cx.actions.push(Action::OpenUrl(dir.clone()));
             }
+            if active > 0 && widgets::pill(ui, "Cancel all", HOVER, TEXT).clicked() {
+                cx.actions.push(Action::Cmd(Command::CancelDownloads));
+            }
             if finished > 0 && widgets::pill(ui, "Clear list", HOVER, TEXT).clicked() {
                 cx.actions.push(Action::Cmd(Command::ClearDownloads));
             }
@@ -1692,14 +1697,21 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             }
             ui.add_space(18.0);
         }
-        ui.label(
-            egui::RichText::new(
+        let note = match st.ytdlp.map(|program| widgets::ytdlp_status(ui, cx, program)) {
+            Some(Some(Err(_))) => {
+                "yt-dlp isn't installed, so Spotify and Apple Music songs are only looked for on SoundCloud. \
+                 Install it to find them on YouTube: sudo pacman -S yt-dlp"
+            }
+            Some(_) => {
                 "Spotify and Apple Music audio is DRM-protected, so those songs are saved from the same \
-                 recording on YouTube (with yt-dlp) or SoundCloud, then tagged with all their details.",
-            )
-            .size(12.0)
-            .color(TEXT_FAINT),
-        );
+                 recording on YouTube or SoundCloud, then tagged with all their details."
+            }
+            None => {
+                "Spotify and Apple Music audio is DRM-protected, so those songs are saved from the same \
+                 recording on SoundCloud (YouTube is off in Settings), then tagged with all their details."
+            }
+        };
+        ui.label(egui::RichText::new(note).size(12.0).color(TEXT_FAINT));
     });
 }
 
@@ -1746,32 +1758,33 @@ fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i
         rect.right_bottom() - vec2(8.0, 0.0),
     );
     let painter = ui.painter();
-    let mut button: Option<(&str, &str)> = None;
-    match &row.state {
+    let button: Option<(&str, &str)> = match &row.state {
         DownloadState::Queued => {
             painter.text(
-                right.right_center(),
+                right.right_center() - vec2(40.0, 0.0),
                 Align2::RIGHT_CENTER,
                 "Waiting…",
                 theme::font(13.0),
                 TEXT_FAINT,
             );
+            Some((icon::X, "Cancel"))
         }
         DownloadState::Running(p) => {
             let bar = Rect::from_min_size(
                 Pos2::new(right.left(), right.center().y - 2.0),
-                vec2(right.width() - 48.0, 4.0),
+                vec2((right.width() - 88.0).max(20.0), 4.0),
             );
             painter.rect_filled(bar, CornerRadius::same(2), SELECTED);
             let filled = Rect::from_min_size(bar.min, vec2(bar.width() * p.clamp(0.0, 1.0), bar.height()));
             painter.rect_filled(filled, CornerRadius::same(2), cx.accent);
             painter.text(
-                right.right_center(),
+                right.right_center() - vec2(40.0, 0.0),
                 Align2::RIGHT_CENTER,
                 format!("{:.0}%", p * 100.0),
                 theme::font(13.0),
                 TEXT_DIM,
             );
+            Some((icon::X, "Cancel"))
         }
         DownloadState::Done { from, .. } => {
             let label = match from.as_str() {
@@ -1786,7 +1799,7 @@ fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i
                 theme::font(13.0),
                 TEXT_DIM,
             );
-            button = Some((icon::FOLDER_OPEN, "Show in folder"));
+            Some((icon::FOLDER_OPEN, "Show in folder"))
         }
         DownloadState::Failed(e) => {
             let used = text_trunc(
@@ -1798,9 +1811,9 @@ fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i
                 right.width() - 44.0,
             );
             let _ = ui.interact(used, id.with("error"), Sense::hover()).on_hover_text(e);
-            button = Some((icon::ARROW_CLOCKWISE, "Try again"));
+            Some((icon::ARROW_CLOCKWISE, "Try again"))
         }
-    }
+    };
     let mut button_clicked = false;
     if let Some((glyph, tip)) = button {
         let r = Rect::from_center_size(Pos2::new(right.right() - 14.0, right.center().y), vec2(30.0, 30.0));
@@ -1815,7 +1828,10 @@ fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i
                         cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
                     }
                 }
-                _ => cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()]))),
+                DownloadState::Queued | DownloadState::Running(_) => {
+                    cx.actions.push(Action::Cmd(Command::CancelDownload(t.id.clone())));
+                }
+                DownloadState::Failed(_) => cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()]))),
             }
         }
     }

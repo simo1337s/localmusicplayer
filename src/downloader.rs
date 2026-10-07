@@ -14,7 +14,8 @@ use crate::integrations::lyrics::{self, LyricsFetcher};
 use crate::library::tags::{self, Metadata};
 use crate::model::{Source, Track};
 use crate::providers::soundcloud::{self, DownloadKind, SoundCloud};
-use crate::providers::{spotify_internal, youtube};
+use crate::providers::spotify_internal;
+use crate::providers::youtube::{self, YtDlp};
 
 pub type Progress<'a> = &'a (dyn Fn(f32) + Send + Sync);
 
@@ -25,8 +26,10 @@ pub struct Downloader {
     pub lyrics: Option<Arc<LyricsFetcher>>,
     /// For the full details of Spotify songs.
     pub spotify: Option<Session>,
-    /// yt-dlp binary; empty = don't look on YouTube.
-    pub ytdlp: String,
+    /// The same song on Spotify, for an Apple Music song's details.
+    pub spotify_twin: Option<Track>,
+    /// `None`: don't look on YouTube.
+    pub ytdlp: Option<YtDlp>,
 }
 
 /// A saved song.
@@ -38,19 +41,27 @@ pub struct Saved {
 }
 
 impl Downloader {
-    pub async fn download(&self, track: &Track, dir: &Path, progress: Progress<'_>) -> Result<Saved> {
-        tokio::fs::create_dir_all(dir)
+    /// Downloads `track` into `dir`. Work happens in `work` (a folder of its own inside
+    /// `dir`), which is removed afterwards, so a failed or cancelled download leaves nothing.
+    pub async fn download(&self, track: &Track, dir: &Path, work: &Path, progress: Progress<'_>) -> Result<Saved> {
+        tokio::fs::create_dir_all(work)
             .await
             .with_context(|| format!("couldn't create {}", dir.display()))?;
+        let result = self.download_in(track, dir, work, progress).await;
+        let _ = tokio::fs::remove_dir_all(work).await;
+        result
+    }
+
+    async fn download_in(&self, track: &Track, dir: &Path, work: &Path, progress: Progress<'_>) -> Result<Saved> {
         let (path, mut meta, from, keep_existing) = match track.source {
             Source::SoundCloud => {
-                let saved = self.soundcloud.download(track, dir, progress).await?;
+                let saved = self.soundcloud.download(track, work, progress).await?;
                 let original = saved.kind == DownloadKind::Original;
                 let from = if original { "original file" } else { "SoundCloud" };
                 (saved.path, saved.meta, from.to_string(), original)
             }
             Source::Spotify | Source::AppleMusic => {
-                let (path, from) = self.find_and_download(track, dir, progress).await?;
+                let (path, from) = self.find_and_download(track, work, progress).await?;
                 (path, self.details(track).await, from, false)
             }
             Source::Local => bail!("this song is already a file on your computer"),
@@ -75,7 +86,7 @@ impl Downloader {
                 Err(e) => warn!("tagging {} failed: {e}", path.display()),
             }
         }
-        let path = rename(path, dir, &soundcloud::file_stem(&meta.artist, &meta.title)).await?;
+        let path = move_into(&path, dir, &soundcloud::file_stem(&meta.artist, &meta.title)).await?;
         info!("saved \"{}\" ({from}) to {}", meta.title, path.display());
         Ok(Saved { path, from })
     }
@@ -83,12 +94,17 @@ impl Downloader {
     /// The song's details: everything Spotify knows for Spotify songs, else what the library
     /// has.
     async fn details(&self, track: &Track) -> Metadata {
-        if track.source == Source::Spotify {
+        // An Apple Music song MultiMusic already matched to Spotify gets Spotify's details.
+        let on_spotify = match track.source {
+            Source::Spotify => Some(track),
+            _ => self.spotify_twin.as_ref().filter(|t| t.source == Source::Spotify),
+        };
+        if let Some(spotify_track) = on_spotify {
             if let Some(session) = &self.spotify {
-                match spotify_internal::track_details(session, &track.id).await {
+                match spotify_internal::track_details(session, &spotify_track.id).await {
                     Ok(meta) if !meta.title.is_empty() => return meta,
                     Ok(_) => {}
-                    Err(e) => warn!("Spotify details of {}: {e:#}", track.id),
+                    Err(e) => warn!("Spotify details of {}: {e:#}", spotify_track.id),
                 }
             }
         }
@@ -102,17 +118,15 @@ impl Downloader {
         let duration = (track.duration_ms > 0).then(|| track.duration_ms as f64 / 1000.0);
 
         let mut youtube_problem = None;
-        if self.ytdlp.is_empty() {
-            youtube_problem = Some("YouTube is turned off in Settings".to_string());
-        } else {
-            match youtube::search(&self.ytdlp, &format!("{artist} - {title}"), 10).await {
+        if let Some(ytdlp) = &self.ytdlp {
+            match youtube::search(ytdlp, &format!("{artist} - {title}"), 10).await {
                 Ok(videos) => {
                     let ranked = youtube::rank(&videos, &track.title, &track.artist, duration);
                     if ranked.is_empty() {
                         youtube_problem = Some("no matching video on YouTube".into());
                     }
                     for video in ranked.into_iter().take(3) {
-                        match youtube::download(&self.ytdlp, &video.id, dir, progress).await {
+                        match youtube::download(ytdlp, &video.id, dir, progress).await {
                             Ok(path) => return Ok((path, "YouTube".into())),
                             Err(e) => {
                                 warn!("YouTube {} for {}: {e:#}", video.id, track.id);
@@ -130,6 +144,8 @@ impl Downloader {
                 }
                 Err(e) => youtube_problem = Some(format!("{e:#}")),
             }
+        } else {
+            youtube_problem = Some("YouTube is turned off in Settings".to_string());
         }
 
         // An upload of the same recording on SoundCloud.
@@ -257,25 +273,26 @@ async fn is_fragmented_mp4(path: &Path) -> bool {
     false
 }
 
-/// Renames a fresh download to "Artist - Title.ext" (unless it already has that name).
-async fn rename(path: PathBuf, dir: &Path, stem: &str) -> Result<PathBuf> {
-    let current = path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if current == stem || current.starts_with(&format!("{stem} (")) {
-        return Ok(path);
-    }
+/// Moves a finished download from its work folder into `dir` as "Artist - Title.ext".
+async fn move_into(path: &Path, dir: &Path, stem: &str) -> Result<PathBuf> {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_string())
         .unwrap_or_else(|| "mp3".into());
     let target = soundcloud::unique_path(dir, stem, &ext);
-    tokio::fs::rename(&path, &target)
+    tokio::fs::rename(path, &target)
         .await
         .with_context(|| format!("couldn't save {}", target.display()))?;
     Ok(target)
 }
+
+/// Name of the work folder of download number `n`. Anything named like this in a download
+/// folder is a leftover (the scanner skips it, and it is cleared on start).
+pub fn work_dir_name(n: u64) -> String {
+    format!("{WORK_PREFIX}{}-{n}", std::process::id())
+}
+
+pub const WORK_PREFIX: &str = ".multimusic-";
 
 #[cfg(test)]
 mod tests {
