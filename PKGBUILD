@@ -11,6 +11,7 @@ depends=('mpv' 'libpulse' 'alsa-lib' 'openssl' 'libxkbcommon' 'libglvnd' 'waylan
          'hicolor-icon-theme' 'gcc-libs' 'glibc')
 makedepends=('cargo')
 optdepends=('pipewire-pulse: Spotify output on PipeWire desktops (usually already installed)'
+            'noto-fonts: symbols (☆ ✞ ♡ ...) in song and artist names'
             'noto-fonts-cjk: Japanese, Chinese and Korean song titles'
             'inter-font: nicer interface font'
             'discord: Rich Presence (also works with Vesktop / arRPC)')

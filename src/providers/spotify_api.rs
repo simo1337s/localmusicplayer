@@ -35,8 +35,20 @@ const MAX_RETRY_AFTER_SECS: u64 = 30;
 /// A `Retry-After` beyond this means we are locked out for a long time: fail right away
 /// instead of hammering the API with capped waits.
 const GIVE_UP_RETRY_AFTER_SECS: u64 = 600;
+/// Interactive requests (search) only wait out rate limits this short; longer ones fail
+/// right away so the UI can say so instead of spinning.
+const INTERACTIVE_MAX_RETRY_AFTER_SECS: u64 = 2;
 /// Safety net against pagination loops.
 const MAX_PAGES: usize = 2000;
+
+/// How hard a request tries before giving up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Patience {
+    /// Background work (library import): waits out rate limits.
+    Patient,
+    /// Something the user is waiting for: at most one short retry.
+    Interactive,
+}
 /// Max pages fetched to fill a single search.
 const MAX_SEARCH_PAGES: usize = 10;
 /// Spotify's largest page size for search.
@@ -289,10 +301,15 @@ impl SpotifyApi {
             self.base,
             urlencoding::encode(query)
         );
-        let page = match self.get_json(token, &with_param(&base, "limit", limit)).await {
+        let first = with_param(&base, "limit", limit);
+        let page = match self.get_json_with(token, &first, Patience::Interactive).await {
             Ok(page) => page,
             Err(e) if error_status(&e) == Some(400) && limit > DEV_MODE_SEARCH_LIMIT => self
-                .get_json(token, &with_param(&base, "limit", DEV_MODE_SEARCH_LIMIT))
+                .get_json_with(
+                    token,
+                    &with_param(&base, "limit", DEV_MODE_SEARCH_LIMIT),
+                    Patience::Interactive,
+                )
                 .await
                 .with_context(|| format!("searching Spotify for {query:?}"))?,
             Err(e) => return Err(e.context(format!("searching Spotify for {query:?}"))),
@@ -341,7 +358,11 @@ impl SpotifyApi {
 
     /// GETs `url` and parses the JSON body (an empty body becomes `Value::Null`).
     async fn get_json(&self, token: &str, url: &str) -> Result<Value> {
-        let body = self.send(Method::GET, url, token).await?;
+        self.get_json_with(token, url, Patience::Patient).await
+    }
+
+    async fn get_json_with(&self, token: &str, url: &str, patience: Patience) -> Result<Value> {
+        let body = self.send_with(Method::GET, url, token, patience).await?;
         if body.trim().is_empty() {
             return Ok(Value::Null);
         }
@@ -402,7 +423,15 @@ impl SpotifyApi {
     /// Sends a request and returns the body of a 2xx response. Retries 429s (honouring
     /// `Retry-After`) and 5xx / transport errors; other statuses become an [`ApiError`].
     async fn send(&self, method: Method, url: &str, token: &str) -> Result<String> {
+        self.send_with(method, url, token, Patience::Patient).await
+    }
+
+    async fn send_with(&self, method: Method, url: &str, token: &str, patience: Patience) -> Result<String> {
         let path = display_path(&self.base, url);
+        let (max_rate_limited, max_wait, max_failures) = match patience {
+            Patience::Patient => (MAX_RATE_LIMIT_RETRIES, GIVE_UP_RETRY_AFTER_SECS, MAX_SERVER_RETRIES),
+            Patience::Interactive => (1, INTERACTIVE_MAX_RETRY_AFTER_SECS, 1),
+        };
         let mut rate_limited = 0;
         let mut failures = 0;
         loop {
@@ -419,7 +448,7 @@ impl SpotifyApi {
 
             let resp = match req.send().await {
                 Ok(resp) => resp,
-                Err(e) if failures < MAX_SERVER_RETRIES && is_transient(&e) => {
+                Err(e) if failures < max_failures && is_transient(&e) => {
                     failures += 1;
                     let wait = backoff(failures);
                     warn!(%method, %path, error = %e, "Spotify API request failed, retrying in {wait:?}");
@@ -436,14 +465,14 @@ impl SpotifyApi {
             if status == StatusCode::TOO_MANY_REQUESTS {
                 let wait = retry_after_secs(resp.headers());
                 retry_after = Some(wait);
-                if rate_limited < MAX_RATE_LIMIT_RETRIES && wait <= GIVE_UP_RETRY_AFTER_SECS {
+                if rate_limited < max_rate_limited && wait <= max_wait {
                     rate_limited += 1;
                     let wait = wait.min(MAX_RETRY_AFTER_SECS);
                     warn!(%method, %path, attempt = rate_limited, "Spotify API rate limited, retrying in {wait}s");
                     tokio::time::sleep(Duration::from_secs(wait)).await;
                     continue;
                 }
-            } else if status.is_server_error() && failures < MAX_SERVER_RETRIES {
+            } else if status.is_server_error() && failures < max_failures {
                 failures += 1;
                 let wait = backoff(failures);
                 warn!(%method, %path, %status, "Spotify API server error, retrying in {wait:?}");
@@ -453,7 +482,7 @@ impl SpotifyApi {
 
             let body = match resp.text().await {
                 Ok(body) => body,
-                Err(e) if status.is_success() && failures < MAX_SERVER_RETRIES => {
+                Err(e) if status.is_success() && failures < max_failures => {
                     failures += 1;
                     let wait = backoff(failures);
                     warn!(%method, %path, error = %e, "reading Spotify API response failed, retrying in {wait:?}");
@@ -1585,6 +1614,32 @@ mod tests {
             }
         );
         assert_eq!(log_of(&log).len(), 3);
+    }
+
+    #[tokio::test]
+    async fn search_fails_fast_when_rate_limited() {
+        // Background requests would wait 30 s here; search must not keep the user waiting.
+        let (base, log) = serve(|_, _| Reply {
+            headers: vec![("Retry-After", "30".into())],
+            ..reply(429, r#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#)
+        })
+        .await;
+        let api = SpotifyApi::with_base(client(), &base);
+        let started = std::time::Instant::now();
+        let err = api.search_with_artists("tok", "bladee", 20).await.unwrap_err();
+        assert_eq!(error_status(&err), Some(429));
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        assert_eq!(log_of(&log).len(), 1);
+
+        // A short Retry-After is waited out once.
+        let (base, log) = serve(|_, _| Reply {
+            headers: vec![("Retry-After", "0".into())],
+            ..reply(429, "")
+        })
+        .await;
+        let api = SpotifyApi::with_base(client(), &base);
+        assert!(api.search_with_artists("tok", "bladee", 20).await.is_err());
+        assert_eq!(log_of(&log).len(), 2);
     }
 
     #[tokio::test]

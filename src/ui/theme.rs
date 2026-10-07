@@ -257,6 +257,13 @@ const BOLD_FONTS: &[&str] = &[
     "Cantarell-Bold.otf",
     "DejaVuSans-Bold.ttf",
 ];
+/// Fallbacks for symbols in names (☆, ✞, ♡, arrows, dingbats...) that text fonts lack.
+const SYMBOL_FONTS: &[&str] = &[
+    "NotoSansSymbols2-Regular.ttf",
+    "NotoSansSymbols-Regular.ttf",
+    "DejaVuSans.ttf",
+    "NotoSansMath-Regular.ttf",
+];
 /// Fallbacks for Japanese/Chinese/Korean titles, smallest first.
 const CJK_FONTS: &[&str] = &[
     "NotoSansCJK-Regular.ttc",
@@ -285,16 +292,26 @@ fn font_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// The first of `names` (file names, any case) installed on the system. The font folders
+/// are scanned once.
 fn find_font(names: &[&str]) -> Option<PathBuf> {
-    for dir in font_dirs() {
-        for entry in walkdir::WalkDir::new(&dir).max_depth(4).into_iter().flatten() {
-            let name = entry.file_name().to_string_lossy();
-            if names.iter().any(|n| name.eq_ignore_ascii_case(n)) {
-                return Some(entry.into_path());
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static INDEX: OnceLock<HashMap<String, PathBuf>> = OnceLock::new();
+    let index = INDEX.get_or_init(|| {
+        let mut index = HashMap::new();
+        for dir in font_dirs() {
+            for entry in walkdir::WalkDir::new(&dir).max_depth(4).into_iter().flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.ends_with(".ttf") || name.ends_with(".otf") || name.ends_with(".ttc") || name.ends_with(".otc")
+                {
+                    index.entry(name).or_insert_with(|| entry.into_path());
+                }
             }
         }
-    }
-    None
+        index
+    });
+    names.iter().find_map(|n| index.get(&n.to_lowercase()).cloned())
 }
 
 /// Memory-maps a font file. Only the glyph pages actually used end up in RAM, which
@@ -366,6 +383,18 @@ pub fn setup_fonts(ctx: &egui::Context, cjk: bool) {
     fill_stack.extend(text_stack.iter().cloned());
     fonts.families.insert(FontFamily::Name("icons-fill".into()), fill_stack);
 
+    // Symbol fallbacks go last, after egui's own emoji fonts.
+    for (i, file) in SYMBOL_FONTS.iter().enumerate() {
+        if let Some(data) = find_font(&[file]).and_then(|p| load(&p)) {
+            let name = format!("symbols-{i}");
+            fonts.font_data.insert(name.clone(), data.into());
+            for fam in [FontFamily::Proportional, bold()] {
+                if let Some(stack) = fonts.families.get_mut(&fam) {
+                    stack.push(name.clone());
+                }
+            }
+        }
+    }
     if cjk {
         if let Some(data) = find_font(CJK_FONTS).and_then(|p| load(&p)) {
             fonts.font_data.insert("cjk".into(), data.into());

@@ -20,9 +20,9 @@ use crate::model::{
     normalize_artist, normalize_title, now_unix, ArtistHit, AudioQuality, ImportedPlaylist, Lyrics, Playlist,
     PlaylistKind, RepeatMode, Source, Track,
 };
-use crate::player::mpv::{Mpv, MpvEvent, MpvOptions};
+use crate::player::mpv::{Mpv, MpvEvent, MpvOptions, MpvSender};
 use crate::player::queue::Queue;
-use crate::player::spotify::{self, SpotifyAuth, SpotifyEngine, SpotifyEvent};
+use crate::player::spotify::{self, SpotifyAuth, SpotifyDeck, SpotifyEngine, SpotifyEvent, SpotifySender};
 use crate::providers::apple_music::{self, AppleMusicApi};
 use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
 use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
@@ -360,6 +360,49 @@ struct SoundCloudSync {
     playlists: Vec<ImportedPlaylist>,
 }
 
+/// How often crossfade timing is checked and volumes are stepped.
+const FADE_STEP: Duration = Duration::from_millis(50);
+/// Longest crossfade offered in the settings.
+const MAX_CROSSFADE: f32 = 12.0;
+/// Shortest fade, used when the previous track is almost over.
+const MIN_FADE: f64 = 0.3;
+
+/// The previous track during a crossfade, fading out on its own player.
+struct Fading {
+    deck: Deck,
+    /// When that track runs out.
+    ends_at: Instant,
+    /// Start and length of the fade-out, set once the next track is audible.
+    ramp: Option<(Instant, f64)>,
+}
+
+/// A player taken out of service to fade out.
+enum Deck {
+    Mpv(Box<Mpv>),
+    Spotify(SpotifyDeck),
+}
+
+impl Deck {
+    async fn set_volume(&self, volume: f32) {
+        match self {
+            Deck::Mpv(mpv) => {
+                let _ = mpv.set_volume(volume).await;
+            }
+            Deck::Spotify(deck) => deck.set_volume(volume),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FadeIn {
+    /// The next track is loading; it starts silent.
+    Waiting,
+    Ramping {
+        start: Instant,
+        len: f64,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Engine {
     None,
@@ -401,8 +444,15 @@ pub struct Service {
     consecutive_failures: u32,
 
     mpv: Option<Mpv>,
-    mpv_tx: UnboundedSender<MpvEvent>,
+    /// An idle mpv kept for the next crossfade.
+    mpv_spare: Option<Mpv>,
+    mpv_next_id: u64,
+    mpv_tx: MpvSender,
     mpv_preloaded: Option<String>,
+    /// The previous track fading out on its own player during a crossfade.
+    fading: Option<Fading>,
+    /// The current track's fade-in during a crossfade.
+    fade_in: Option<FadeIn>,
 
     spotify_auth: Arc<SpotifyAuth>,
     /// Optional login with the user's own developer app, for Web API calls.
@@ -412,7 +462,7 @@ pub struct Service {
     /// A sync was requested before the session was connected.
     spotify_sync_pending: bool,
     spotify_syncing: bool,
-    spotify_tx: UnboundedSender<SpotifyEvent>,
+    spotify_tx: SpotifySender,
     spotify_api: Arc<SpotifyApi>,
     /// A Spotify page waiting for the session to connect.
     spotify_pending_page: Option<String>,
@@ -455,17 +505,10 @@ pub fn start(
     (cmd_tx, handle)
 }
 
-type Receivers = (
-    UnboundedReceiver<MpvEvent>,
-    UnboundedReceiver<SpotifyEvent>,
-    UnboundedReceiver<Internal>,
-);
-type Started = (
-    Service,
-    UnboundedReceiver<MpvEvent>,
-    UnboundedReceiver<SpotifyEvent>,
-    UnboundedReceiver<Internal>,
-);
+type MpvReceiver = UnboundedReceiver<(u64, MpvEvent)>;
+type SpotifyReceiver = UnboundedReceiver<(u64, SpotifyEvent)>;
+type Receivers = (MpvReceiver, SpotifyReceiver, UnboundedReceiver<Internal>);
+type Started = (Service, MpvReceiver, SpotifyReceiver, UnboundedReceiver<Internal>);
 
 impl Service {
     fn new(shared: Arc<Shared>, paths: Paths, cfg: Config, cmd_tx: UnboundedSender<Command>) -> Result<Started> {
@@ -519,8 +562,12 @@ impl Service {
             resume_position: None,
             consecutive_failures: 0,
             mpv: None,
+            mpv_spare: None,
+            mpv_next_id: 1,
             mpv_tx,
             mpv_preloaded: None,
+            fading: None,
+            fade_in: None,
             spotify_auth,
             spotify_web_auth,
             spotify: None,
@@ -535,7 +582,11 @@ impl Service {
             soundcloud,
             lyrics,
             lastfm,
-            scrobble: ScrobbleTracker::new(),
+            scrobble: {
+                let mut tracker = ScrobbleTracker::new();
+                tracker.set_instant(cfg.lastfm.scrobble_instantly);
+                tracker
+            },
             discord,
             mpris,
             last_tick: Instant::now(),
@@ -548,14 +599,18 @@ impl Service {
     async fn run(
         mut self,
         mut cmd_rx: UnboundedReceiver<Command>,
-        mut mpv_rx: UnboundedReceiver<MpvEvent>,
-        mut sp_rx: UnboundedReceiver<SpotifyEvent>,
+        mut mpv_rx: MpvReceiver,
+        mut sp_rx: SpotifyReceiver,
         mut int_rx: UnboundedReceiver<Internal>,
     ) {
         self.startup();
         let mut tick = tokio::time::interval(Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Crossfade timing and volume ramps; only runs while one could happen.
+        let mut fade_tick = tokio::time::interval(FADE_STEP);
+        fade_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
+            let fade_active = self.fade_watch_needed();
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     if matches!(cmd, Command::Quit) {
@@ -563,10 +618,11 @@ impl Service {
                     }
                     self.handle(cmd).await;
                 }
-                Some(ev) = mpv_rx.recv() => self.on_mpv(ev).await,
-                Some(ev) = sp_rx.recv() => self.on_spotify(ev).await,
+                Some((id, ev)) = mpv_rx.recv() => self.on_mpv(id, ev).await,
+                Some((id, ev)) = sp_rx.recv() => self.on_spotify(id, ev).await,
                 Some(msg) = int_rx.recv() => self.on_internal(msg).await,
                 _ = tick.tick() => self.on_tick().await,
+                _ = fade_tick.tick(), if fade_active => self.on_fade_tick().await,
             }
         }
         self.shutdown().await;
@@ -612,10 +668,14 @@ impl Service {
     async fn shutdown(&mut self) {
         self.save_session();
         self.discord.shutdown();
+        self.cancel_fades().await;
         if let Some(sp) = self.spotify.take() {
             sp.shutdown();
         }
         if let Some(mpv) = self.mpv.take() {
+            mpv.quit().await;
+        }
+        if let Some(mpv) = self.mpv_spare.take() {
             mpv.quit().await;
         }
         let mut feed = self.shared.feed.write().unwrap();
@@ -670,11 +730,14 @@ impl Service {
             Command::SetVolume(v) => {
                 let v = v.clamp(0.0, 100.0);
                 self.cfg.playback.volume = v;
-                if let Some(mpv) = &self.mpv {
-                    let _ = mpv.set_volume(v).await;
-                }
-                if let Some(sp) = &self.spotify {
-                    sp.set_volume(v);
+                // During a crossfade the ramps apply the new volume on their next step.
+                if self.fade_in.is_none() {
+                    if let Some(mpv) = &self.mpv {
+                        let _ = mpv.set_volume(v).await;
+                    }
+                    if let Some(sp) = &self.spotify {
+                        sp.set_volume(v);
+                    }
                 }
                 self.mpris.set_volume(v);
                 self.publish_player();
@@ -828,6 +891,7 @@ impl Service {
             }
             Command::SpotifyLogin => self.spotify_login(),
             Command::SpotifyLogout => {
+                self.cancel_fades().await;
                 if let Some(sp) = self.spotify.take() {
                     sp.shutdown();
                 }
@@ -891,7 +955,14 @@ impl Service {
     }
 
     /// Starts playing the queue's current entry from `start` seconds.
+    /// Starts the queue's current track, cutting a crossfade short (skips, new playlists).
     async fn play_current(&mut self, start: f64) {
+        self.cancel_fades().await;
+        self.load_current(start).await;
+    }
+
+    /// Loads the queue's current track. During a crossfade it starts silent and fades in.
+    async fn load_current(&mut self, start: f64) {
         let Some(track) = self.queue.current().cloned() else {
             self.stop().await;
             return;
@@ -1008,6 +1079,10 @@ impl Service {
         if self.mpv.is_some() {
             return Ok(());
         }
+        if let Some(spare) = self.mpv_spare.take() {
+            self.mpv = Some(spare);
+            return Ok(());
+        }
         let opts = MpvOptions {
             binary: self.cfg.playback.mpv_path.clone(),
             volume: self.cfg.playback.volume,
@@ -1016,7 +1091,9 @@ impl Service {
             audio_device: self.cfg.playback.audio_device.clone(),
             exclusive: self.cfg.playback.bit_perfect,
         };
-        self.mpv = Some(Mpv::spawn(&opts, self.mpv_tx.clone()).await?);
+        let id = self.mpv_next_id;
+        self.mpv_next_id += 1;
+        self.mpv = Some(Mpv::spawn(&opts, id, self.mpv_tx.clone()).await?);
         Ok(())
     }
 
@@ -1033,7 +1110,9 @@ impl Service {
         self.engine = Engine::Mpv;
         self.mpv_preloaded = None;
         self.playing = Some(track);
+        let volume = self.start_volume();
         if let Some(mpv) = &self.mpv {
+            let _ = mpv.set_volume(volume).await;
             if let Err(e) = mpv.load(url, start).await {
                 self.load_failed(format!("mpv: {e:#}")).await;
             }
@@ -1075,6 +1154,7 @@ impl Service {
             }
         }
         let auth = self.spotify_auth.clone();
+        let volume = self.start_volume();
         let Some(sp) = self.spotify.as_mut() else { return };
         if let Err(e) = sp.ensure_session(&auth).await {
             self.load_failed(format!("Spotify: {e:#}")).await;
@@ -1082,6 +1162,7 @@ impl Service {
         }
         self.engine = Engine::Spotify;
         self.playing = Some(track.clone());
+        sp.set_volume(volume);
         if let Err(e) = sp.load(&track.uri, (start * 1000.0) as u32) {
             self.load_failed(format!("{e:#}")).await;
         }
@@ -1104,7 +1185,8 @@ impl Service {
             return;
         }
         if self.queue.advance(true).is_some() {
-            Box::pin(self.play_current(0.0)).await;
+            // A crossfade in progress carries on into the next track.
+            Box::pin(self.load_current(0.0)).await;
             self.publish_queue();
         } else {
             self.stop().await;
@@ -1118,6 +1200,9 @@ impl Service {
         }
         self.started_reported = true;
         self.consecutive_failures = 0;
+        if self.fade_in == Some(FadeIn::Waiting) {
+            self.start_fade_ramps();
+        }
         let Some(track) = self.queue.current().cloned() else {
             return;
         };
@@ -1136,6 +1221,8 @@ impl Service {
             lib.version += 1;
         }
         self.scrobble.start(&track.id, track.duration_ms, now);
+        // In instant mode this scrobbles right away.
+        self.scrobble_if_due();
         if let Some(lfm) = self.lastfm.clone() {
             let t = track.clone();
             tokio::spawn(async move {
@@ -1195,6 +1282,7 @@ impl Service {
     }
 
     async fn pause(&mut self) {
+        self.cancel_fades().await;
         match self.engine {
             Engine::Mpv => {
                 if let Some(mpv) = &self.mpv {
@@ -1241,6 +1329,7 @@ impl Service {
     }
 
     async fn seek(&mut self, secs: f64) {
+        self.cancel_fades().await;
         let secs = if self.duration > 0.0 {
             secs.clamp(0.0, self.duration - 0.5)
         } else {
@@ -1267,6 +1356,7 @@ impl Service {
     }
 
     async fn stop(&mut self) {
+        self.cancel_fades().await;
         match self.engine {
             Engine::Mpv => {
                 if let Some(mpv) = &self.mpv {
@@ -1294,7 +1384,8 @@ impl Service {
 
     /// Queues the next local file in mpv so the transition is gapless.
     async fn refresh_mpv_preload(&mut self) {
-        if self.engine != Engine::Mpv || !self.cfg.playback.gapless {
+        // A crossfade starts the next track on another mpv instead.
+        if self.engine != Engine::Mpv || !self.cfg.playback.gapless || self.will_crossfade() {
             return;
         }
         let Some(mpv) = &self.mpv else { return };
@@ -1315,7 +1406,19 @@ impl Service {
         }
     }
 
-    async fn on_mpv(&mut self, ev: MpvEvent) {
+    async fn on_mpv(&mut self, id: u64, ev: MpvEvent) {
+        if self.mpv.as_ref().map(Mpv::id) != Some(id) {
+            // The instance fading out or the spare one: only its exit matters.
+            if ev == MpvEvent::Died {
+                if self.mpv_spare.as_ref().map(Mpv::id) == Some(id) {
+                    self.mpv_spare = None;
+                }
+                if matches!(&self.fading, Some(Fading { deck: Deck::Mpv(m), .. }) if m.id() == id) {
+                    self.fading = None;
+                }
+            }
+            return;
+        }
         if ev == MpvEvent::Died {
             self.mpv = None;
             self.mpv_preloaded = None;
@@ -1396,8 +1499,9 @@ impl Service {
         }
     }
 
-    async fn on_spotify(&mut self, ev: SpotifyEvent) {
-        if self.engine != Engine::Spotify {
+    async fn on_spotify(&mut self, id: u64, ev: SpotifyEvent) {
+        // Events of a player that is fading out (or idle) are stale.
+        if self.engine != Engine::Spotify || self.spotify.as_ref().map(SpotifyEngine::current_id) != Some(id) {
             return;
         }
         match ev {
@@ -1418,6 +1522,10 @@ impl Service {
                 self.publish_player();
             }
             SpotifyEvent::TimeToPreload => {
+                if self.will_crossfade() {
+                    // The next track goes to another player; preloading here wouldn't help.
+                    return;
+                }
                 if let (Some(next), Some(sp)) = (self.queue.peek_next(), &self.spotify) {
                     if next.source == Source::Spotify {
                         sp.preload(&next.uri);
@@ -1455,19 +1563,7 @@ impl Service {
         }
 
         self.scrobble.tick(playing, dt);
-        if self.scrobble.should_scrobble() {
-            self.scrobble.mark_scrobbled();
-            if let (Some(lfm), Some((_, started))) = (self.lastfm.clone(), self.scrobble.current()) {
-                let track = self.queue.current().cloned();
-                if let Some(t) = track {
-                    tokio::spawn(async move {
-                        if let Err(e) = lfm.scrobble(&t, started).await {
-                            tracing::warn!("scrobble failed: {e:#}");
-                        }
-                    });
-                }
-            }
-        }
+        self.scrobble_if_due();
         if playing {
             self.mpris.update(self.queue.current(), true, self.current_position());
         }
@@ -1480,6 +1576,218 @@ impl Service {
         };
         if expired {
             self.shared.repaint();
+        }
+    }
+
+    /// Sends the current track to Last.fm once it qualifies (see [`ScrobbleTracker`]).
+    fn scrobble_if_due(&mut self) {
+        if !self.scrobble.should_scrobble() {
+            return;
+        }
+        self.scrobble.mark_scrobbled();
+        if let (Some(lfm), Some((_, started))) = (self.lastfm.clone(), self.scrobble.current()) {
+            if let Some(t) = self.queue.current().cloned() {
+                tokio::spawn(async move {
+                    if let Err(e) = lfm.scrobble(&t, started).await {
+                        tracing::warn!("scrobble failed: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- crossfade
+
+    /// Crossfade length in seconds; 0 when off or not possible (exclusive output devices
+    /// can't be opened twice).
+    fn crossfade_len(&self) -> f64 {
+        let p = &self.cfg.playback;
+        if p.bit_perfect || p.audio_device.starts_with("alsa/hw:") {
+            0.0
+        } else {
+            f64::from(p.crossfade.clamp(0.0, MAX_CROSSFADE))
+        }
+    }
+
+    /// True if the current track will crossfade into the next one (rather than gapless).
+    fn will_crossfade(&self) -> bool {
+        crossfades_into(
+            self.crossfade_len(),
+            self.cfg.playback.crossfade_albums,
+            self.queue.repeat,
+            self.queue.current(),
+            self.queue.peek_next(),
+        )
+    }
+
+    /// Whether the fade timer has anything to do.
+    fn fade_watch_needed(&self) -> bool {
+        self.fading.is_some()
+            || self.fade_in.is_some()
+            || (self.status == PlayStatus::Playing && self.crossfade_len() > 0.0)
+    }
+
+    async fn on_fade_tick(&mut self) {
+        self.maybe_begin_crossfade().await;
+        self.step_fades().await;
+    }
+
+    /// Starts the next track when the current one is about to end.
+    async fn maybe_begin_crossfade(&mut self) {
+        if self.fading.is_some()
+            || self.fade_in.is_some()
+            || self.status != PlayStatus::Playing
+            || !self.started_reported
+            || self.engine == Engine::None
+            || self.duration <= 0.0
+            || !self.will_crossfade()
+        {
+            return;
+        }
+        let Some(next) = self.queue.peek_next() else { return };
+        let len = self.crossfade_len().min(self.duration / 3.0);
+        let remaining = self.duration - self.current_position();
+        // Start a bit early so the next track has time to load; too close to the end,
+        // just let it finish.
+        if remaining > len + load_lead(next.source) || remaining < 1.0 {
+            return;
+        }
+        self.begin_crossfade(remaining).await;
+    }
+
+    /// Moves the playing track to its own player to fade out and starts the next one silently.
+    async fn begin_crossfade(&mut self, remaining: f64) {
+        let deck = match self.engine {
+            Engine::Mpv => match self.mpv.take() {
+                Some(mpv) => {
+                    // It must not continue into a preloaded file.
+                    let _ = mpv.clear_upcoming().await;
+                    Deck::Mpv(Box::new(mpv))
+                }
+                None => return,
+            },
+            Engine::Spotify => match self.spotify.as_mut().map(SpotifyEngine::detach_current) {
+                Some(Ok(deck)) => Deck::Spotify(deck),
+                Some(Err(e)) => {
+                    tracing::warn!("crossfade: no second Spotify player: {e:#}");
+                    return;
+                }
+                None => return,
+            },
+            Engine::None => return,
+        };
+        tracing::debug!("crossfade: {remaining:.1}s left, starting the next track");
+        self.mpv_preloaded = None;
+        self.engine = Engine::None;
+        self.fading = Some(Fading {
+            deck,
+            ends_at: Instant::now() + Duration::from_secs_f64(remaining),
+            ramp: None,
+        });
+        self.fade_in = Some(FadeIn::Waiting);
+        if self.queue.advance(false).is_some() {
+            self.load_current(0.0).await;
+        } else {
+            self.cancel_fades().await;
+        }
+        self.publish_queue();
+    }
+
+    /// The next track is audible: fade the previous one out and this one in.
+    fn start_fade_ramps(&mut self) {
+        let now = Instant::now();
+        let max = self.crossfade_len();
+        let len = match &mut self.fading {
+            Some(f) => {
+                let left = f.ends_at.saturating_duration_since(now).as_secs_f64();
+                let len = max.min(left).max(MIN_FADE);
+                f.ramp = Some((now, len));
+                len
+            }
+            // The previous track already ended: just a short fade-in.
+            None => MIN_FADE,
+        };
+        tracing::debug!("crossfade: fading over {len:.1}s");
+        self.fade_in = Some(FadeIn::Ramping { start: now, len });
+    }
+
+    async fn step_fades(&mut self) {
+        let volume = self.cfg.playback.volume;
+        let now = Instant::now();
+        let mut done = false;
+        if let Some(f) = &self.fading {
+            match f.ramp {
+                Some((start, len)) => {
+                    let t = fade_progress(start, len, now);
+                    f.deck.set_volume(volume * (1.0 - ease(t))).await;
+                    done = t >= 1.0;
+                }
+                // Nothing took over before the track ran out.
+                None => done = now >= f.ends_at + Duration::from_secs(1),
+            }
+        }
+        if done {
+            self.finish_fading().await;
+        }
+        if let Some(FadeIn::Ramping { start, len }) = self.fade_in {
+            let t = fade_progress(start, len, now);
+            self.set_engine_volume(volume * ease(t)).await;
+            if t >= 1.0 {
+                self.fade_in = None;
+            }
+        }
+    }
+
+    /// Stops the player that faded out and keeps it for the next crossfade.
+    async fn finish_fading(&mut self) {
+        let Some(f) = self.fading.take() else { return };
+        tracing::debug!("crossfade: done");
+        match f.deck {
+            Deck::Mpv(mpv) => {
+                let _ = mpv.stop().await;
+                if self.mpv_spare.is_none() {
+                    self.mpv_spare = Some(*mpv);
+                } else {
+                    mpv.quit().await;
+                }
+            }
+            Deck::Spotify(deck) => match self.spotify.as_mut() {
+                Some(sp) => sp.return_deck(deck),
+                None => deck.stop(),
+            },
+        }
+    }
+
+    /// Ends a crossfade right away: the previous track stops, the current one goes to full volume.
+    async fn cancel_fades(&mut self) {
+        self.finish_fading().await;
+        if self.fade_in.take().is_some() {
+            self.set_engine_volume(self.cfg.playback.volume).await;
+        }
+    }
+
+    async fn set_engine_volume(&self, volume: f32) {
+        match self.engine {
+            Engine::Mpv => {
+                if let Some(mpv) = &self.mpv {
+                    let _ = mpv.set_volume(volume).await;
+                }
+            }
+            Engine::Spotify => {
+                if let Some(sp) = &self.spotify {
+                    sp.set_volume(volume);
+                }
+            }
+            Engine::None => {}
+        }
+    }
+
+    /// Volume a newly loaded track starts at: silent while it is going to fade in.
+    fn start_volume(&self) -> f32 {
+        if self.fade_in.is_some() {
+            0.0
+        } else {
+            self.cfg.playback.volume
         }
     }
 
@@ -2112,7 +2420,11 @@ impl Service {
             let tx = self.internal_tx.clone();
             let q = q.clone();
             tokio::spawn(async move {
-                let r = async { api.search_with_artists(&auth.token().await?, &q, 20).await }.await;
+                let search = async { api.search_with_artists(&auth.token().await?, &q, 20).await };
+                // Never leave the results spinning.
+                let r = tokio::time::timeout(Duration::from_secs(15), search)
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("Spotify didn't answer in time")));
                 let (tracks, artists) = match r {
                     Ok((tracks, artists)) => (Ok(tracks), artists),
                     Err(e) => (Err(e), Vec::new()),
@@ -2386,7 +2698,7 @@ impl Service {
         let old = std::mem::replace(&mut self.cfg, cfg);
 
         if old.playback != self.cfg.playback {
-            if let Some(mpv) = &self.mpv {
+            for mpv in self.mpv.iter().chain(self.mpv_spare.iter()) {
                 let p = &self.cfg.playback;
                 let _ = mpv
                     .command(serde_json::json!([
@@ -2418,8 +2730,13 @@ impl Service {
                     .command(serde_json::json!(["set_property", "audio-device", dev]))
                     .await;
             }
-            if old.playback.mpv_path != self.cfg.playback.mpv_path && self.engine != Engine::Mpv {
-                if let Some(mpv) = self.mpv.take() {
+            if old.playback.mpv_path != self.cfg.playback.mpv_path {
+                if self.engine != Engine::Mpv {
+                    if let Some(mpv) = self.mpv.take() {
+                        mpv.quit().await;
+                    }
+                }
+                if let Some(mpv) = self.mpv_spare.take() {
                     mpv.quit().await;
                 }
             }
@@ -2431,6 +2748,7 @@ impl Service {
         }
         if old.lastfm != self.cfg.lastfm {
             self.lastfm = make_lastfm(&self.cfg, &self.http, &self.paths);
+            self.scrobble.set_instant(self.cfg.lastfm.scrobble_instantly);
         }
         if old.soundcloud != self.cfg.soundcloud {
             self.soundcloud = Arc::new(SoundCloud::new(
@@ -2903,6 +3221,52 @@ async fn spotify_sync_web(
     })
 }
 
+/// Fraction (0..=1) of a fade of `len` seconds that started at `start`.
+fn fade_progress(start: Instant, len: f64, now: Instant) -> f32 {
+    if len <= 0.0 {
+        return 1.0;
+    }
+    (now.saturating_duration_since(start).as_secs_f64() / len).clamp(0.0, 1.0) as f32
+}
+
+/// Smooth start and end of a fade (smoothstep).
+fn ease(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// How early to start a crossfade so the next track has time to load.
+fn load_lead(source: Source) -> f64 {
+    match source {
+        Source::Local => 0.3,
+        Source::Spotify => 1.5,
+        Source::SoundCloud => 2.0,
+        Source::AppleMusic => 2.5,
+    }
+}
+
+/// Whether `current` should crossfade into `next`. Songs of the same album stay gapless
+/// unless `same_album_too`; repeat-one never fades a song into itself.
+fn crossfades_into(
+    len: f64,
+    same_album_too: bool,
+    repeat: RepeatMode,
+    current: Option<&Track>,
+    next: Option<&Track>,
+) -> bool {
+    let (Some(current), Some(next)) = (current, next) else {
+        return false;
+    };
+    len > 0.0 && repeat != RepeatMode::One && (same_album_too || !same_album(current, next))
+}
+
+fn same_album(a: &Track, b: &Track) -> bool {
+    let album = a.album.trim();
+    !album.is_empty()
+        && album.eq_ignore_ascii_case(b.album.trim())
+        && normalize_artist(&a.artist) == normalize_artist(&b.artist)
+}
+
 /// Exact and prefix name matches first; Spotify before SoundCloud on ties. Stable, so each
 /// service's own relevance order is kept.
 fn rank_artists(artists: &mut [ArtistHit], query: &str) {
@@ -3069,6 +3433,49 @@ pub fn best_match(target: &Track, candidates: &[Track]) -> Option<Track> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crossfade_decisions() {
+        let mut a = track(Source::Local, "Neon Coast", "Intro", 200_000);
+        a.album = "Midnight Drive".into();
+        let mut b = track(Source::Spotify, "Neon Coast", "Afterglow", 180_000);
+        b.album = "Midnight Drive".into();
+        let mut c = track(Source::SoundCloud, "Bladee", "Topman", 194_000);
+        c.album = "Icedancer".into();
+        // Different albums (and sources) fade; the same album stays gapless unless asked.
+        assert!(crossfades_into(6.0, false, RepeatMode::Off, Some(&a), Some(&c)));
+        assert!(!crossfades_into(6.0, false, RepeatMode::Off, Some(&a), Some(&b)));
+        assert!(crossfades_into(6.0, true, RepeatMode::Off, Some(&a), Some(&b)));
+        // Off, nothing next, or repeat-one: no crossfade.
+        assert!(!crossfades_into(0.0, true, RepeatMode::Off, Some(&a), Some(&c)));
+        assert!(!crossfades_into(6.0, true, RepeatMode::Off, Some(&a), None));
+        assert!(!crossfades_into(6.0, true, RepeatMode::One, Some(&a), Some(&a)));
+        assert!(crossfades_into(6.0, false, RepeatMode::All, Some(&c), Some(&a)));
+        // "Greatest Hits" by two artists isn't one album.
+        let mut d = track(Source::Local, "Other Band", "Song", 100_000);
+        d.album = "midnight drive".into();
+        assert!(same_album(&a, &b));
+        assert!(!same_album(&a, &d));
+        let mut no_album = a.clone();
+        no_album.album.clear();
+        assert!(!same_album(&no_album, &no_album.clone()));
+    }
+
+    #[test]
+    fn fade_curves() {
+        assert_eq!(ease(0.0), 0.0);
+        assert_eq!(ease(1.0), 1.0);
+        assert!((ease(0.5) - 0.5).abs() < 1e-6);
+        assert!(ease(0.25) < 0.25 && ease(0.75) > 0.75);
+        let start = Instant::now();
+        assert_eq!(fade_progress(start, 4.0, start), 0.0);
+        assert!((fade_progress(start, 4.0, start + Duration::from_secs(1)) - 0.25).abs() < 1e-6);
+        assert_eq!(fade_progress(start, 4.0, start + Duration::from_secs(9)), 1.0);
+        assert_eq!(fade_progress(start, 0.0, start), 1.0);
+        // Streams get more time to load than local files.
+        assert!(load_lead(Source::Local) < load_lead(Source::Spotify));
+        assert!(load_lead(Source::Spotify) < load_lead(Source::SoundCloud));
+    }
 
     #[test]
     fn artists_rank_exact_then_prefix_then_spotify() {

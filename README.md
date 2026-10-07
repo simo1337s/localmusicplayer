@@ -27,7 +27,8 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 - **Custom playlists that mix sources**: drop a Spotify song, a SoundCloud upload and a FLAC into the same playlist. A cross-source **Liked Songs** collection (♥) also syncs likes back to Spotify and Last.fm.
 - **Synced lyrics**: reads `.lrc` files next to your music, then embedded lyrics tags, then [LRCLIB](https://lrclib.net). Lyrics are shown in a side panel and in a full-screen *Now playing* view with a large cover. Click a line to jump to it.
 - **Discord Rich Presence** shows "Listening to <song>" with the album cover, a progress bar and an "Open in Spotify/SoundCloud" button. Works with the Discord app, Vesktop and arRPC.
-- **Last.fm scrobbling** follows the official rules (half the track or 4 minutes), sends "now playing" updates, and queues scrobbles offline to send later.
+- **Crossfade** (Settings → Playback, up to 12 s) between any two sources: local file into Spotify, Spotify into SoundCloud, Spotify into Spotify, and so on. The next song starts on a second player while the current one fades out. Songs of the same album stay gapless unless you tick *Also crossfade between songs of the same album*. Skipping, seeking or pausing during a fade ends it right away.
+- **Last.fm scrobbling**: by default every song scrobbles the moment it starts playing. Untick *Scrobble as soon as a song starts* to use Last.fm's usual rule instead (half the song or 4 minutes). Also sends "now playing" updates, and queues scrobbles offline to send later.
 - **MPRIS / media keys**: works with `playerctl`, waybar, polybar, KDE/GNOME media widgets and headset buttons.
 - **Its own look**: graphite and off-white like the logo, rounded "tile" panels, a floating player dock, header cards that glow in the colours of the cover, and soft hover and page transitions. **Drag the edges** of the sidebar and the lyrics / queue panel to resize them (sizes are remembered); drag the sidebar narrow and it becomes a strip of icons and covers. Also: a queue, back / forward navigation, albums and artists grids, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window). The accent colour can be changed in Settings.
 - **Low memory use**: cover art is decoded at the size it's drawn and kept in a small LRU cache, fonts are memory-mapped from your system, and only two runtime threads are used. The window doesn't redraw at all while nothing changes.
@@ -46,11 +47,12 @@ Then launch **MultiMusic** from your app launcher, or run `multimusic`.
 Optional extras:
 
 ```sh
-sudo pacman -S noto-fonts-cjk inter-font
+sudo pacman -S noto-fonts noto-fonts-cjk inter-font
 ```
 
 - `noto-fonts-cjk`: Japanese, Chinese and Korean titles.
 - `inter-font`: a nicer UI font. MultiMusic uses Inter, Noto Sans, Cantarell or DejaVu, whichever is installed.
+- `noto-fonts` (or `ttf-dejavu`): symbols in names such as ☆ ✞ ♡ instead of empty boxes.
 
 To run without packaging: `cargo build --release && ./target/release/multimusic`.
 
@@ -126,7 +128,9 @@ Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 - **No sound from Spotify**: Spotify plays through PipeWire/PulseAudio (`pipewire-pulse`) and follows your default output device. If you use plain ALSA without a sound server, set *Settings → Spotify → Audio output* to ALSA.
 - **Spotify login says "redirect_uri: Not matching configuration"**: the redirect URI registered in your own Spotify app must match exactly, e.g. `http://127.0.0.1:8899/login` (use `127.0.0.1`, not `localhost`), and you have to click Save in the Spotify dashboard. A login you abandon times out after 5 minutes; clicking Log in / Authorize again restarts it right away.
 - **Upgrading from Medley**: your settings, library and logins move to the new `multimusic` folders automatically on first start.
-- **Spotify "HTTP 429 Too Many Requests"**: that's the shared Web API key being rate limited. Library import no longer uses it. For search, add your own Spotify app (see *Setting up your accounts*).
+- **Spotify "HTTP 429 Too Many Requests"** or **"rate limited" under Spotify in search**: that's the shared Web API key being rate limited. Library import and playback don't use it. For search, add your own Spotify app (see *Setting up your accounts*); search now says so right away instead of spinning.
+- **Boxes (□) in song or artist names**: install `noto-fonts` (or `ttf-dejavu`) for symbol characters, and `noto-fonts-cjk` for Japanese, Chinese and Korean.
+- **Crossfade does nothing**: it's off in bit-perfect mode and with `alsa/hw:` output devices, because those can't be opened twice at the same time.
 - **Spotify says Premium is required**: playlists and search work on free accounts, but librespot can only stream with Premium.
 - **A pasted Spotify link says "Log in to Spotify"**: Spotify pages load through your Spotify login, so log in under Settings first. SoundCloud and Apple Music links work without an account.
 - **`makepkg` fails in `check()`**: update to the latest commit (`git pull`); an older test could fail when a network port was busy. `makepkg -si --nocheck` skips the tests.

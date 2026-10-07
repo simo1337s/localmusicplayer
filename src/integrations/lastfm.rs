@@ -486,9 +486,12 @@ impl Lastfm {
 
 /// Last.fm scrobble rules: a track qualifies once it is longer than 30 seconds and has been
 /// played for half its duration or 4 minutes, whichever comes first. Paused time doesn't count.
+/// In instant mode a track qualifies as soon as it starts.
 #[derive(Debug, Default)]
 pub struct ScrobbleTracker {
     current: Option<Tracked>,
+    /// Scrobble as soon as a track starts instead of after half of it.
+    instant: bool,
 }
 
 #[derive(Debug)]
@@ -506,6 +509,11 @@ const MAX_LISTEN_REQUIRED: Duration = Duration::from_secs(240);
 impl ScrobbleTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Scrobble tracks as soon as they start (`true`) or by Last.fm's usual rule.
+    pub fn set_instant(&mut self, instant: bool) {
+        self.instant = instant;
     }
 
     /// A new track started playing (resets all progress).
@@ -531,6 +539,10 @@ impl ScrobbleTracker {
             return false;
         };
         let duration = Duration::from_millis(t.duration_ms);
+        if self.instant {
+            // Unknown lengths count too; known short clips (< 30 s) still don't.
+            return !t.scrobbled && (t.duration_ms == 0 || duration > MIN_TRACK_LEN);
+        }
         !t.scrobbled && duration > MIN_TRACK_LEN && t.listened >= (duration / 2).min(MAX_LISTEN_REQUIRED)
     }
 
@@ -683,6 +695,23 @@ mod tests {
                 "duration[1]"
             ]
         );
+    }
+
+    #[test]
+    fn tracker_instant_mode() {
+        let mut t = ScrobbleTracker::new();
+        t.set_instant(true);
+        t.start("a", 200_000, 100);
+        assert!(t.should_scrobble());
+        t.mark_scrobbled();
+        assert!(!t.should_scrobble());
+        t.tick(true, secs(500));
+        assert!(!t.should_scrobble());
+        // Unknown length still counts, short clips don't.
+        t.start("stream", 0, 200);
+        assert!(t.should_scrobble());
+        t.start("clip", 20_000, 300);
+        assert!(!t.should_scrobble());
     }
 
     #[test]

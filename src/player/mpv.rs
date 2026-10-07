@@ -48,7 +48,11 @@ pub struct MpvOptions {
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
+/// Events from one mpv instance, tagged with its [`Mpv::id`] (crossfades run two at once).
+pub type MpvSender = mpsc::UnboundedSender<(u64, MpvEvent)>;
+
 pub struct Mpv {
+    id: u64,
     child: Child,
     writer: tokio::sync::Mutex<OwnedWriteHalf>,
     pending: Pending,
@@ -57,11 +61,13 @@ pub struct Mpv {
 }
 
 impl Mpv {
-    pub async fn spawn(opts: &MpvOptions, events: mpsc::UnboundedSender<MpvEvent>) -> Result<Mpv> {
+    /// Starts an mpv process. `id` tags its events and keeps its IPC socket apart from other
+    /// instances.
+    pub async fn spawn(opts: &MpvOptions, id: u64, events: MpvSender) -> Result<Mpv> {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let name = format!("multimusic-mpv-{}.sock", std::process::id());
+        let name = format!("multimusic-mpv-{}-{id}.sock", std::process::id());
         let mut socket = runtime_dir.join(&name);
         // Unix socket paths are limited to ~108 bytes.
         if socket.as_os_str().len() > 100 {
@@ -156,15 +162,16 @@ impl Mpv {
                     continue;
                 }
                 if let Some(ev) = parse_event(&msg) {
-                    if events.send(ev).is_err() {
+                    if events.send((id, ev)).is_err() {
                         break;
                     }
                 }
             }
-            let _ = events.send(MpvEvent::Died);
+            let _ = events.send((id, MpvEvent::Died));
         });
 
         let mpv = Mpv {
+            id,
             child,
             writer: tokio::sync::Mutex::new(write),
             pending,
@@ -174,6 +181,10 @@ impl Mpv {
         mpv.command(json!(["observe_property", 1, "pause"])).await?;
         mpv.command(json!(["observe_property", 2, "duration"])).await?;
         Ok(mpv)
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub async fn command(&self, args: Value) -> Result<Value> {
@@ -309,8 +320,13 @@ const LEAN_FLAGS: &[&str] = &[
     "--cover-art-auto=no",
 ];
 
-/// Option names (`--foo`) the given mpv binary understands.
+/// Option names (`--foo`) the given mpv binary understands. Asked once per binary, so a
+/// second instance (for crossfades) starts quickly.
 async fn supported_options(binary: &str) -> Vec<String> {
+    static KNOWN: Mutex<Option<HashMap<String, Vec<String>>>> = Mutex::new(None);
+    if let Some(list) = KNOWN.lock().unwrap().as_ref().and_then(|m| m.get(binary)) {
+        return list.clone();
+    }
     let output = Command::new(binary)
         .arg("--no-config")
         .arg("--list-options")
@@ -318,10 +334,16 @@ async fn supported_options(binary: &str) -> Vec<String> {
         .stderr(Stdio::null())
         .output()
         .await;
-    match output {
+    let list = match output {
         Ok(out) => parse_option_list(&String::from_utf8_lossy(&out.stdout)),
-        Err(_) => Vec::new(),
-    }
+        Err(_) => return Vec::new(),
+    };
+    KNOWN
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(binary.to_string(), list.clone());
+    list
 }
 
 fn parse_option_list(text: &str) -> Vec<String> {
@@ -353,6 +375,8 @@ fn parse_event(msg: &Value) -> Option<MpvEvent> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -406,7 +430,8 @@ mod tests {
         );
     }
 
-    /// Talks to a real mpv if one is installed: plays a generated WAV file.
+    /// Talks to a real mpv if one is installed: two instances (as during a crossfade) play a
+    /// generated WAV file at the same time, each reporting under its own id.
     #[tokio::test]
     async fn real_mpv_roundtrip() {
         if std::process::Command::new("mpv").arg("--version").output().is_err() {
@@ -426,29 +451,36 @@ mod tests {
             audio_device: String::new(),
             exclusive: false,
         };
-        let mpv = Mpv::spawn(&opts, tx).await.unwrap();
-        // Use the null audio output so the test needs no sound card.
-        mpv.command(json!(["set_property", "ao", "null"])).await.unwrap();
-        mpv.load(&wav.to_string_lossy(), 0.0).await.unwrap();
-        let mut got_loaded = false;
-        let mut got_eof = false;
+        let a = Mpv::spawn(&opts, 7, tx.clone()).await.unwrap();
+        let b = Mpv::spawn(&opts, 8, tx).await.unwrap();
+        assert_eq!((a.id(), b.id()), (7, 8));
+        for mpv in [&a, &b] {
+            // Use the null audio output so the test needs no sound card.
+            mpv.command(json!(["set_property", "ao", "null"])).await.unwrap();
+            mpv.load(&wav.to_string_lossy(), 0.0).await.unwrap();
+        }
+        let mut loaded = HashSet::new();
+        let mut ended = HashSet::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while let Ok(Some(ev)) = tokio::time::timeout_at(deadline, rx.recv()).await {
+        while let Ok(Some((id, ev))) = tokio::time::timeout_at(deadline, rx.recv()).await {
             match ev {
                 MpvEvent::FileLoaded => {
-                    got_loaded = true;
-                    assert!(mpv.time_pos().await.is_some());
+                    loaded.insert(id);
                 }
                 MpvEvent::EndFile { reason, .. } if reason == "eof" => {
-                    got_eof = true;
-                    break;
+                    ended.insert(id);
+                    if ended.len() == 2 {
+                        break;
+                    }
                 }
                 _ => {}
             }
         }
-        mpv.quit().await;
+        a.quit().await;
+        b.quit().await;
         std::fs::remove_dir_all(dir).unwrap();
-        assert!(got_loaded && got_eof);
+        assert_eq!(loaded, HashSet::from([7, 8]));
+        assert_eq!(ended, HashSet::from([7, 8]));
     }
 
     fn write_test_wav(path: &std::path::Path, secs: f32) {

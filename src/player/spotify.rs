@@ -191,12 +191,44 @@ pub enum SpotifyEvent {
     Stopped,
 }
 
-pub struct SpotifyEngine {
-    session: Session,
+/// Events from one Spotify player, tagged with its [`SpotifyDeck::id`].
+pub type SpotifySender = mpsc::UnboundedSender<(u64, SpotifyEvent)>;
+
+/// One librespot player with its own volume. Crossfades play two at once on the same session.
+pub struct SpotifyDeck {
+    pub id: u64,
     player: Arc<Player>,
     mixer: Arc<dyn Mixer>,
+}
+
+impl SpotifyDeck {
+    pub fn load(&self, uri: &str, start_ms: u32) -> Result<()> {
+        let uri = SpotifyUri::from_uri(uri).map_err(|e| anyhow!("bad Spotify URI {uri}: {e}"))?;
+        self.player.load(uri, true, start_ms);
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.player.stop();
+    }
+
+    pub fn set_volume(&self, volume: f32) {
+        self.mixer.set_volume(volume_to_u16(volume));
+    }
+}
+
+pub struct SpotifyEngine {
+    session: Session,
     cache: Cache,
     pub username: String,
+    player_config: PlayerConfig,
+    backend: audio_backend::SinkBuilder,
+    events: SpotifySender,
+    next_deck: u64,
+    /// The player for the current track.
+    current: SpotifyDeck,
+    /// An idle player kept for the next crossfade.
+    spare: Option<SpotifyDeck>,
 }
 
 impl SpotifyEngine {
@@ -206,16 +238,12 @@ impl SpotifyEngine {
         audio_cache: Option<PathBuf>,
         cfg: &SpotifyConfig,
         volume: f32,
-        events: mpsc::UnboundedSender<SpotifyEvent>,
+        events: SpotifySender,
     ) -> Result<SpotifyEngine> {
         let cache = Cache::new(Some(dir), Some(dir), audio_cache.as_deref(), Some(2 << 30))
             .context("creating Spotify cache")?;
         let session = new_session(auth, &cache).await?;
         let username = session.username();
-
-        let mixer = mixer::find(None).ok_or_else(|| anyhow!("no mixer"))?(MixerConfig::default())
-            .map_err(|e| anyhow!("mixer: {e}"))?;
-        mixer.set_volume(volume_to_u16(volume));
 
         let (backend_name, backend) = select_backend(&cfg.audio_output)?;
         tracing::info!("Spotify audio output: {backend_name}");
@@ -230,38 +258,18 @@ impl SpotifyEngine {
             gapless: true,
             ..PlayerConfig::default()
         };
-        let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), move || {
-            backend(None, AudioFormat::default())
-        });
-
-        let mut rx = player.get_player_event_channel();
-        tokio::spawn(async move {
-            while let Some(ev) = rx.recv().await {
-                let mapped = match ev {
-                    PlayerEvent::Loading { .. } => SpotifyEvent::Loading,
-                    PlayerEvent::Playing { position_ms, .. } => SpotifyEvent::Playing { position_ms },
-                    PlayerEvent::Paused { position_ms, .. } => SpotifyEvent::Paused { position_ms },
-                    PlayerEvent::Seeked { position_ms, .. } | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                        SpotifyEvent::Seeked { position_ms }
-                    }
-                    PlayerEvent::TimeToPreloadNextTrack { .. } => SpotifyEvent::TimeToPreload,
-                    PlayerEvent::EndOfTrack { .. } => SpotifyEvent::EndOfTrack,
-                    PlayerEvent::Unavailable { .. } => SpotifyEvent::Unavailable,
-                    PlayerEvent::Stopped { .. } => SpotifyEvent::Stopped,
-                    _ => continue,
-                };
-                if events.send(mapped).is_err() {
-                    break;
-                }
-            }
-        });
-
+        let current = new_deck(1, &session, &player_config, backend, &events)?;
+        current.set_volume(volume);
         Ok(SpotifyEngine {
             session,
-            player,
-            mixer,
             cache,
             username,
+            player_config,
+            backend,
+            events,
+            next_deck: 2,
+            current,
+            spare: None,
         })
     }
 
@@ -270,45 +278,75 @@ impl SpotifyEngine {
         if self.session.is_invalid() {
             tracing::info!("Spotify session lost, reconnecting");
             self.session = new_session(auth, &self.cache).await?;
-            self.player.set_session(self.session.clone());
+            self.current.player.set_session(self.session.clone());
+            if let Some(spare) = &self.spare {
+                spare.player.set_session(self.session.clone());
+            }
         }
         Ok(())
     }
 
+    /// Id of the player for the current track (events from other players are stale).
+    pub fn current_id(&self) -> u64 {
+        self.current.id
+    }
+
+    /// Hands out the current player (to fade out) and switches to another one.
+    pub fn detach_current(&mut self) -> Result<SpotifyDeck> {
+        let next = match self.spare.take() {
+            Some(deck) => deck,
+            None => {
+                let id = self.next_deck;
+                self.next_deck += 1;
+                new_deck(id, &self.session, &self.player_config, self.backend, &self.events)?
+            }
+        };
+        Ok(std::mem::replace(&mut self.current, next))
+    }
+
+    /// Takes back a player that finished fading out.
+    pub fn return_deck(&mut self, deck: SpotifyDeck) {
+        deck.stop();
+        if self.spare.is_none() {
+            self.spare = Some(deck);
+        }
+    }
+
     pub fn load(&self, uri: &str, start_ms: u32) -> Result<()> {
-        let uri = SpotifyUri::from_uri(uri).map_err(|e| anyhow!("bad Spotify URI {uri}: {e}"))?;
-        self.player.load(uri, true, start_ms);
-        Ok(())
+        self.current.load(uri, start_ms)
     }
 
     pub fn preload(&self, uri: &str) {
         if let Ok(uri) = SpotifyUri::from_uri(uri) {
-            self.player.preload(uri);
+            self.current.player.preload(uri);
         }
     }
 
     pub fn play(&self) {
-        self.player.play();
+        self.current.player.play();
     }
 
     pub fn pause(&self) {
-        self.player.pause();
+        self.current.player.pause();
     }
 
     pub fn stop(&self) {
-        self.player.stop();
+        self.current.stop();
     }
 
     pub fn seek(&self, secs: f64) {
-        self.player.seek((secs.max(0.0) * 1000.0) as u32);
+        self.current.player.seek((secs.max(0.0) * 1000.0) as u32);
     }
 
     pub fn set_volume(&self, volume: f32) {
-        self.mixer.set_volume(volume_to_u16(volume));
+        self.current.set_volume(volume);
     }
 
     pub fn shutdown(&self) {
-        self.player.stop();
+        self.current.stop();
+        if let Some(spare) = &self.spare {
+            spare.stop();
+        }
         self.session.shutdown();
     }
 
@@ -316,6 +354,44 @@ impl SpotifyEngine {
     pub fn session(&self) -> Option<Session> {
         (!self.session.is_invalid()).then(|| self.session.clone())
     }
+}
+
+/// A librespot player with its own soft volume, forwarding its events tagged with `id`.
+fn new_deck(
+    id: u64,
+    session: &Session,
+    config: &PlayerConfig,
+    backend: audio_backend::SinkBuilder,
+    events: &SpotifySender,
+) -> Result<SpotifyDeck> {
+    let mixer = mixer::find(None).ok_or_else(|| anyhow!("no mixer"))?(MixerConfig::default())
+        .map_err(|e| anyhow!("mixer: {e}"))?;
+    let player = Player::new(config.clone(), session.clone(), mixer.get_soft_volume(), move || {
+        backend(None, AudioFormat::default())
+    });
+    let mut rx = player.get_player_event_channel();
+    let events = events.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            let mapped = match ev {
+                PlayerEvent::Loading { .. } => SpotifyEvent::Loading,
+                PlayerEvent::Playing { position_ms, .. } => SpotifyEvent::Playing { position_ms },
+                PlayerEvent::Paused { position_ms, .. } => SpotifyEvent::Paused { position_ms },
+                PlayerEvent::Seeked { position_ms, .. } | PlayerEvent::PositionCorrection { position_ms, .. } => {
+                    SpotifyEvent::Seeked { position_ms }
+                }
+                PlayerEvent::TimeToPreloadNextTrack { .. } => SpotifyEvent::TimeToPreload,
+                PlayerEvent::EndOfTrack { .. } => SpotifyEvent::EndOfTrack,
+                PlayerEvent::Unavailable { .. } => SpotifyEvent::Unavailable,
+                PlayerEvent::Stopped { .. } => SpotifyEvent::Stopped,
+                _ => continue,
+            };
+            if events.send((id, mapped)).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(SpotifyDeck { id, player, mixer })
 }
 
 /// Picks librespot's audio output. PipeWire desktops answer on the PulseAudio socket

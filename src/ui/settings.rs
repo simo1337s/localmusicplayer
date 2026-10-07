@@ -278,6 +278,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 status(ui, &cx.feed.lastfm);
                 ui.add_space(4.0);
                 ui.checkbox(&mut cfg.lastfm.enabled, "Scrobble what I listen to");
+                ui.checkbox(&mut cfg.lastfm.scrobble_instantly, "Scrobble as soon as a song starts");
                 text_field(ui, "API key", &mut cfg.lastfm.api_key, "from last.fm/api/account/create", false);
                 text_field(ui, "API secret", &mut cfg.lastfm.api_secret, "", true);
                 ui.horizontal(|ui| {
@@ -290,7 +291,16 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         cx.actions.push(Action::Cmd(Command::LastfmLogin));
                     }
                 });
-                hint(ui, "Tracks scrobble after half their length (or 4 minutes). Offline scrobbles are queued and sent later.");
+                hint(
+                    ui,
+                    if cfg.lastfm.scrobble_instantly {
+                        "Every song scrobbles the moment it starts playing, even if you skip it. \
+                         Offline scrobbles are queued and sent later."
+                    } else {
+                        "Songs scrobble after half their length (or 4 minutes), Last.fm's usual rule. \
+                         Offline scrobbles are queued and sent later."
+                    },
+                );
             });
 
             // ---------------------------------------------------------- discord
@@ -308,6 +318,25 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
             // ---------------------------------------------------------- playback
             section(ui, icon::HEADPHONES, cx.accent, "Playback", |ui| {
                 ui.checkbox(&mut cfg.playback.gapless, "Gapless playback");
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Crossfade").color(TEXT_DIM));
+                    ui.add(
+                        egui::Slider::new(&mut cfg.playback.crossfade, 0.0..=12.0)
+                            .step_by(0.5)
+                            .custom_formatter(|v, _| if v <= 0.0 { "Off".into() } else { format!("{v:.1} s") }),
+                    );
+                });
+                if cfg.playback.crossfade > 0.0 {
+                    ui.checkbox(
+                        &mut cfg.playback.crossfade_albums,
+                        "Also crossfade between songs of the same album",
+                    );
+                    hint(
+                        ui,
+                        "Each song fades into the next, between any sources (local files, SoundCloud, Spotify). \
+                         Albums stay gapless unless you tick the box above. Crossfade is off in bit-perfect mode.",
+                    );
+                }
                 ui.checkbox(&mut cfg.playback.replaygain, "Use ReplayGain tags (local files)");
                 ui.checkbox(&mut cfg.lyrics.enabled, "Show lyrics");
                 ui.checkbox(&mut cfg.lyrics.online, "Fetch lyrics from LRCLIB when there are no local lyrics");

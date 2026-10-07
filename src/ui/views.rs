@@ -1188,9 +1188,26 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             widgets::track_table(ui, cx, &local, &opts, viewport, origin);
             ui.add_space(16.0);
         }
+        let error_for = |prefix: &str| {
+            search
+                .errors
+                .iter()
+                .find_map(|e| e.strip_prefix(prefix))
+                .filter(|_| fresh)
+                .map(str::to_string)
+        };
+        let spotify_error = error_for("Spotify: ");
+        let soundcloud_error = error_for("SoundCloud: ");
         if cx.feed.spotify_logged_in {
             widgets::heading_icon(ui, icon::SPOTIFY_LOGO, source_color(Source::Spotify), "Spotify");
-            if spotify.is_empty() {
+            if let (true, Some(e)) = (spotify.is_empty(), &spotify_error) {
+                search_error(ui, e);
+                if e.contains("rate limited")
+                    && widgets::action_button(ui, icon::GEAR, "Add your own Spotify app", false, cx.accent).clicked()
+                {
+                    cx.actions.push(Action::Go(View::Settings));
+                }
+            } else if spotify.is_empty() {
                 remote_status(ui, spotify_pending);
             } else {
                 let refs: Vec<&Track> = spotify.iter().collect();
@@ -1212,7 +1229,9 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                 source_color(Source::SoundCloud),
                 "SoundCloud",
             );
-            if soundcloud.is_empty() {
+            if let (true, Some(e)) = (soundcloud.is_empty(), &soundcloud_error) {
+                search_error(ui, e);
+            } else if soundcloud.is_empty() {
                 remote_status(ui, soundcloud_pending);
             } else {
                 let refs: Vec<&Track> = soundcloud.iter().collect();
@@ -1227,8 +1246,13 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             }
         }
         if fresh {
+            // Errors not shown in a section above (e.g. while results are still listed).
             for e in &search.errors {
-                ui.label(egui::RichText::new(e).small().color(DANGER));
+                let shown = (e.starts_with("Spotify: ") && spotify.is_empty() && cx.feed.spotify_logged_in)
+                    || (e.starts_with("SoundCloud: ") && soundcloud.is_empty());
+                if !shown {
+                    ui.label(egui::RichText::new(e).small().color(DANGER));
+                }
             }
         }
         let pending = spotify_pending || soundcloud_pending;
@@ -1443,6 +1467,18 @@ fn link_card(ui: &mut Ui, cx: &mut Cx, link: &links::Link) {
             });
         });
     });
+}
+
+fn search_error(ui: &mut Ui, error: &str) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            egui::RichText::new(icon::WARNING_CIRCLE)
+                .family(theme::icons())
+                .color(DANGER),
+        );
+        ui.label(egui::RichText::new(error).color(TEXT_DIM));
+    });
+    ui.add_space(6.0);
 }
 
 fn remote_status(ui: &mut Ui, pending: bool) {

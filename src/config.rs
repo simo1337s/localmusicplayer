@@ -65,6 +65,10 @@ pub struct PlaybackConfig {
     pub audio_device: String,
     /// Bit-perfect output for lossless files: exclusive device access, no ReplayGain.
     pub bit_perfect: bool,
+    /// Crossfade between songs, in seconds (0 = off).
+    pub crossfade: f32,
+    /// Also crossfade between songs of the same album (they play gapless otherwise).
+    pub crossfade_albums: bool,
 }
 
 impl Default for PlaybackConfig {
@@ -76,6 +80,8 @@ impl Default for PlaybackConfig {
             gapless: true,
             audio_device: String::new(),
             bit_perfect: false,
+            crossfade: 0.0,
+            crossfade_albums: false,
         }
     }
 }
@@ -152,7 +158,7 @@ pub struct AppleMusicConfig {
     pub storefront: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct LastfmConfig {
     pub enabled: bool,
@@ -161,6 +167,21 @@ pub struct LastfmConfig {
     /// Filled in after authorizing.
     pub session_key: String,
     pub username: String,
+    /// Scrobble as soon as a song starts, instead of after half of it (or 4 minutes).
+    pub scrobble_instantly: bool,
+}
+
+impl Default for LastfmConfig {
+    fn default() -> Self {
+        LastfmConfig {
+            enabled: false,
+            api_key: String::new(),
+            api_secret: String::new(),
+            session_key: String::new(),
+            username: String::new(),
+            scrobble_instantly: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
