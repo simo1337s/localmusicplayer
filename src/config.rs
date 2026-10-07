@@ -106,7 +106,7 @@ impl Default for SpotifyConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SoundCloudConfig {
     pub enabled: bool,
@@ -116,6 +116,17 @@ pub struct SoundCloudConfig {
     pub oauth_token: String,
     /// Optional API client id override (scraped from soundcloud.com automatically when empty).
     pub client_id: String,
+}
+
+impl Default for SoundCloudConfig {
+    fn default() -> Self {
+        SoundCloudConfig {
+            enabled: true,
+            profile_url: String::new(),
+            oauth_token: String::new(),
+            client_id: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

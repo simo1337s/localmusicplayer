@@ -92,14 +92,11 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 let mut remove = None;
                 for (i, f) in cfg.library.folders.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.set_max_width(ui.available_width() - 40.0);
+                        if widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Remove folder").clicked() {
+                            remove = Some(i);
+                        }
                         ui.label(RichText::new(icon::FOLDER_OPEN).family(theme::icons()).color(TEXT_DIM));
                         ui.add(egui::Label::new(f.display().to_string()).truncate());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Remove folder").clicked() {
-                                remove = Some(i);
-                            }
-                        });
                     });
                 }
                 if let Some(i) = remove {

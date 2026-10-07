@@ -584,18 +584,18 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         let all: Vec<&Track> = p.track_ids.iter().filter_map(|id| cx.lib.get(id)).collect();
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
-            kind: if p.kind == PlaylistKind::Liked {
-                "PLAYLIST".into()
-            } else {
+            kind: if p.kind.source().is_some() || p.kind == PlaylistKind::M3u {
                 "PLAYLIST ·".into()
+            } else {
+                "PLAYLIST".into()
             },
             title: &p.name,
             description: &p.description,
             meta: format!("{} songs · {}", all.len(), theme::fmt_total(total_ms)),
-            source: if p.kind == PlaylistKind::Liked {
-                None
+            source: if p.kind == PlaylistKind::M3u {
+                Some(Source::Local)
             } else {
-                Some(p.kind.source().unwrap_or(Source::Local))
+                p.kind.source()
             },
         };
         let (play, shuffle) = list_header(ui, cx, st, &header, |ui, r, cx| {

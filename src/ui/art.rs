@@ -138,6 +138,10 @@ impl ArtCache {
         None
     }
 
+    pub fn len(&self) -> usize {
+        self.textures.len()
+    }
+
     /// Dominant colour of an image that was loaded at any size.
     pub fn accent(&self, src: &str) -> Option<Color32> {
         self.accents.get(src).copied()

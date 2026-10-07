@@ -484,7 +484,7 @@ impl App {
             });
     }
 
-    fn check_memory(&mut self) {
+    fn check_memory(&mut self, ctx: &egui::Context) {
         if self.mem_checked.elapsed() < Duration::from_secs(5) {
             return;
         }
@@ -499,6 +499,12 @@ impl App {
                 self.rss_mb = kb / 1024.0;
             }
         }
+        tracing::debug!(
+            "memory: rss {:.0} MB, font atlas {:?}, cached covers {}",
+            self.rss_mb,
+            ctx.fonts(|f| f.font_image_size()),
+            self.art.len()
+        );
     }
 }
 
@@ -607,7 +613,7 @@ impl eframe::App for App {
         self.apply(&ctx, actions);
         self.dialogs(&ctx);
         self.sync_config();
-        self.check_memory();
+        self.check_memory(&ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {
             // Persist UI settings right away on exit.

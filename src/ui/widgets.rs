@@ -34,16 +34,12 @@ pub fn gradient(ui: &Ui, rect: Rect, top: Color32, bottom: Color32) {
     ui.painter().add(Shape::mesh(mesh));
 }
 
-/// Placeholder artwork: a soft gradient with an icon.
-pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) {
-    let top = theme::mix(base, Color32::BLACK, 0.35);
-    let bottom = theme::mix(base, Color32::BLACK, 0.7);
-    ui.painter().rect_filled(rect, CornerRadius::same(radius), bottom);
-    let inner = rect;
-    // Rounded gradient: approximate by painting the gradient inset by the radius.
-    gradient(ui, inner.shrink2(vec2(0.0, radius as f32)), top, bottom);
-    ui.painter().rect_filled(
-        Rect::from_min_size(rect.min, vec2(rect.width(), radius as f32)),
+/// Vertical gradient inside a rounded rectangle.
+pub fn rounded_gradient(ui: &Ui, rect: Rect, top: Color32, bottom: Color32, radius: u8) {
+    let r = (radius as f32).min(rect.height() / 2.0);
+    let p = ui.painter();
+    p.rect_filled(
+        Rect::from_min_size(rect.min, vec2(rect.width(), r)),
         CornerRadius {
             nw: radius,
             ne: radius,
@@ -52,6 +48,29 @@ pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) 
         },
         top,
     );
+    p.rect_filled(
+        Rect::from_min_max(Pos2::new(rect.left(), rect.bottom() - r), rect.max),
+        CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: radius,
+            se: radius,
+        },
+        bottom,
+    );
+    gradient(
+        ui,
+        Rect::from_min_max(rect.min + vec2(0.0, r), rect.max - vec2(0.0, r)),
+        top,
+        bottom,
+    );
+}
+
+/// Placeholder artwork: a soft gradient with an icon.
+pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) {
+    let top = theme::mix(base, Color32::BLACK, 0.35);
+    let bottom = theme::mix(base, Color32::BLACK, 0.7);
+    rounded_gradient(ui, rect, top, bottom, radius);
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -105,15 +124,9 @@ pub fn playlist_cover(ui: &Ui, art: &mut ArtCache, p: &Playlist, rect: Rect, rad
         PlaylistKind::Liked | PlaylistKind::SpotifyLiked | PlaylistKind::SoundCloudLikes
     ) {
         let (base, glyph) = playlist_fallback(p);
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(radius), theme::mix(base, Color32::WHITE, 0.1));
-        let bottom = theme::with_alpha(theme::mix(base, Color32::BLACK, 0.5), 255);
-        gradient(
-            ui,
-            rect.shrink2(vec2(0.0, radius as f32)).with_min_y(rect.center().y),
-            theme::with_alpha(bottom, 0),
-            bottom,
-        );
+        let top = theme::mix(base, Color32::WHITE, 0.12);
+        let bottom = theme::mix(base, Color32::BLACK, 0.45);
+        rounded_gradient(ui, rect, top, bottom, radius);
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,

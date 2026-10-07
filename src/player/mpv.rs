@@ -77,10 +77,10 @@ impl Mpv {
             .arg("--keep-open=no")
             .arg("--prefetch-playlist=yes")
             .arg("--audio-client-name=Medley")
-            .arg("--cache=yes")
-            // Keep mpv's memory small: a few MB of demuxer buffer is plenty for audio.
-            .arg("--demuxer-max-bytes=8MiB")
-            .arg("--demuxer-max-back-bytes=2MiB")
+            // Cache network streams only; a few MB of demuxer buffer is plenty for audio.
+            .arg("--cache=auto")
+            .arg("--demuxer-max-bytes=4MiB")
+            .arg("--demuxer-max-back-bytes=1MiB")
             .arg("--volume-max=100")
             .arg(format!("--volume={}", opts.volume.clamp(0.0, 100.0)))
             .arg(format!("--gapless-audio={}", if opts.gapless { "weak" } else { "no" }))
@@ -100,6 +100,16 @@ impl Mpv {
         }
         if !opts.audio_device.is_empty() {
             cmd.arg(format!("--audio-device={}", opts.audio_device));
+        }
+        // Skip mpv's built-in Lua scripts (OSC, console, stats, ...): an audio backend
+        // doesn't need them and each one costs memory. Options differ between versions,
+        // so only pass the ones this mpv knows.
+        let supported = supported_options(&opts.binary).await;
+        for flag in LEAN_FLAGS {
+            let name = flag.split('=').next().unwrap_or(flag);
+            if supported.iter().any(|o| o == name) {
+                cmd.arg(flag);
+            }
         }
         let child = cmd
             .spawn()
@@ -248,6 +258,47 @@ impl Drop for Mpv {
     }
 }
 
+const LEAN_FLAGS: &[&str] = &[
+    "--osc=no",
+    "--load-scripts=no",
+    "--load-stats-overlay=no",
+    "--load-console=no",
+    "--load-osd-console=no",
+    "--load-auto-profiles=no",
+    "--load-select=no",
+    "--load-positioning=no",
+    "--load-commands=no",
+    "--load-context-menu=no",
+    "--input-default-bindings=no",
+    "--osd-level=0",
+    "--sub-auto=no",
+    "--audio-file-auto=no",
+    "--cover-art-auto=no",
+];
+
+/// Option names (`--foo`) the given mpv binary understands.
+async fn supported_options(binary: &str) -> Vec<String> {
+    let output = Command::new(binary)
+        .arg("--no-config")
+        .arg("--list-options")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await;
+    match output {
+        Ok(out) => parse_option_list(&String::from_utf8_lossy(&out.stdout)),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_option_list(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|w| w.starts_with("--"))
+        .map(str::to_string)
+        .collect()
+}
+
 fn parse_event(msg: &Value) -> Option<MpvEvent> {
     match msg.get("event")?.as_str()? {
         "start-file" => Some(MpvEvent::StartFile {
@@ -300,6 +351,15 @@ mod tests {
         assert_eq!(
             ev(r#"{"event":"start-file","playlist_entry_id":3}"#),
             Some(MpvEvent::StartFile { playlist_entry_id: 3 })
+        );
+    }
+
+    #[test]
+    fn parses_option_list() {
+        let text = "Options:\n\n --osc                            Flag (default: yes)\n --load-scripts                   Flag (default: yes)\n\nTotal: 2 options\n";
+        assert_eq!(
+            parse_option_list(text),
+            vec!["--osc".to_string(), "--load-scripts".to_string()]
         );
     }
 
