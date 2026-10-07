@@ -1,0 +1,334 @@
+//! SQLite persistence for tracks, playlists and small bits of state.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::model::{Playlist, PlaylistKind, Source, Track};
+
+pub struct Db {
+    conn: Connection,
+}
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS tracks (
+    id          TEXT PRIMARY KEY,
+    source      TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    artist      TEXT NOT NULL,
+    album       TEXT NOT NULL,
+    duration_ms INTEGER NOT NULL,
+    track_no    INTEGER,
+    art         TEXT,
+    uri         TEXT NOT NULL,
+    added_at    INTEGER NOT NULL DEFAULT 0,
+    mtime       INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS playlists (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    remote_id   TEXT,
+    description TEXT NOT NULL DEFAULT '',
+    art         TEXT,
+    position    INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS playlist_tracks (
+    playlist_id TEXT NOT NULL,
+    pos         INTEGER NOT NULL,
+    track_id    TEXT NOT NULL,
+    PRIMARY KEY (playlist_id, pos)
+);
+CREATE TABLE IF NOT EXISTS plays (
+    track_id    TEXT NOT NULL,
+    played_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS plays_time ON plays(played_at);
+CREATE TABLE IF NOT EXISTS kv (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    pub fn open_in_memory() -> Result<Db> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> Result<Db> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // Keep SQLite's page cache small; the library is held in memory anyway.
+        conn.pragma_update(None, "cache_size", -2000)?;
+        conn.execute_batch(SCHEMA)?;
+        Ok(Db { conn })
+    }
+
+    pub fn load_tracks(&self) -> Result<Vec<Track>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source, title, artist, album, duration_ms, track_no, art, uri, added_at FROM tracks",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let source: String = r.get(1)?;
+            Ok(Track {
+                id: r.get(0)?,
+                source: Source::parse(&source).unwrap_or(Source::Local),
+                title: r.get(2)?,
+                artist: r.get(3)?,
+                album: r.get(4)?,
+                duration_ms: r.get::<_, i64>(5)? as u64,
+                track_no: r.get::<_, Option<i64>>(6)?.map(|n| n as u32),
+                art: r.get(7)?,
+                uri: r.get(8)?,
+                added_at: r.get(9)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Insert or update tracks. `mtimes` holds file modification times for local files.
+    pub fn upsert_tracks(&mut self, tracks: &[Track], mtimes: &HashMap<String, i64>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO tracks (id, source, title, artist, album, duration_ms, track_no, art, uri, added_at, mtime)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(id) DO UPDATE SET
+                    source = excluded.source, title = excluded.title, artist = excluded.artist,
+                    album = excluded.album, duration_ms = excluded.duration_ms, track_no = excluded.track_no,
+                    art = excluded.art, uri = excluded.uri,
+                    added_at = CASE WHEN tracks.added_at = 0 THEN excluded.added_at ELSE tracks.added_at END,
+                    mtime = excluded.mtime",
+            )?;
+            for t in tracks {
+                stmt.execute(params![
+                    t.id,
+                    t.source.as_str(),
+                    t.title,
+                    t.artist,
+                    t.album,
+                    t.duration_ms as i64,
+                    t.track_no.map(|n| n as i64),
+                    t.art,
+                    t.uri,
+                    t.added_at,
+                    mtimes.get(&t.id).copied().unwrap_or(0),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_tracks(&mut self, ids: &[String]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM tracks WHERE id = ?1")?;
+            for id in ids {
+                stmt.execute([id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `track id -> mtime` for local files, used for incremental rescans.
+    pub fn local_mtimes(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, mtime FROM tracks WHERE source = 'local'")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn load_playlists(&self) -> Result<Vec<Playlist>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, kind, remote_id, description, art FROM playlists ORDER BY position, rowid",
+        )?;
+        let mut playlists: Vec<Playlist> = stmt
+            .query_map([], |r| {
+                let kind: String = r.get(2)?;
+                Ok(Playlist {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: PlaylistKind::parse(&kind).unwrap_or(PlaylistKind::Custom),
+                    remote_id: r.get(3)?,
+                    description: r.get(4)?,
+                    art: r.get(5)?,
+                    track_ids: Vec::new(),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT playlist_id, track_id FROM playlist_tracks ORDER BY playlist_id, pos")?;
+        let mut by_playlist: HashMap<String, Vec<String>> = HashMap::new();
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for (pid, tid) in rows.flatten() {
+            by_playlist.entry(pid).or_default().push(tid);
+        }
+        for p in &mut playlists {
+            if let Some(ids) = by_playlist.remove(&p.id) {
+                p.track_ids = ids;
+            }
+        }
+        Ok(playlists)
+    }
+
+    pub fn save_playlist(&mut self, p: &Playlist, position: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO playlists (id, name, kind, remote_id, description, art, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+                remote_id = excluded.remote_id, description = excluded.description,
+                art = excluded.art, position = excluded.position",
+            params![p.id, p.name, p.kind.as_str(), p.remote_id, p.description, p.art, position],
+        )?;
+        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [&p.id])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO playlist_tracks (playlist_id, pos, track_id) VALUES (?1, ?2, ?3)")?;
+            for (i, tid) in p.track_ids.iter().enumerate() {
+                stmt.execute(params![p.id, i as i64, tid])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_playlist(&mut self, id: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [id])?;
+        tx.execute("DELETE FROM playlists WHERE id = ?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_play(&self, track_id: &str, at: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO plays (track_id, played_at) VALUES (?1, ?2)",
+            params![track_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// Most recently played distinct track ids, newest first.
+    pub fn recent_plays(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, MAX(played_at) AS t FROM plays GROUP BY track_id ORDER BY t DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Track ids ordered by play count, most played first.
+    pub fn top_plays(&self, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, COUNT(*) AS c FROM plays GROUP BY track_id ORDER BY c DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn get_kv(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row("SELECT value FROM kv WHERE key = ?1", [key], |r| r.get(0))
+            .optional()
+            .ok()
+            .flatten()
+    }
+
+    pub fn set_kv(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_kv(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
+    /// Removes tracks of remote sources that are no longer referenced by any playlist.
+    pub fn prune_orphans(&mut self) -> Result<usize> {
+        let n = self.conn.execute(
+            "DELETE FROM tracks WHERE source != 'local'
+               AND id NOT IN (SELECT DISTINCT track_id FROM playlist_tracks)",
+            [],
+        )?;
+        Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn track(id: &str, source: Source) -> Track {
+        Track {
+            id: id.into(),
+            source,
+            title: format!("Title {id}"),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            duration_ms: 1000,
+            track_no: Some(1),
+            art: None,
+            uri: id.into(),
+            added_at: 5,
+        }
+    }
+
+    #[test]
+    fn tracks_and_playlists_roundtrip() {
+        let mut db = Db::open_in_memory().unwrap();
+        let tracks = vec![track("local:/a.flac", Source::Local), track("spotify:track:x", Source::Spotify)];
+        db.upsert_tracks(&tracks, &HashMap::new()).unwrap();
+        let mut loaded = db.load_tracks().unwrap();
+        loaded.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0], tracks[0]);
+
+        let p = Playlist {
+            id: "custom:1".into(),
+            name: "Mix".into(),
+            kind: PlaylistKind::Custom,
+            remote_id: None,
+            description: String::new(),
+            art: None,
+            track_ids: vec!["spotify:track:x".into(), "local:/a.flac".into()],
+        };
+        db.save_playlist(&p, 0).unwrap();
+        assert_eq!(db.load_playlists().unwrap(), vec![p.clone()]);
+
+        // Orphan pruning keeps referenced and local tracks.
+        db.upsert_tracks(&[track("soundcloud:9", Source::SoundCloud)], &HashMap::new()).unwrap();
+        assert_eq!(db.prune_orphans().unwrap(), 1);
+        db.delete_playlist("custom:1").unwrap();
+        assert!(db.load_playlists().unwrap().is_empty());
+    }
+
+    #[test]
+    fn plays_and_kv() {
+        let db = Db::open_in_memory().unwrap();
+        db.record_play("a", 1).unwrap();
+        db.record_play("b", 2).unwrap();
+        db.record_play("a", 3).unwrap();
+        assert_eq!(db.recent_plays(10).unwrap(), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(db.top_plays(1).unwrap(), vec!["a".to_string()]);
+        db.set_kv("k", "v").unwrap();
+        assert_eq!(db.get_kv("k").as_deref(), Some("v"));
+    }
+}
