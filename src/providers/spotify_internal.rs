@@ -13,6 +13,7 @@ use librespot_protocol::metadata;
 use librespot_protocol::playlist4_external::SelectedListContent;
 use protobuf::{CodedInputStream, CodedOutputStream, EnumOrUnknown, Message};
 
+use crate::library::tags::Metadata;
 use crate::model::{Source, Track};
 use crate::providers::spotify_api::SpotifyPlaylistMeta;
 
@@ -348,6 +349,98 @@ pub async fn track_page(session: &Session, id: &str) -> Result<PageData> {
     })
 }
 
+/// Everything about a track for tagging a downloaded copy: album, numbering, release date,
+/// ISRC, label, copyright and the largest cover.
+pub async fn track_details(session: &Session, uri: &str) -> Result<Metadata> {
+    let (_, bytes) = fetch_batch(session, &[uri.to_string()], ExtensionKind::TRACK_V4)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("Spotify returned nothing for this track"))?;
+    let track = metadata::Track::parse_from_bytes(&bytes).context("parsing track")?;
+    // The track only carries part of its album; the album itself has the dates and discs.
+    let album = match track.album.as_ref().and_then(|a| gid_uri("album", a.gid())) {
+        Some(album_uri) => fetch_batch(session, &[album_uri], ExtensionKind::ALBUM_V4)
+            .await
+            .ok()
+            .and_then(|found| found.into_iter().next())
+            .and_then(|(_, bytes)| metadata::Album::parse_from_bytes(&bytes).ok()),
+        None => None,
+    };
+    Ok(details(uri, &track, album.as_ref()))
+}
+
+fn details(uri: &str, t: &metadata::Track, full_album: Option<&metadata::Album>) -> Metadata {
+    let names = |artists: &[metadata::Artist]| {
+        artists
+            .iter()
+            .map(|a| a.name())
+            .filter(|n| !n.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let album = full_album.or(t.album.as_ref());
+    let date = album
+        .map(|a| match (a.date.year(), a.date.month(), a.date.day()) {
+            (y, m, d) if y > 0 && m > 0 && d > 0 => format!("{y:04}-{m:02}-{d:02}"),
+            (y, m, _) if y > 0 && m > 0 => format!("{y:04}-{m:02}"),
+            (y, _, _) if y > 0 => format!("{y:04}"),
+            _ => String::new(),
+        })
+        .unwrap_or_default();
+    let number = |n: i32| (n > 0).then_some(n as u32);
+    let discs = full_album.map(|a| a.disc.as_slice()).unwrap_or_default();
+    let track_total = discs
+        .iter()
+        .find(|d| d.number() == t.disc_number().max(1))
+        .map(|d| d.track.len() as u32)
+        .filter(|n| *n > 0);
+    let copyright = album.and_then(|a| {
+        [metadata::copyright::Type::P, metadata::copyright::Type::C]
+            .iter()
+            .find_map(|kind| a.copyright.iter().find(|c| c.type_() == *kind))
+            .map(|c| c.text().trim().to_string())
+    });
+    let covers = album.map(|a| {
+        let mut images: Vec<&metadata::Image> = if a.cover_group.image.is_empty() {
+            a.cover.iter().collect()
+        } else {
+            a.cover_group.image.iter().collect()
+        };
+        // XLARGE, LARGE, DEFAULT (~300 px), SMALL.
+        images.sort_by_key(|i| match i.size() {
+            metadata::image::Size::XLARGE => 0,
+            metadata::image::Size::LARGE => 1,
+            metadata::image::Size::DEFAULT => 2,
+            metadata::image::Size::SMALL => 3,
+        });
+        images.iter().map(|i| image_url(i.file_id())).collect::<Vec<_>>()
+    });
+    let id = uri.rsplit(':').next().unwrap_or_default();
+    Metadata {
+        title: t.name().to_string(),
+        artist: names(&t.artist),
+        album: album.map(|a| a.name().to_string()).unwrap_or_default(),
+        album_artist: album.map(|a| names(&a.artist)).unwrap_or_default(),
+        date,
+        track: number(t.number()),
+        track_total,
+        disc: number(t.disc_number()),
+        disc_total: (discs.len() > 1).then_some(discs.len() as u32),
+        isrc: t
+            .external_id
+            .iter()
+            .find(|e| e.type_().eq_ignore_ascii_case("isrc"))
+            .map(|e| e.id().to_string())
+            .unwrap_or_default(),
+        label: album.map(|a| a.label().trim().to_string()).unwrap_or_default(),
+        copyright: copyright.unwrap_or_default(),
+        url: format!("https://open.spotify.com/track/{id}"),
+        cover_urls: covers.unwrap_or_default(),
+        ..Metadata::default()
+    }
+}
+
 /// The user's display name, falling back to the username.
 pub async fn display_name(session: &Session) -> String {
     let username = session.username();
@@ -570,5 +663,83 @@ mod tests {
         assert_eq!(out.track_no, Some(8));
         assert_eq!(out.art.as_deref(), Some("https://i.scdn.co/image/0102"));
         assert!(convert_track("spotify:episode:x", &t).is_none());
+    }
+
+    #[test]
+    fn track_details_for_tags() {
+        let artist = |name: &str| {
+            let mut a = metadata::Artist::new();
+            a.set_name(name.into());
+            a
+        };
+        let image = |id: u8, size| {
+            let mut i = metadata::Image::new();
+            i.set_file_id(vec![id]);
+            i.set_size(size);
+            i
+        };
+        let mut t = metadata::Track::new();
+        t.set_name("Get Lucky".into());
+        t.set_number(8);
+        t.set_disc_number(1);
+        t.artist = vec![artist("Daft Punk"), artist("Pharrell Williams")];
+        let mut isrc = metadata::ExternalId::new();
+        isrc.set_type("isrc".into());
+        isrc.set_id("USQX91300108".into());
+        t.external_id = vec![isrc];
+
+        let mut album = metadata::Album::new();
+        album.set_name("Random Access Memories".into());
+        album.artist = vec![artist("Daft Punk")];
+        album.set_label("Columbia".into());
+        let date = album.date.mut_or_insert_default();
+        date.set_year(2013);
+        date.set_month(5);
+        date.set_day(17);
+        let mut disc = metadata::Disc::new();
+        disc.set_number(1);
+        disc.track = vec![metadata::Track::new(); 13];
+        album.disc = vec![disc];
+        let mut c = metadata::Copyright::new();
+        c.set_type(metadata::copyright::Type::C);
+        c.set_text("© 2013 Daft Life".into());
+        let mut p = metadata::Copyright::new();
+        p.set_type(metadata::copyright::Type::P);
+        p.set_text("℗ 2013 Daft Life".into());
+        album.copyright = vec![c, p];
+        album.cover_group.mut_or_insert_default().image = vec![
+            image(1, metadata::image::Size::DEFAULT),
+            image(2, metadata::image::Size::LARGE),
+            image(3, metadata::image::Size::SMALL),
+        ];
+
+        let m = details("spotify:track:69kOkLUCkxIZYexIgSG8rq", &t, Some(&album));
+        assert_eq!(m.title, "Get Lucky");
+        assert_eq!(m.artist, "Daft Punk, Pharrell Williams");
+        assert_eq!(
+            (m.album.as_str(), m.album_artist.as_str()),
+            ("Random Access Memories", "Daft Punk")
+        );
+        assert_eq!(m.date, "2013-05-17");
+        assert_eq!(
+            (m.track, m.track_total, m.disc, m.disc_total),
+            (Some(8), Some(13), Some(1), None)
+        );
+        assert_eq!(m.isrc, "USQX91300108");
+        assert_eq!(m.label, "Columbia");
+        assert_eq!(m.copyright, "℗ 2013 Daft Life");
+        assert_eq!(m.url, "https://open.spotify.com/track/69kOkLUCkxIZYexIgSG8rq");
+        assert_eq!(
+            m.cover_urls,
+            vec![
+                "https://i.scdn.co/image/02".to_string(),
+                "https://i.scdn.co/image/01".to_string(),
+                "https://i.scdn.co/image/03".to_string()
+            ]
+        );
+
+        // Without the full album: what the track itself carries.
+        let m = details("spotify:track:x", &t, None);
+        assert_eq!((m.album.as_str(), m.date.as_str(), m.track_total), ("", "", None));
     }
 }

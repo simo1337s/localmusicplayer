@@ -1,6 +1,7 @@
 //! MultiMusic: a lightweight native music player for local files, Spotify and SoundCloud.
 
 mod config;
+mod downloader;
 mod http;
 mod integrations;
 mod library;

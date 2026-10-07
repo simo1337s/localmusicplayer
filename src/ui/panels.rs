@@ -1009,8 +1009,8 @@ fn now_playing_panel(ui: &mut Ui, cx: &mut Cx) {
             widgets::cover(ui, cx.art, src.as_deref(), art, 8, widgets::track_fallback(&t));
             ui.add_space(14.0);
             let (row, _) = ui.allocate_exact_size(vec2(w, 54.0), Sense::hover());
-            let soundcloud = t.source == Source::SoundCloud;
-            let text_w = w - if soundcloud { 76.0 } else { 40.0 };
+            let downloadable = t.source != Source::Local;
+            let text_w = w - if downloadable { 76.0 } else { 40.0 };
             text_trunc(ui, row.min, &t.title, theme::bold_font(22.0), TEXT, text_w);
             let artist = widgets::link_text(
                 ui,
@@ -1040,7 +1040,7 @@ fn now_playing_panel(ui: &mut Ui, cx: &mut Cx) {
             if hr.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                 cx.actions.push(Action::Cmd(Command::ToggleLike(t.clone())));
             }
-            if soundcloud {
+            if downloadable {
                 let r = heart.translate(vec2(-(CONTROL + 4.0), 0.0));
                 download_control(ui, cx, &t, r);
             }
@@ -1257,8 +1257,8 @@ fn provider(ui: &mut Ui, name: &str) {
     }
 }
 
-/// Download button for one SoundCloud song: a ring fills while it downloads, and once saved
-/// it shows the file in its folder.
+/// Download button for one song: a ring fills while it downloads, and once saved it shows the
+/// file in its folder.
 fn download_control(ui: &mut Ui, cx: &mut Cx, t: &Track, rect: Rect) {
     let resp = ui.interact(rect, Id::new(("download", &t.id)), Sense::click());
     let state = widgets::downloaded(cx.feed, &t.id);

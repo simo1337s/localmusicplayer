@@ -10,6 +10,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::config::{Config, Paths};
+use crate::downloader::{Downloader, Saved};
 use crate::integrations::discord::{Discord, Presence};
 use crate::integrations::lastfm::{Lastfm, ScrobbleTracker};
 use crate::integrations::lyrics::LyricsFetcher;
@@ -24,7 +25,7 @@ use crate::player::mpv::{Mpv, MpvEvent, MpvOptions, MpvSender};
 use crate::player::queue::Queue;
 use crate::player::spotify::{self, SpotifyAuth, SpotifyDeck, SpotifyEngine, SpotifyEvent, SpotifySender};
 use crate::providers::apple_music::{self, AppleMusicApi};
-use crate::providers::soundcloud::{self, DownloadKind, ScResolved, ScUser, SoundCloud};
+use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
 use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
 
 /// Requests from the UI (and MPRIS).
@@ -89,7 +90,8 @@ pub enum Command {
     Search(String),
     /// Load an artist / album / playlist / song page: a page key or a pasted link.
     OpenPage(String),
-    /// Save SoundCloud songs as files (other sources are skipped with a note why).
+    /// Save songs as files: SoundCloud songs directly, Spotify and Apple Music songs from a
+    /// matching YouTube or SoundCloud upload.
     Download(Vec<Track>),
     /// Remove finished and failed entries from the Downloads list.
     ClearDownloads,
@@ -235,10 +237,10 @@ pub enum DownloadState {
     Queued,
     /// Progress 0..=1.
     Running(f32),
-    /// `original`: the uploader's own file rather than the stream.
+    /// `from`: where the audio came from ("original file", "YouTube", …).
     Done {
         path: PathBuf,
-        original: bool,
+        from: String,
     },
     Failed(String),
 }
@@ -376,7 +378,7 @@ enum Internal {
     AudioDevices(Vec<(String, String)>),
     DownloadDone {
         track: Track,
-        result: Result<(PathBuf, DownloadKind)>,
+        result: Result<Saved>,
     },
     /// Status text while the Spotify library syncs.
     SyncProgress(String),
@@ -1031,16 +1033,17 @@ impl Service {
     /// Plays a track on the engine matching its source.
     async fn dispatch(&mut self, track: Track, start: f64) {
         let seq = self.load_seq;
+        // Local files, and downloaded songs from any service, play from the file.
+        if let Some(file) = self.file_of(&track) {
+            self.start_mpv(track, &file, start).await;
+            return;
+        }
         match track.source {
             Source::Local => {
                 let path = track.uri.clone();
                 self.start_mpv(track, &path, start).await;
             }
             Source::SoundCloud => {
-                if let Some(file) = self.downloaded_file(&track) {
-                    self.start_mpv(track, &file, start).await;
-                    return;
-                }
                 let sc = self.soundcloud.clone();
                 let tx = self.internal_tx.clone();
                 tokio::spawn(async move {
@@ -1292,17 +1295,20 @@ impl Service {
     fn detect_quality(&mut self) {
         self.quality = None;
         let Some(t) = self.playing.clone() else { return };
-        match t.source {
-            Source::Local => {
-                let tx = self.internal_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let quality = library::quality::read(std::path::Path::new(&t.uri));
-                    let _ = tx.send(Internal::Quality {
-                        track_id: t.id,
-                        quality,
-                    });
+        // Local files and downloaded songs: the file's own format.
+        if let Some(file) = self.file_of(&t) {
+            let tx = self.internal_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let quality = library::quality::read(std::path::Path::new(&file));
+                let _ = tx.send(Internal::Quality {
+                    track_id: t.id,
+                    quality,
                 });
-            }
+            });
+            return;
+        }
+        match t.source {
+            Source::Local => {}
             Source::Spotify => {
                 self.quality = Some(AudioQuality {
                     codec: "Ogg Vorbis".into(),
@@ -2721,8 +2727,7 @@ impl Service {
     fn file_of(&self, track: &Track) -> Option<String> {
         match track.source {
             Source::Local => Some(track.uri.clone()),
-            Source::SoundCloud => self.downloaded_file(track),
-            _ => None,
+            _ => self.downloaded_file(track),
         }
     }
 
@@ -2733,36 +2738,30 @@ impl Service {
     }
 
     fn download(&mut self, tracks: Vec<Track>) {
-        let (mut spotify, mut apple, mut already) = (0, 0, 0);
+        let mut already = 0;
         let mut added: Vec<String> = Vec::new();
         {
             let mut feed = self.shared.feed.write().unwrap();
             let mut seen = HashSet::new();
             for track in tracks {
-                match track.source {
-                    Source::Spotify => spotify += 1,
-                    Source::AppleMusic => apple += 1,
-                    Source::Local => {}
-                    Source::SoundCloud => {
-                        if !seen.insert(track.id.clone()) {
-                            continue;
-                        }
-                        if feed.downloaded.get(&track.id).is_some_and(|p| p.exists()) {
-                            already += 1;
-                            continue;
-                        }
-                        match feed.downloads.iter_mut().find(|d| d.track.id == track.id) {
-                            Some(d) if d.state.active() => continue,
-                            // Failed before, or the file was deleted since: try again.
-                            Some(d) => d.state = DownloadState::Queued,
-                            None => feed.downloads.push(DownloadItem {
-                                track: track.clone(),
-                                state: DownloadState::Queued,
-                            }),
-                        }
-                        added.push(track.title);
-                    }
+                // Local files are files already.
+                if track.source == Source::Local || !seen.insert(track.id.clone()) {
+                    continue;
                 }
+                if feed.downloaded.get(&track.id).is_some_and(|p| p.exists()) {
+                    already += 1;
+                    continue;
+                }
+                match feed.downloads.iter_mut().find(|d| d.track.id == track.id) {
+                    Some(d) if d.state.active() => continue,
+                    // Failed before, or the file was deleted since: try again.
+                    Some(d) => d.state = DownloadState::Queued,
+                    None => feed.downloads.push(DownloadItem {
+                        track: track.clone(),
+                        state: DownloadState::Queued,
+                    }),
+                }
+                added.push(track.title);
             }
         }
         match added.as_slice() {
@@ -2771,18 +2770,6 @@ impl Service {
             [] => {}
             [title] => self.shared.info(format!("Downloading “{title}”…")),
             many => self.shared.info(format!("Downloading {} songs…", many.len())),
-        }
-        let skipped = |n: usize, service: &str| match n {
-            1 => format!("{service} songs can't be downloaded: their audio is DRM-protected"),
-            n => format!(
-                "Skipped {n} {service} songs: their audio is DRM-protected, so only SoundCloud songs can be saved"
-            ),
-        };
-        if spotify > 0 {
-            self.shared.info(skipped(spotify, "Spotify"));
-        }
-        if apple > 0 {
-            self.shared.info(skipped(apple, "Apple Music"));
         }
         self.pump_downloads();
     }
@@ -2800,9 +2787,22 @@ impl Service {
                 item.track.clone()
             };
             self.downloads_running += 1;
-            let sc = self.soundcloud.clone();
-            let http = self.http.clone();
-            let dir = self.cfg.download_dir();
+            let wants_spotify =
+                track.source == Source::Spotify && self.cfg.spotify.enabled && self.spotify_auth.has_login();
+            let spotify = if wants_spotify { self.spotify_session() } else { None };
+            let d = &self.cfg.downloads;
+            let downloader = Downloader {
+                soundcloud: self.soundcloud.clone(),
+                http: self.http.clone(),
+                lyrics: d.lyrics.then(|| self.lyrics.clone()),
+                spotify,
+                ytdlp: if d.youtube {
+                    d.ytdlp_path.trim().to_string()
+                } else {
+                    String::new()
+                },
+            };
+            let dir = self.cfg.download_dir(track.source);
             let shared = self.shared.clone();
             let tx = self.internal_tx.clone();
             tokio::spawn(async move {
@@ -2825,17 +2825,17 @@ impl Service {
                     drop(feed);
                     shared.repaint();
                 };
-                let result = save_download(&sc, &http, &track, &dir, &progress).await;
+                let result = downloader.download(&track, &dir, &progress).await;
                 let _ = tx.send(Internal::DownloadDone { track, result });
             });
         }
         self.shared.repaint();
     }
 
-    fn download_finished(&mut self, track: Track, result: Result<(PathBuf, DownloadKind)>) {
+    fn download_finished(&mut self, track: Track, result: Result<Saved>) {
         self.downloads_running = self.downloads_running.saturating_sub(1);
         let state = match result {
-            Ok((path, kind)) => {
+            Ok(Saved { path, from }) => {
                 let _ = self
                     .db
                     .set_kv(&format!("{DOWNLOAD_KEY}{}", track.id), &path.to_string_lossy());
@@ -2847,10 +2847,7 @@ impl Service {
                     .insert(track.id.clone(), path.clone());
                 self.add_downloaded_file(&path);
                 self.download_batch.push((track.title.clone(), None));
-                DownloadState::Done {
-                    path,
-                    original: kind == DownloadKind::Original,
-                }
+                DownloadState::Done { path, from }
             }
             Err(e) => {
                 let error = friendly_download_error(&e);
@@ -3309,63 +3306,6 @@ impl Service {
 /// Database key prefix of downloaded songs (`download:<track id>` → file path).
 const DOWNLOAD_KEY: &str = "download:";
 
-/// Downloads a SoundCloud song and tags it with its title, artist and cover.
-async fn save_download(
-    sc: &SoundCloud,
-    http: &reqwest::Client,
-    track: &Track,
-    dir: &Path,
-    progress: &(dyn Fn(f32) + Send + Sync),
-) -> Result<(PathBuf, DownloadKind)> {
-    let (path, kind) = sc.download(track, dir, progress).await?;
-    // Streams in MP4 are fragmented, which tag writers can't safely rewrite; the stream's own
-    // metadata has to do there.
-    if kind == DownloadKind::Stream && path.extension().is_some_and(|e| e == "m4a") {
-        return Ok((path, kind));
-    }
-    let cover = match track.art.as_deref().filter(|a| a.starts_with("http")) {
-        Some(url) => fetch_image(http, url).await,
-        None => None,
-    };
-    let (file, track_) = (path.clone(), track.clone());
-    let tagged = tokio::task::spawn_blocking(move || {
-        let album = if track_.album.trim().is_empty() {
-            &track_.title
-        } else {
-            &track_.album
-        };
-        library::tags::write(
-            &file,
-            &library::tags::Tags {
-                title: &track_.title,
-                artist: &track_.artist,
-                album,
-                comment: &track_.uri,
-                cover: cover.as_deref(),
-                // The uploader's own file may be tagged already.
-                keep_existing: kind == DownloadKind::Original,
-            },
-        )
-    })
-    .await;
-    match tagged {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("{e:#}"),
-        Err(e) => tracing::warn!("tagging {} failed: {e}", path.display()),
-    }
-    Ok((path, kind))
-}
-
-/// Cover art for tagging; at most a few MB.
-async fn fetch_image(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
-    let resp = http.get(url).send().await.ok()?.error_for_status().ok()?;
-    if resp.content_length().is_some_and(|n| n > 8 << 20) {
-        return None;
-    }
-    let bytes = resp.bytes().await.ok()?;
-    (bytes.len() <= 8 << 20).then(|| bytes.to_vec())
-}
-
 /// Short reason for the Downloads list (the song's title is shown next to it).
 fn friendly_download_error(e: &anyhow::Error) -> String {
     let offline = e.chain().any(|cause| {
@@ -3745,9 +3685,14 @@ impl Resolver {
 
 /// Picks the candidate that is clearly the same song (title + artist, close duration).
 pub fn best_match(target: &Track, candidates: &[Track]) -> Option<Track> {
+    ranked_matches(target, candidates).into_iter().next()
+}
+
+/// Candidates that are the same song as `target`, best first.
+pub fn ranked_matches(target: &Track, candidates: &[Track]) -> Vec<Track> {
     let title = normalize_title(&target.title);
     let artist = normalize_artist(&target.artist);
-    candidates
+    let mut matches: Vec<(&Track, u64)> = candidates
         .iter()
         .filter_map(|c| {
             let ct = normalize_title(&c.title);
@@ -3770,8 +3715,9 @@ pub fn best_match(target: &Track, candidates: &[Track]) -> Option<Track> {
             let exact = (ct == title) as u64 + (ca == artist) as u64;
             Some((c, (2 - exact) * 100_000 + dur_diff))
         })
-        .min_by_key(|(_, score)| *score)
-        .map(|(c, _)| c.clone())
+        .collect();
+    matches.sort_by_key(|(_, score)| *score);
+    matches.into_iter().map(|(c, _)| c.clone()).collect()
 }
 
 #[cfg(test)]

@@ -28,7 +28,11 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 - **Synced lyrics**: reads `.lrc` files next to your music, then embedded lyrics tags, then [LRCLIB](https://lrclib.net). Lyrics are shown in a side panel and in a full-screen *Now playing* view with a large cover. Click a line to jump to it.
 - **Discord Rich Presence** shows "Listening to <song>" with the album cover, a progress bar and an "Open in Spotify/SoundCloud" button. Works with the Discord app, Vesktop and arRPC.
 - **Crossfade** (Settings → Playback, up to 12 s) between any two sources: local file into Spotify, Spotify into SoundCloud, Spotify into Spotify, and so on. The next song starts on a second player while the current one fades out. Songs of the same album stay gapless unless you tick *Also crossfade between songs of the same album*. Skipping, seeking or pausing during a fade ends it right away.
-- **SoundCloud downloads**: right-click a SoundCloud song and choose *Download*, use the download button on a SoundCloud playlist, likes or profile page, or the one next to the song in *Now playing*. MultiMusic saves the uploader's original file when they allow downloads (often WAV or FLAC), otherwise the stream SoundCloud plays (MP3, or Opus). Files are tagged with title, artist and cover. They go to `~/Music/SoundCloud` (the first library folder) by default, so they also show up in *Local Files*; change it under *Settings → SoundCloud → Download folder*. Downloaded songs play from the file, even offline, and a **Downloads** page in the sidebar shows progress, failures (with *Try again*) and everything saved earlier. Go+ previews and encrypted Go+ streams can't be saved. Spotify and Apple Music songs can't be downloaded: their audio is DRM-protected.
+- **Downloads from every service**: right-click a song and choose *Download*, use the download button on a playlist, album, artist or profile page, or the one next to the song in *Now playing*.
+  - **SoundCloud** songs download directly: the uploader's original file when they allow it (often WAV or FLAC), otherwise the stream SoundCloud plays.
+  - **Spotify and Apple Music** audio is DRM-protected, so MultiMusic does what [spotDL](https://github.com/spotDL/spotify-downloader) does: it finds the same recording on YouTube (the artist's official "Topic" upload, with the same length) through [yt-dlp](https://github.com/yt-dlp/yt-dlp), or on SoundCloud, and downloads that. Spotify's own encrypted audio is never touched. Install yt-dlp for this (`sudo pacman -S yt-dlp`); without it only SoundCloud is searched.
+  - **Full metadata**: every file is tagged with title, all artists, album, album artist, track and disc number (with totals), release date, ISRC, label, copyright, genre (SoundCloud), a link to the song and the full-size cover. For Spotify songs these come from Spotify itself. Lyrics from LRCLIB are embedded too, time-synced when available.
+  - Files are named "Artist - Title" and go to a *SoundCloud*, *Spotify* or *Apple Music* folder in your first library folder, so they also show up in *Local Files*; choose another folder under *Settings → Downloads*. Downloaded songs play from the file, even offline, and the **Downloads** page in the sidebar shows progress, failures (with *Try again*) and everything saved earlier.
 - **Last.fm scrobbling**: by default every song scrobbles the moment it starts playing. Untick *Scrobble as soon as a song starts* to use Last.fm's usual rule instead (half the song or 4 minutes). Also sends "now playing" updates, and queues scrobbles offline to send later.
 - **MPRIS / media keys**: works with `playerctl`, waybar, polybar, KDE/GNOME media widgets and headset buttons.
 - **Its own look**: graphite and off-white like the logo, rounded "tile" panels, a floating player dock, header cards that glow in the colours of the cover, and soft hover and page transitions. **Drag the edges** of the sidebar and the lyrics / queue panel to resize them (sizes are remembered); drag the sidebar narrow and it becomes a strip of icons and covers. Also: a queue, back / forward navigation, albums and artists grids, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window). The accent colour can be changed in Settings.
@@ -136,8 +140,9 @@ Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 - **A pasted Spotify link says "Log in to Spotify"**: Spotify pages load through your Spotify login, so log in under Settings first. SoundCloud and Apple Music links work without an account.
 - **`makepkg` fails in `check()`**: update to the latest commit (`git pull`); an older test could fail when a network port was busy. `makepkg -si --nocheck` skips the tests.
 - **Some SoundCloud tracks won't play**: SoundCloud Go+ tracks only offer 30-second previews to third-party apps, and some tracks are region-locked.
+- **A Spotify or Apple Music download says "install yt-dlp"**: these songs are found on YouTube with yt-dlp (`sudo pacman -S yt-dlp`), which also needs `ffmpeg` (already installed with mpv). Without yt-dlp only SoundCloud is searched, where many songs are missing or only have Go+ previews. If YouTube downloads start failing, update yt-dlp; YouTube changes often.
 - **A SoundCloud download fails**: Go+ songs only offer a 30 second preview or an encrypted stream, and neither is saved. Region-locked songs fail too. Other failures can be retried from the Downloads page.
-- **Why is there no Spotify download button?** Spotify streams are encrypted (DRM), and saving them would mean breaking that protection and Spotify's terms. Spotify songs still play in MultiMusic as usual; *Settings → Spotify → Cache audio on disk* saves bandwidth for songs you replay.
+- **Why not save Spotify's own audio?** It is encrypted (DRM). Tools that decrypt it break Spotify's terms and get accounts banned, so MultiMusic downloads the same recording from YouTube or SoundCloud instead and tags it with Spotify's details.
 - **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. MultiMusic loads a CJK font only when your library needs it.
 - **Media keys don't work**: MultiMusic registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has.
 - **Interface too small or too large**: Settings → Appearance → *Interface scale*.
@@ -149,9 +154,10 @@ src/
   main.rs              window + runtime setup
   service.rs           background service: playback state machine, sync jobs, search, pages, integrations
   links.rs             recognises pasted Spotify / SoundCloud / Apple Music links
+  downloader.rs        downloads: finds the audio, then tags it with metadata, cover and lyrics
   player/              play queue, mpv (JSON IPC) engine, librespot engine + Spotify OAuth
-  library/             SQLite store, incremental tag scanner (lofty), M3U import/export
-  providers/           Spotify (session + Web API), SoundCloud api-v2, Apple Music (XML + catalog API)
+  library/             SQLite store, incremental tag scanner and tag writer (lofty), M3U import/export
+  providers/           Spotify (session + Web API), SoundCloud api-v2, Apple Music (XML + catalog API), YouTube (yt-dlp)
   integrations/        lyrics (LRC/LRCLIB), Last.fm, Discord RPC, MPRIS
   ui/                  egui views, theme, widgets, cover art cache
 ```
@@ -160,7 +166,7 @@ The UI thread only draws. Playback, network and disk work run on a small tokio r
 
 ## Disclaimer
 
-MultiMusic is an unofficial client and isn't affiliated with Spotify, SoundCloud, Apple or Discord. Spotify support uses librespot. Use the integrations in line with each service's terms.
+MultiMusic is an unofficial client and isn't affiliated with Spotify, SoundCloud, YouTube, Apple or Discord. Spotify support uses librespot. Use the integrations in line with each service's terms.
 
 ## License
 

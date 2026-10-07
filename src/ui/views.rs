@@ -14,8 +14,10 @@ use crate::service::{Command, DownloadState, PlayStatus};
 
 pub struct ViewState<'a> {
     pub view: &'a View,
-    /// Where SoundCloud downloads are saved.
+    /// Where downloads are saved: the chosen folder, or the library folder holding the
+    /// per-service folders.
     pub download_dir: &'a std::path::Path,
+    pub download_custom: bool,
     /// What's typed in the top bar.
     pub search_text: &'a str,
     pub search_cache: &'a mut (String, u64, Vec<String>),
@@ -1611,7 +1613,7 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                 track: track.clone(),
                 state: DownloadState::Done {
                     path: path.clone(),
-                    original: false,
+                    from: String::new(),
                 },
             })
         })
@@ -1632,7 +1634,12 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             Some(rest) if !home.is_empty() => format!("~{rest}"),
             _ => dir.clone(),
         };
-        ui.label(egui::RichText::new(format!("SoundCloud songs are saved to {shown}")).color(TEXT_DIM));
+        let saved_to = if st.download_custom {
+            format!("Songs are saved to {shown}")
+        } else {
+            format!("Songs are saved in {shown}, in a folder for each service")
+        };
+        ui.label(egui::RichText::new(saved_to).color(TEXT_DIM));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
@@ -1650,16 +1657,12 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         ui.add_space(18.0);
 
         if rows.is_empty() && earlier.is_empty() {
-            panels::empty_state(
-                ui,
-                icon::DOWNLOAD_SIMPLE,
-                "Songs you download from SoundCloud show up here",
-            );
+            panels::empty_state(ui, icon::DOWNLOAD_SIMPLE, "Songs you download show up here");
             ui.vertical_centered(|ui| {
                 ui.label(
                     egui::RichText::new(
-                        "Right-click a SoundCloud song and choose Download, or use the download button on a \
-                         SoundCloud playlist or profile.",
+                        "Right-click a song and choose Download, or use the download button on a playlist, \
+                         album or profile.",
                     )
                     .size(12.5)
                     .color(TEXT_FAINT),
@@ -1691,7 +1694,8 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         }
         ui.label(
             egui::RichText::new(
-                "Only SoundCloud songs can be downloaded: Spotify and Apple Music audio is DRM-protected.",
+                "Spotify and Apple Music audio is DRM-protected, so those songs are saved from the same \
+                 recording on YouTube (with yt-dlp) or SoundCloud, then tagged with all their details.",
             )
             .size(12.0)
             .color(TEXT_FAINT),
@@ -1769,8 +1773,12 @@ fn download_row(ui: &mut Ui, cx: &mut Cx, row: &DownloadRow, tracks: &[Track], i
                 TEXT_DIM,
             );
         }
-        DownloadState::Done { original, .. } => {
-            let label = if *original { "Saved · original file" } else { "Saved" };
+        DownloadState::Done { from, .. } => {
+            let label = match from.as_str() {
+                "" => "Saved".to_string(),
+                "original file" => "Saved · original file".to_string(),
+                from => format!("Saved · from {from}"),
+            };
             painter.text(
                 right.right_center() - vec2(40.0, 0.0),
                 Align2::RIGHT_CENTER,

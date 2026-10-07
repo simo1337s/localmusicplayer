@@ -255,14 +255,31 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync likes & playlists")).clicked() {
                     cx.actions.push(Action::Cmd(Command::SyncSoundCloud));
                 }
-                ui.add_space(10.0);
-                let default_dir = cfg.default_download_dir().to_string_lossy().into_owned();
-                text_field(ui, "Download folder", &mut cfg.soundcloud.download_folder, &default_dir, false);
+            });
+
+            // ---------------------------------------------------------- downloads
+            section(ui, icon::DOWNLOAD_SIMPLE, TEXT, "Downloads", |ui| {
+                let root = cfg.library_root().to_string_lossy().into_owned();
+                text_field(ui, "Download folder", &mut cfg.downloads.folder, &format!("{root}/<service>"), false);
                 hint(
                     ui,
-                    "Downloads are the uploader's original file when they allow it (often WAV or FLAC), otherwise the \
-                     stream SoundCloud plays. Saved inside a library folder, they show up in Local Files too.",
+                    "Empty: a SoundCloud, Spotify or Apple Music folder inside your first library folder, so \
+                     downloads show up in Local Files too.",
                 );
+                ui.add_space(6.0);
+                ui.checkbox(&mut cfg.downloads.youtube, "Find Spotify and Apple Music songs on YouTube");
+                if cfg.downloads.youtube {
+                    text_field(ui, "yt-dlp program", &mut cfg.downloads.ytdlp_path, "yt-dlp", false);
+                }
+                hint(
+                    ui,
+                    "Spotify and Apple Music audio is DRM-protected, so MultiMusic downloads the same recording \
+                     from YouTube (with yt-dlp: sudo pacman -S yt-dlp) or SoundCloud, then tags it with the \
+                     song's details from Spotify: album, artists, track and disc number, release date, ISRC, \
+                     label, copyright and full-size cover.",
+                );
+                ui.add_space(6.0);
+                ui.checkbox(&mut cfg.downloads.lyrics, "Embed lyrics (time-synced when available)");
             });
 
             // ---------------------------------------------------------- apple music

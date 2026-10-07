@@ -14,7 +14,8 @@ optdepends=('pipewire-pulse: Spotify output on PipeWire desktops (usually alread
             'noto-fonts: symbols (☆ ✞ ♡ ...) in song and artist names'
             'noto-fonts-cjk: Japanese, Chinese and Korean song titles'
             'inter-font: nicer interface font'
-            'discord: Rich Presence (also works with Vesktop / arRPC)')
+            'discord: Rich Presence (also works with Vesktop / arRPC)'
+            'yt-dlp: download Spotify and Apple Music songs (found on YouTube)')
 provides=('multimusic')
 conflicts=('medley')
 replaces=('medley')

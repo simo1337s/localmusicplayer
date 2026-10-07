@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::library::tags::Metadata;
 use crate::model::{ArtistHit, ImportedPlaylist, Source, Track};
 
 const API_BASE: &str = "https://api-v2.soundcloud.com";
@@ -409,13 +411,14 @@ impl SoundCloud {
 
     /// Saves `track` into `dir`: the uploader's original file when they allow downloads,
     /// otherwise the stream SoundCloud plays (encrypted Go+ streams and 30 second previews are
-    /// refused). Returns the saved file. `progress` is called with 0..=1 while downloading.
+    /// refused). Returns the saved file and the song's details for tagging. `progress` is
+    /// called with 0..=1 while downloading.
     pub async fn download(
         &self,
         track: &Track,
         dir: &Path,
         progress: &(dyn Fn(f32) + Send + Sync),
-    ) -> Result<(PathBuf, DownloadKind)> {
+    ) -> Result<ScDownload> {
         let json = self.track_json(track).await?;
         let title = json
             .get("title")
@@ -463,7 +466,11 @@ impl SoundCloud {
             .await
             .with_context(|| format!("couldn't save {}", path.display()))?;
         info!("SoundCloud: saved \"{title}\" to {}", path.display());
-        Ok((path, kind))
+        Ok(ScDownload {
+            path,
+            kind,
+            meta: download_metadata(&json, track),
+        })
     }
 
     /// The file the uploader put up for download.
@@ -941,6 +948,87 @@ fn is_default_avatar(url: &str) -> bool {
     url.contains("default_avatar")
 }
 
+/// A saved song.
+pub struct ScDownload {
+    pub path: PathBuf,
+    pub kind: DownloadKind,
+    pub meta: Metadata,
+}
+
+/// Tags for a downloaded song, from its api-v2 JSON (release details come from the
+/// `publisher_metadata` labels and distributors fill in).
+fn download_metadata(v: &Value, track: &Track) -> Metadata {
+    let parsed = parse_track(v);
+    let pm = v.get("publisher_metadata");
+    let text = |value: Option<&Value>| non_empty(value).unwrap_or_default().trim().to_string();
+    let artist = parsed
+        .as_ref()
+        .map(|t| t.artist.clone())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| track.artist.clone());
+    let title = parsed
+        .as_ref()
+        .map(|t| t.title.clone())
+        .unwrap_or_else(|| track.title.clone());
+    let album = [
+        pm.and_then(|m| m.get("album_title")),
+        pm.and_then(|m| m.get("release_title")),
+    ]
+    .into_iter()
+    .map(text)
+    .find(|a| !a.is_empty())
+    .unwrap_or_default();
+    // "2019-05-03T00:00:00Z" → "2019-05-03"; the release date when the uploader set one.
+    let date = ["release_date", "display_date", "created_at"]
+        .iter()
+        .map(|k| text(v.get(*k)))
+        .find(|d| d.len() >= 4 && d[..4].chars().all(|c| c.is_ascii_digit()))
+        .map(|d| d.chars().take(10).collect())
+        .unwrap_or_default();
+    let copyright = [
+        pm.and_then(|m| m.get("p_line_for_display")),
+        pm.and_then(|m| m.get("p_line")),
+        pm.and_then(|m| m.get("c_line_for_display")),
+        pm.and_then(|m| m.get("c_line")),
+    ]
+    .into_iter()
+    .map(text)
+    .find(|c| !c.is_empty())
+    .unwrap_or_default();
+    let artwork = non_empty(v.get("artwork_url"))
+        .or_else(|| v.get("user").and_then(|u| non_empty(u.get("avatar_url"))))
+        .filter(|u| !is_default_avatar(u));
+    // The full-size upload first, then 500x500.
+    let cover_urls = artwork
+        .map(|u| {
+            let mut urls = Vec::new();
+            if u.contains("-large.") {
+                urls.push(u.replace("-large.", "-original."));
+            }
+            urls.push(upscale_art(u));
+            urls
+        })
+        .unwrap_or_default();
+    Metadata {
+        title,
+        album_artist: artist.clone(),
+        artist,
+        album,
+        genre: text(v.get("genre")),
+        date,
+        isrc: text(pm.and_then(|m| m.get("isrc"))),
+        label: [v.get("label_name"), pm.and_then(|m| m.get("publisher"))]
+            .into_iter()
+            .map(text)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default(),
+        copyright,
+        url: text(v.get("permalink_url")),
+        cover_urls,
+        ..Metadata::default()
+    }
+}
+
 /// Where a downloaded file came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadKind {
@@ -1111,7 +1199,7 @@ pub fn file_stem(artist: &str, title: &str) -> String {
 }
 
 /// `dir/stem.ext`, or `dir/stem (2).ext` and so on if that exists.
-fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
     let first = dir.join(format!("{stem}.{ext}"));
     if !first.exists() {
         return first;

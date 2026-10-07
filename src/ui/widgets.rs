@@ -299,14 +299,10 @@ pub fn downloaded(feed: &Feed, track_id: &str) -> Downloaded {
     }
 }
 
-/// Download button for the SoundCloud songs among `tracks`; nothing when there are none.
+/// Download button for the songs among `tracks` that aren't local files; nothing when all are.
 pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
-    let soundcloud: Vec<&Track> = tracks
-        .iter()
-        .copied()
-        .filter(|t| t.source == Source::SoundCloud)
-        .collect();
-    if soundcloud.is_empty() {
+    let remote: Vec<&Track> = tracks.iter().copied().filter(|t| t.source != Source::Local).collect();
+    if remote.is_empty() {
         return;
     }
     let active: std::collections::HashSet<&str> = cx
@@ -316,18 +312,14 @@ pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
         .filter(|d| d.state.active())
         .map(|d| d.track.id.as_str())
         .collect();
-    let total = soundcloud.len();
-    let done = soundcloud
-        .iter()
-        .filter(|t| cx.feed.downloaded.contains_key(&t.id))
-        .count();
-    let busy = soundcloud.iter().filter(|t| active.contains(t.id.as_str())).count();
-    let others = tracks.len() - total;
+    let total = remote.len();
+    let done = remote.iter().filter(|t| cx.feed.downloaded.contains_key(&t.id)).count();
+    let busy = remote.iter().filter(|t| active.contains(t.id.as_str())).count();
     let (glyph, color, tip) = if done == total {
         let tip = if total == 1 {
             "Downloaded".to_string()
         } else {
-            format!("All {total} SoundCloud songs are downloaded")
+            format!("All {total} songs are downloaded")
         };
         (icon::CHECK_CIRCLE, cx.accent, tip)
     } else if busy > 0 {
@@ -337,11 +329,10 @@ pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
             format!("Downloading… {done} of {total} saved"),
         )
     } else {
-        let tip = match (total, done, others) {
-            (1, _, 0) => "Download".to_string(),
-            (n, 0, 0) => format!("Download {n} songs"),
-            (n, 0, _) => format!("Download the {n} SoundCloud songs (Spotify and Apple Music songs can't be saved)"),
-            (n, d, _) => format!("Download the other {} SoundCloud songs ({d} of {n} saved)", n - d),
+        let tip = match (total, done) {
+            (1, _) => "Download".to_string(),
+            (n, 0) => format!("Download {n} songs"),
+            (n, d) => format!("Download the other {} songs ({d} of {n} saved)", n - d),
         };
         (icon::DOWNLOAD_SIMPLE, TEXT_DIM, tip)
     };
@@ -349,7 +340,7 @@ pub fn download_button(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], size: f32) {
         if done == total || busy > 0 {
             cx.actions.push(Action::Go(View::Downloads));
         } else {
-            let todo = soundcloud
+            let todo = remote
                 .into_iter()
                 .filter(|t| !cx.feed.downloaded.contains_key(&t.id))
                 .cloned()
@@ -658,9 +649,9 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             title_color,
             tw,
         );
-        // Downloaded (or downloading) SoundCloud songs get a small arrow before the artist.
+        // Downloaded (or downloading) songs get a small arrow before the artist.
         let mut artist_x = tx;
-        if t.source == Source::SoundCloud {
+        if t.source != Source::Local {
             let mark = match downloaded(cx.feed, &t.id) {
                 Downloaded::Yes => Some(cx.accent),
                 Downloaded::Busy(_) => Some(TEXT_FAINT),
@@ -880,6 +871,29 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             ui.close();
         }
     }
+    if t.source != Source::Local {
+        if let Some(file) = cx.feed.downloaded.get(&t.id) {
+            if ui
+                .button(theme::ic(icon::FOLDER_OPEN, "Show download in folder"))
+                .clicked()
+            {
+                if let Some(dir) = file.parent() {
+                    cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
+                }
+                ui.close();
+            }
+        } else {
+            let busy = cx.feed.downloads.iter().any(|d| d.track.id == t.id && d.state.active());
+            let label = if busy { "Downloading…" } else { "Download" };
+            if ui
+                .add_enabled(!busy, egui::Button::new(theme::ic(icon::DOWNLOAD_SIMPLE, label)))
+                .clicked()
+            {
+                cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()])));
+                ui.close();
+            }
+        }
+    }
     ui.separator();
     match t.source {
         Source::Spotify => {
@@ -895,24 +909,6 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             }
         }
         Source::SoundCloud => {
-            if let Some(file) = cx.feed.downloaded.get(&t.id) {
-                if ui.button(theme::ic(icon::FOLDER_OPEN, "Show in folder")).clicked() {
-                    if let Some(dir) = file.parent() {
-                        cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
-                    }
-                    ui.close();
-                }
-            } else {
-                let busy = cx.feed.downloads.iter().any(|d| d.track.id == t.id && d.state.active());
-                let label = if busy { "Downloading…" } else { "Download" };
-                if ui
-                    .add_enabled(!busy, egui::Button::new(theme::ic(icon::DOWNLOAD_SIMPLE, label)))
-                    .clicked()
-                {
-                    cx.actions.push(Action::Cmd(Command::Download(vec![t.clone()])));
-                    ui.close();
-                }
-            }
             if t.uri.starts_with("http")
                 && ui
                     .button(theme::ic(icon::ARROW_SQUARE_OUT, "Open on SoundCloud"))

@@ -412,6 +412,24 @@ pub fn clean_title(title: &str) -> String {
     }
 }
 
+/// Lyrics as text for a file's lyrics tag: LRC when they are time-synced, else plain.
+pub fn to_tag_text(l: &Lyrics) -> String {
+    if l.instrumental {
+        return String::new();
+    }
+    if l.synced.is_empty() {
+        return l.plain.trim().to_string();
+    }
+    l.synced
+        .iter()
+        .map(|line| {
+            let cs = line.time_ms / 10;
+            format!("[{:02}:{:02}.{:02}]{}", cs / 6000, cs / 100 % 60, cs % 100, line.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The first credited artist ("A, B" / "A & B" / "A feat. B" -> "A").
 pub fn first_artist(artist: &str) -> String {
     let artist = artist.trim();
@@ -531,7 +549,7 @@ fn embedded_lyrics(audio: &Path) -> Option<Lyrics> {
     None
 }
 
-fn local_lyrics(audio: &Path) -> Option<Lyrics> {
+pub(crate) fn local_lyrics(audio: &Path) -> Option<Lyrics> {
     sidecar_lyrics(audio).or_else(|| embedded_lyrics(audio))
 }
 
@@ -1052,5 +1070,15 @@ mod tests {
         assert_eq!(decode_text(b"\xEF\xBB\xBFhi"), "hi");
         assert_eq!(decode_text(b"caf\xE9"), "café");
         assert_eq!(decode_text(&[0xFF, 0xFE, b'h', 0, b'i', 0]), "hi");
+    }
+
+    #[test]
+    fn lyrics_tag_text_roundtrips() {
+        let l = lyrics_from_text("[00:01.00]Hello\n[01:02.34]World", "x");
+        let text = to_tag_text(&l);
+        assert_eq!(text, "[00:01.00]Hello\n[01:02.34]World");
+        assert_eq!(lyrics_from_text(&text, "x").synced, l.synced);
+        let plain = lyrics_from_text("Just words\nmore", "x");
+        assert_eq!(to_tag_text(&plain), "Just words\nmore");
     }
 }

@@ -19,6 +19,7 @@ pub struct Config {
     pub lastfm: LastfmConfig,
     pub discord: DiscordConfig,
     pub lyrics: LyricsConfig,
+    pub downloads: DownloadsConfig,
     pub ui: UiConfig,
 }
 
@@ -39,6 +40,7 @@ impl Default for Config {
             lastfm: LastfmConfig::default(),
             discord: DiscordConfig::default(),
             lyrics: LyricsConfig::default(),
+            downloads: DownloadsConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -149,7 +151,8 @@ pub struct SoundCloudConfig {
     pub oauth_token: String,
     /// Optional API client id override (scraped from soundcloud.com automatically when empty).
     pub client_id: String,
-    /// Where downloaded songs go. Empty = a "SoundCloud" folder in the first library folder.
+    /// Moved to `[downloads] folder`; only read to carry an old setting over.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub download_folder: String,
 }
 
@@ -161,6 +164,30 @@ impl Default for SoundCloudConfig {
             oauth_token: String::new(),
             client_id: String::new(),
             download_folder: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DownloadsConfig {
+    /// Where downloads go. Empty = "SoundCloud", "Spotify" and "Apple Music" folders in the
+    /// first library folder.
+    pub folder: String,
+    /// Look for Spotify and Apple Music songs on YouTube (needs yt-dlp) before SoundCloud.
+    pub youtube: bool,
+    pub ytdlp_path: String,
+    /// Embed lyrics (from LRCLIB, time-synced when available).
+    pub lyrics: bool,
+}
+
+impl Default for DownloadsConfig {
+    fn default() -> Self {
+        DownloadsConfig {
+            folder: String::new(),
+            youtube: true,
+            ytdlp_path: "yt-dlp".into(),
+            lyrics: true,
         }
     }
 }
@@ -380,30 +407,33 @@ impl Config {
         }
     }
 
-    /// Folder SoundCloud downloads are saved in.
-    pub fn download_dir(&self) -> PathBuf {
-        let custom = self.soundcloud.download_folder.trim();
+    /// Folder songs from `source` are downloaded to.
+    pub fn download_dir(&self, source: crate::model::Source) -> PathBuf {
+        let custom = self.downloads.folder.trim();
         if !custom.is_empty() {
             return expand_home(custom);
         }
-        self.default_download_dir()
+        self.library_root().join(source.label())
     }
 
-    /// A "SoundCloud" folder in the first library folder, so downloads join the library.
-    pub fn default_download_dir(&self) -> PathBuf {
+    /// The first library folder, where downloads go by default (so they join the library).
+    pub fn library_root(&self) -> PathBuf {
         self.library
             .folders
             .first()
             .cloned()
             .or_else(|| Config::default().library.folders.first().cloned())
             .unwrap_or_else(|| PathBuf::from("Music"))
-            .join("SoundCloud")
     }
 
     /// Adjusts settings saved by older versions.
     fn upgrade(&mut self) {
         if self.ui.accent == OLD_DEFAULT_ACCENT {
             self.ui.accent = DEFAULT_ACCENT;
+        }
+        let old_folder = std::mem::take(&mut self.soundcloud.download_folder);
+        if self.downloads.folder.is_empty() {
+            self.downloads.folder = old_folder;
         }
     }
 
@@ -484,14 +514,22 @@ mod tests {
 
     #[test]
     fn download_dir_defaults_to_the_library() {
+        use crate::model::Source;
         let mut cfg = Config::default();
         cfg.library.folders = vec![PathBuf::from("/music"), PathBuf::from("/more")];
-        assert_eq!(cfg.download_dir(), PathBuf::from("/music/SoundCloud"));
-        cfg.soundcloud.download_folder = " /data/sc ".into();
-        assert_eq!(cfg.download_dir(), PathBuf::from("/data/sc"));
-        cfg.soundcloud.download_folder = "~/sc".into();
-        assert!(cfg.download_dir().ends_with("sc"));
-        assert!(cfg.download_dir().is_absolute());
+        assert_eq!(cfg.download_dir(Source::SoundCloud), PathBuf::from("/music/SoundCloud"));
+        assert_eq!(cfg.download_dir(Source::Spotify), PathBuf::from("/music/Spotify"));
+        cfg.downloads.folder = " /data/dl ".into();
+        assert_eq!(cfg.download_dir(Source::Spotify), PathBuf::from("/data/dl"));
+        cfg.downloads.folder = "~/dl".into();
+        assert!(cfg.download_dir(Source::SoundCloud).ends_with("dl"));
+        assert!(cfg.download_dir(Source::SoundCloud).is_absolute());
+
+        // The folder set in the previous version moves to [downloads].
+        let mut cfg: Config = toml::from_str("[soundcloud]\ndownload_folder = \"/old\"\n").unwrap();
+        cfg.upgrade();
+        assert_eq!(cfg.downloads.folder, "/old");
+        assert!(!toml::to_string(&cfg).unwrap().contains("download_folder"));
     }
 
     #[test]

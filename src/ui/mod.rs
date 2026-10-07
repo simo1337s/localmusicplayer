@@ -776,10 +776,16 @@ impl eframe::App for App {
                     if self.view == View::Settings {
                         settings::show(ui, &mut cx, &mut self.cfg, &mut self.settings, &self.paths, self.rss_mb);
                     } else {
-                        let download_dir = self.cfg.download_dir();
+                        let custom = self.cfg.downloads.folder.trim();
+                        let download_dir = if custom.is_empty() {
+                            self.cfg.library_root()
+                        } else {
+                            crate::config::expand_home(custom)
+                        };
                         let mut state = views::ViewState {
                             view: &self.view,
                             download_dir: &download_dir,
+                            download_custom: !custom.is_empty(),
                             search_text: &self.search_text,
                             search_cache: &mut self.search_cache,
                             filter_text: &mut self.filter_text,
