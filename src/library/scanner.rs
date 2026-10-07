@@ -229,7 +229,7 @@ mod tests {
 
         let mut known = HashMap::new();
         known.insert("local:/gone.mp3".to_string(), 1);
-        let result = scan(&[dir.clone()], &known, &|_, _| {});
+        let result = scan(std::slice::from_ref(&dir), &known, &|_, _| {});
         assert_eq!(result.total_files, 1);
         assert_eq!(result.changed.len(), 1);
         assert_eq!(result.removed, vec!["local:/gone.mp3".to_string()]);
@@ -240,7 +240,7 @@ mod tests {
 
         // Unchanged files are skipped on the next scan.
         let known: HashMap<String, i64> = result.mtimes.clone();
-        let again = scan(&[dir.clone()], &known, &|_, _| {});
+        let again = scan(std::slice::from_ref(&dir), &known, &|_, _| {});
         assert!(again.changed.is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }

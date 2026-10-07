@@ -172,9 +172,6 @@ impl Library {
         hits.into_iter().take(limit).map(|(t, _)| t.clone()).collect()
     }
 
-    pub fn playlist_position(&self, id: &str) -> i64 {
-        self.playlists.iter().position(|p| p.id == id).unwrap_or(0) as i64
-    }
 }
 
 pub fn liked_playlist() -> Playlist {

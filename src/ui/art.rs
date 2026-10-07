@@ -143,9 +143,6 @@ impl ArtCache {
         self.accents.get(src).copied()
     }
 
-    pub fn loaded_count(&self) -> usize {
-        self.textures.len()
-    }
 }
 
 async fn load_bytes(http: &reqwest::Client, disk: &Path, src: &str) -> Option<Vec<u8>> {

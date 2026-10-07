@@ -599,10 +599,6 @@ impl LyricsFetcher {
         LyricsFetcher { http, cache_dir, online }
     }
 
-    pub fn set_online(&mut self, online: bool) {
-        self.online = online;
-    }
-
     pub fn cache_path(&self, track: &Track) -> PathBuf {
         self.cache_dir.join(cache_key(track))
     }

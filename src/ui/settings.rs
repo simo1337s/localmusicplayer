@@ -33,7 +33,7 @@ fn section(ui: &mut Ui, glyph: &str, color: Color32, title: &str, add: impl FnOn
     widgets::card_frame().show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(RichText::new(glyph).size(20.0).color(color));
+            ui.label(RichText::new(glyph).family(theme::icons()).size(20.0).color(color));
             ui.label(RichText::new(title).font(theme::bold_font(17.0)));
         });
         ui.add_space(8.0);
@@ -90,8 +90,9 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 let mut remove = None;
                 for (i, f) in cfg.library.folders.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(icon::FOLDER_OPEN).color(TEXT_DIM));
-                        ui.label(f.display().to_string());
+                        ui.set_max_width(ui.available_width() - 40.0);
+                        ui.label(RichText::new(icon::FOLDER_OPEN).family(theme::icons()).color(TEXT_DIM));
+                        ui.add(egui::Label::new(f.display().to_string()).truncate());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Remove folder").clicked() {
                                 remove = Some(i);
@@ -119,7 +120,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 });
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut cfg.library.scan_on_startup, "Rescan on startup");
-                    if ui.button(format!("{}  Rescan now", icon::ARROWS_CLOCKWISE)).clicked() {
+                    if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Rescan now")).clicked() {
                         cx.actions.push(Action::Cmd(Command::Rescan));
                     }
                 });
@@ -133,7 +134,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.horizontal(|ui| {
                     let logged_in = matches!(cx.feed.spotify, AccountStatus::Connected(_) | AccountStatus::Working(_));
                     if logged_in {
-                        if ui.button(format!("{}  Sync playlists", icon::ARROWS_CLOCKWISE)).clicked() {
+                        if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync playlists")).clicked() {
                             cx.actions.push(Action::Cmd(Command::SyncSpotify));
                         }
                         if ui.button("Log out").clicked() {
@@ -182,7 +183,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 text_field(ui, "OAuth token (optional, for private likes/playlists)", &mut cfg.soundcloud.oauth_token, "2-123456-…", true);
                 hint(ui, "Find it in your browser on soundcloud.com: DevTools → Application → Cookies → oauth_token.");
                 ui.add_space(4.0);
-                if ui.button(format!("{}  Sync likes & playlists", icon::ARROWS_CLOCKWISE)).clicked() {
+                if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync likes & playlists")).clicked() {
                     cx.actions.push(Action::Cmd(Command::SyncSoundCloud));
                 }
             });
@@ -219,7 +220,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     text_field(ui, "Media user token", &mut cfg.apple_music.user_token, "media-user-token cookie from music.apple.com", true);
                     text_field(ui, "Developer token (optional)", &mut cfg.apple_music.developer_token, "fetched automatically when empty", true);
                     text_field(ui, "Storefront", &mut cfg.apple_music.storefront, "us", false);
-                    if ui.button(format!("{}  Import library & playlists", icon::ARROWS_CLOCKWISE)).clicked() {
+                    if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Import library & playlists")).clicked() {
                         cx.actions.push(Action::Cmd(Command::ImportAppleApi));
                     }
                 });
@@ -238,7 +239,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         if ui.button("Disconnect").clicked() {
                             cx.actions.push(Action::Cmd(Command::LastfmLogout));
                         }
-                    } else if ui.button(format!("{}  Connect account", icon::SIGN_IN)).clicked() {
+                    } else if ui.button(theme::ic(icon::SIGN_IN, "Connect account")).clicked() {
                         cx.actions.push(Action::Cmd(Command::LastfmLogin));
                     }
                 });

@@ -365,6 +365,7 @@ impl AppleMusicApi {
     }
 
     /// The catalog storefront (country code) this account uses, e.g. "us".
+    #[cfg(test)]
     pub fn storefront(&self) -> &str {
         &self.storefront
     }

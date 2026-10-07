@@ -42,8 +42,39 @@ pub fn bold() -> FontFamily {
     FontFamily::Name("bold".into())
 }
 
+/// Font family for Phosphor icons. Icons need their own family because text fonts such as
+/// Inter ship glyphs in the Private Use Area that would shadow the icon codepoints.
+pub fn icons() -> FontFamily {
+    FontFamily::Name("icons".into())
+}
+
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, icons())
+}
+
 pub fn fill_icon_font(size: f32) -> FontId {
-    FontId::new(size, FontFamily::Name("phosphor-fill".into()))
+    FontId::new(size, FontFamily::Name("icons-fill".into()))
+}
+
+/// "icon  label" text for buttons and menus, with the icon in the icon font.
+pub fn ic(glyph: &str, text: impl Into<String>) -> egui::WidgetText {
+    use egui::text::{LayoutJob, TextFormat};
+    let mut job = LayoutJob::default();
+    let icon_fmt = TextFormat {
+        font_id: icon_font(15.0),
+        color: Color32::PLACEHOLDER,
+        valign: egui::Align::Center,
+        ..Default::default()
+    };
+    let text_fmt = TextFormat {
+        font_id: font(14.0),
+        color: Color32::PLACEHOLDER,
+        valign: egui::Align::Center,
+        ..Default::default()
+    };
+    job.append(glyph, 0.0, icon_fmt);
+    job.append(&text.into(), 8.0, text_fmt);
+    job.into()
 }
 
 pub fn font(size: f32) -> FontId {
@@ -55,6 +86,17 @@ pub fn bold_font(size: f32) -> FontId {
 }
 
 /// Mixes `a` towards `b` by `t` (0..1).
+/// Soft drop shadow under artwork.
+pub fn art_shadow(ui: &egui::Ui, rect: egui::Rect, radius: u8) {
+    let shadow = Shadow {
+        offset: [0, 10],
+        blur: 36,
+        spread: 0,
+        color: Color32::from_black_alpha(130),
+    };
+    ui.painter().add(shadow.as_shape(rect, CornerRadius::same(radius)));
+}
+
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
@@ -108,13 +150,14 @@ pub fn apply_style(ctx: &egui::Context, accent: Color32) {
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x24, 0x24, 0x2c));
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
     v.widgets.noninteractive.corner_radius = r;
-    v.widgets.inactive.bg_fill = CARD;
-    v.widgets.inactive.weak_bg_fill = CARD;
+    // bg_fill: checkbox boxes, slider rails. weak_bg_fill: buttons, combo boxes.
+    v.widgets.inactive.bg_fill = Color32::from_rgb(0x2c, 0x2c, 0x38);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x25, 0x25, 0x30);
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.bg_fill = HOVER;
-    v.widgets.hovered.weak_bg_fill = HOVER;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x36, 0x36, 0x44);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x30, 0x30, 0x3c);
     v.widgets.hovered.bg_stroke = Stroke::NONE;
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     v.widgets.hovered.corner_radius = r;
@@ -167,13 +210,18 @@ const BOLD_FONTS: &[&str] = &[
 ];
 /// Fallbacks for Japanese/Chinese/Korean titles, smallest first.
 const CJK_FONTS: &[&str] = &[
+    "NotoSansCJK-Regular.ttc",
+    "NotoSansCJKjp-Regular.otf",
+    "NotoSansJP-Regular.otf",
+    "SourceHanSans-Regular.otc",
+    "SourceHanSans-Regular.ttc",
     "DroidSansFallbackFull.ttf",
     "DroidSansFallback.ttf",
     "wqy-microhei.ttc",
-    "NotoSansCJKjp-Regular.otf",
-    "NotoSansCJK-Regular.ttc",
-    "NotoSansJP-Regular.otf",
-    "SourceHanSans-Regular.ttc",
+    "wqy-zenhei.ttc",
+    "ipag.ttf",
+    "ipagp.ttf",
+    "fonts-japanese-gothic.ttf",
 ];
 
 fn font_dirs() -> Vec<PathBuf> {
@@ -197,8 +245,23 @@ fn find_font(names: &[&str]) -> Option<PathBuf> {
     None
 }
 
+/// Memory-maps a font file. Only the glyph pages actually used end up in RAM, which
+/// matters for multi-megabyte CJK fonts. Maps are kept for the process lifetime.
 fn load(path: &Path) -> Option<FontData> {
-    std::fs::read(path).ok().map(FontData::from_owned)
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static MAPS: Mutex<Option<HashMap<PathBuf, &'static [u8]>>> = Mutex::new(None);
+    let mut maps = MAPS.lock().ok()?;
+    let maps = maps.get_or_insert_with(HashMap::new);
+    if let Some(bytes) = maps.get(path) {
+        return Some(FontData::from_static(bytes));
+    }
+    let file = std::fs::File::open(path).ok()?;
+    // SAFETY: font files are not modified while we run; worst case a glyph renders wrong.
+    let map = unsafe { memmap2::Mmap::map(&file) }.ok()?;
+    let bytes: &'static [u8] = Box::leak(Box::new(map));
+    maps.insert(path.to_path_buf(), bytes);
+    Some(FontData::from_static(bytes))
 }
 
 /// Uses a system UI font when one is installed (no font is bundled, which keeps the
@@ -227,13 +290,21 @@ pub fn setup_fonts(ctx: &egui::Context, cjk: bool) {
     }
     fonts.families.insert(bold(), bold_stack);
 
-    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
-    // Filled icons (play button, liked heart) as their own family.
-    egui_phosphor::add_font_bytes_as_family(&mut fonts, "phosphor-fill", egui_phosphor::Variant::Fill.font_bytes());
-    // add_to_fonts registers icons for Proportional only; make them work in bold text too.
-    if let Some(stack) = fonts.families.get_mut(&bold()) {
-        stack.push("phosphor".into());
-    }
+    // Icons get dedicated families with Phosphor first (it maps a-z for ligatures, so it
+    // can't go first in the text families).
+    fonts
+        .font_data
+        .insert("phosphor".into(), egui_phosphor::Variant::Regular.font_data().into());
+    fonts
+        .font_data
+        .insert("phosphor-fill".into(), egui_phosphor::Variant::Fill.font_data().into());
+    let text_stack = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let mut icon_stack = vec!["phosphor".to_string()];
+    icon_stack.extend(text_stack.iter().cloned());
+    fonts.families.insert(icons(), icon_stack);
+    let mut fill_stack = vec!["phosphor-fill".to_string(), "phosphor".to_string()];
+    fill_stack.extend(text_stack.iter().cloned());
+    fonts.families.insert(FontFamily::Name("icons-fill".into()), fill_stack);
 
     if cjk {
         if let Some(data) = find_font(CJK_FONTS).and_then(|p| load(&p)) {

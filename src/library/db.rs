@@ -58,6 +58,7 @@ impl Db {
         Self::init(conn)
     }
 
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Db> {
         Self::init(Connection::open_in_memory()?)
     }
@@ -232,6 +233,7 @@ impl Db {
     }
 
     /// Track ids ordered by play count, most played first.
+    #[cfg(test)]
     pub fn top_plays(&self, limit: usize) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT track_id, COUNT(*) AS c FROM plays GROUP BY track_id ORDER BY c DESC LIMIT ?1",
@@ -253,11 +255,6 @@ impl Db {
             "INSERT INTO kv (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![key, value],
         )?;
-        Ok(())
-    }
-
-    pub fn delete_kv(&self, key: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM kv WHERE key = ?1", [key])?;
         Ok(())
     }
 

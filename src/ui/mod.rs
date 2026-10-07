@@ -89,6 +89,7 @@ pub struct App {
     dialog: Option<Dialog>,
     settings: settings::SettingsState,
     cjk_loaded: bool,
+    cjk_checked_version: u64,
     focus_search: bool,
     mem_checked: Instant,
     pub(crate) rss_mb: f32,
@@ -131,6 +132,7 @@ impl App {
             dialog: None,
             settings: settings::SettingsState::default(),
             cjk_loaded: false,
+            cjk_checked_version: u64::MAX,
             focus_search: false,
             mem_checked: Instant::now() - Duration::from_secs(60),
             rss_mb: 0.0,
@@ -204,11 +206,16 @@ impl App {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context, player: &PlayerView) {
-        if ctx.egui_wants_keyboard_input() {
+        if ctx.text_edit_focused() {
             if ctx.input(|i| i.key_pressed(Key::Escape)) {
                 ctx.memory_mut(|m| m.stop_text_input());
             }
             return;
+        }
+        // Clicked buttons/rows keep keyboard focus, which would make Space press them
+        // again. Media-player shortcuts win over widget keyboard navigation.
+        if let Some(id) = ctx.memory(|m| m.focused()) {
+            ctx.memory_mut(|m| m.surrender_focus(id));
         }
         let (space, left, right, up, down, ctrl, f, esc, l, q) = ctx.input(|i| {
             (
@@ -309,15 +316,16 @@ impl App {
     }
 
     fn maybe_load_cjk(&mut self, ctx: &egui::Context, lib: &Library) {
-        if self.cjk_loaded {
+        if self.cjk_loaded || self.cjk_checked_version == lib.version {
             return;
         }
+        self.cjk_checked_version = lib.version;
         // Only pay for a CJK font when the library actually needs one.
         let needed = lib
             .tracks
             .values()
             .take(20_000)
-            .any(|t| theme::has_cjk(&t.title) || theme::has_cjk(&t.artist))
+            .any(|t| theme::has_cjk(&t.title) || theme::has_cjk(&t.artist) || theme::has_cjk(&t.album))
             || lib.playlists.iter().any(|p| theme::has_cjk(&p.name));
         if needed {
             theme::setup_fonts(ctx, true);

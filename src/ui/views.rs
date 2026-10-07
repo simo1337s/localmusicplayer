@@ -254,7 +254,7 @@ fn onboarding(ui: &mut Ui, cx: &mut Cx) {
             (icon::APPLE_LOGO, source_color(Source::AppleMusic), "Import your Apple Music library (drop Library.xml here)"),
         ] {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(glyph).size(18.0).color(color));
+                ui.label(egui::RichText::new(glyph).family(theme::icons()).size(18.0).color(color));
                 ui.label(text);
             });
         }
@@ -332,11 +332,7 @@ fn list_header(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, h: &Header, draw_ar
     let art_size = if ui.available_width() > 700.0 { 200.0 } else { 140.0 };
     ui.horizontal(|ui| {
         let (art_rect, _) = ui.allocate_exact_size(vec2(art_size, art_size), Sense::hover());
-        ui.painter().rect_filled(
-            art_rect.translate(vec2(0.0, 6.0)).expand(2.0),
-            CornerRadius::same(10),
-            Color32::from_black_alpha(70),
-        );
+        theme::art_shadow(ui, art_rect, 10);
         draw_art(ui, art_rect, cx);
         ui.add_space(14.0);
         ui.vertical(|ui| {
@@ -380,7 +376,7 @@ fn list_header(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, h: &Header, draw_ar
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.add(
                 egui::TextEdit::singleline(st.filter_text)
-                    .hint_text(format!("{}  Filter", icon::MAGNIFYING_GLASS))
+                    .hint_text(theme::ic(icon::MAGNIFYING_GLASS, "Filter"))
                     .desired_width(200.0),
             );
         });
@@ -445,7 +441,7 @@ fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(st.filter_text)
-                        .hint_text(format!("{}  Filter", icon::MAGNIFYING_GLASS))
+                        .hint_text(theme::ic(icon::MAGNIFYING_GLASS, "Filter"))
                         .desired_width(200.0),
                 );
             });
@@ -530,26 +526,26 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         ui.horizontal(|ui| {
             match p.kind {
                 PlaylistKind::Spotify | PlaylistKind::SpotifyLiked => {
-                    if ui.button(format!("{}  Sync with Spotify", icon::ARROWS_CLOCKWISE)).clicked() {
+                    if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync with Spotify")).clicked() {
                         cx.actions.push(Action::Cmd(Command::SyncSpotify));
                     }
                 }
                 PlaylistKind::SoundCloud | PlaylistKind::SoundCloudLikes => {
-                    if ui.button(format!("{}  Sync with SoundCloud", icon::ARROWS_CLOCKWISE)).clicked() {
+                    if ui.button(theme::ic(icon::ARROWS_CLOCKWISE, "Sync with SoundCloud")).clicked() {
                         cx.actions.push(Action::Cmd(Command::SyncSoundCloud));
                     }
                 }
                 PlaylistKind::Custom | PlaylistKind::M3u => {
-                    if ui.button(format!("{}  Rename", icon::TEXT_ALIGN_LEFT)).clicked() {
+                    if ui.button(theme::ic(icon::TEXT_ALIGN_LEFT, "Rename")).clicked() {
                         cx.actions.push(Action::Rename(p.id.clone(), p.name.clone()));
                     }
-                    if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
+                    if ui.button(theme::ic(icon::TRASH, "Delete")).clicked() {
                         cx.actions.push(Action::Delete(p.id.clone()));
                     }
                 }
                 _ => {}
             }
-            if p.track_ids.iter().any(|id| id.starts_with("local:")) && ui.button(format!("{}  Export .m3u", icon::ARROW_SQUARE_OUT)).clicked() {
+            if p.track_ids.iter().any(|id| id.starts_with("local:")) && ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Export .m3u")).clicked() {
                 let dir = directories::UserDirs::new()
                     .and_then(|u| u.audio_dir().map(|d| d.to_path_buf()))
                     .unwrap_or_else(std::env::temp_dir);
@@ -560,8 +556,9 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
                 }));
             }
             if p.kind == PlaylistKind::AppleMusic {
+                ui.label(egui::RichText::new(icon::APPLE_LOGO).family(theme::icons()).color(TEXT_FAINT));
                 ui.label(
-                    egui::RichText::new(format!("{}  Songs play from your local files, Spotify or SoundCloud", icon::APPLE_LOGO))
+                    egui::RichText::new("Songs play from your local files, Spotify or SoundCloud")
                         .small()
                         .color(TEXT_FAINT),
                 );
@@ -601,7 +598,7 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             back_button(ui, cx, st);
             let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width().min(520.0), 46.0), Sense::hover());
             ui.painter().rect_filled(rect, CornerRadius::same(23), CARD);
-            ui.painter().text(rect.left_center() + vec2(22.0, 0.0), Align2::CENTER_CENTER, icon::MAGNIFYING_GLASS, egui::FontId::proportional(18.0), TEXT_DIM);
+            ui.painter().text(rect.left_center() + vec2(22.0, 0.0), Align2::CENTER_CENTER, icon::MAGNIFYING_GLASS, theme::icon_font(18.0), TEXT_DIM);
             let edit_rect = Rect::from_min_max(rect.min + vec2(42.0, 11.0), rect.max - vec2(16.0, 9.0));
             let resp = ui.put(
                 edit_rect,
@@ -644,7 +641,7 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         }
         let spotify_on = matches!(cx.feed.spotify, AccountStatus::Connected(_) | AccountStatus::Working(_));
         if spotify_on {
-            widgets::heading(ui, &format!("{}  Spotify", icon::SPOTIFY_LOGO));
+            widgets::heading_icon(ui, icon::SPOTIFY_LOGO, source_color(Source::Spotify), "Spotify");
             if spotify.is_empty() {
                 remote_status(ui, pending);
             } else {
@@ -655,7 +652,7 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             ui.add_space(16.0);
         }
         if !soundcloud.is_empty() || pending {
-            widgets::heading(ui, &format!("{}  SoundCloud", icon::SOUNDCLOUD_LOGO));
+            widgets::heading_icon(ui, icon::SOUNDCLOUD_LOGO, source_color(Source::SoundCloud), "SoundCloud");
             if soundcloud.is_empty() {
                 remote_status(ui, pending);
             } else {
@@ -703,7 +700,7 @@ fn search_tips(ui: &mut Ui, cx: &mut Cx) {
             rect.right_bottom() - vec2(16.0, 12.0),
             Align2::RIGHT_BOTTOM,
             theme::source_icon(s),
-            egui::FontId::proportional(40.0),
+            theme::icon_font(40.0),
             theme::with_alpha(Color32::WHITE, 170),
         );
     });
@@ -738,7 +735,7 @@ fn now_playing(ui: &mut Ui, cx: &mut Cx) {
                 ui.vertical(|ui| {
                     ui.set_width(art_size);
                     let (r, _) = ui.allocate_exact_size(vec2(art_size, art_size), Sense::hover());
-                    ui.painter().rect_filled(r.translate(vec2(0.0, 12.0)).expand(4.0), CornerRadius::same(14), Color32::from_black_alpha(90));
+                    theme::art_shadow(ui, r, 12);
                     widgets::cover(ui, cx.art, art_src.as_deref(), r, 12, widgets::track_fallback(&t));
                     ui.add_space(18.0);
                     track_titles(ui, cx, &t, art_size);

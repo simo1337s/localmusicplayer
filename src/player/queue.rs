@@ -193,14 +193,6 @@ impl Queue {
         self.current.is_none()
     }
 
-    /// Replaces a track (e.g. after resolving an Apple Music song) everywhere in the queue.
-    pub fn replace_track(&mut self, old_id: &str, new: &Track) {
-        for t in self.tracks.iter_mut().chain(self.up_next.iter_mut()).chain(self.current.iter_mut()) {
-            if t.id == old_id {
-                *t = new.clone();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -268,8 +260,10 @@ mod tests {
 
     #[test]
     fn shuffle_keeps_current_first_and_covers_all() {
-        let mut q = Queue::default();
-        q.shuffle = true;
+        let mut q = Queue {
+            shuffle: true,
+            ..Default::default()
+        };
         q.set_context(tracks(20), 7, String::new());
         assert_eq!(id(q.current().cloned()), "t7");
         let mut seen: Vec<String> = q.upcoming(100).into_iter().map(|t| t.id).collect();

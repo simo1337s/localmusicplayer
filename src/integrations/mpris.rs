@@ -20,7 +20,10 @@ impl Mpris {
             dbus_name: "medley",
             hwnd: None,
         };
-        let controls = MediaControls::new(config).ok().and_then(|mut c| {
+        let controls = session_bus_available()
+            .then(|| MediaControls::new(config).ok())
+            .flatten()
+            .and_then(|mut c| {
             let result = c.attach(move |event: MediaControlEvent| {
                 let cmd = match event {
                     MediaControlEvent::Play => Command::Resume,
@@ -99,6 +102,20 @@ impl Mpris {
             let _ = c.set_volume(volume as f64 / 100.0);
         }
     }
+}
+
+/// souvlaki panics on its D-Bus thread when there is no session bus, so check first.
+fn session_bus_available() -> bool {
+    if let Ok(addr) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        // unix:path=/run/user/1000/bus[,guid=...]
+        return match addr.strip_prefix("unix:path=") {
+            Some(rest) => std::path::Path::new(rest.split(',').next().unwrap_or(rest)).exists(),
+            None => !addr.is_empty(),
+        };
+    }
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|d| std::path::Path::new(&d).join("bus").exists())
+        .unwrap_or(false)
 }
 
 fn is_image(path: &str) -> bool {

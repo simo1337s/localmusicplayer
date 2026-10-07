@@ -279,12 +279,6 @@ impl Lastfm {
         self.session_key.is_some()
     }
 
-    /// Replaces the session key (empty = log out).
-    pub fn set_session_key(&mut self, session_key: &str) {
-        let key = session_key.trim();
-        self.session_key = (!key.is_empty()).then(|| key.to_string());
-    }
-
     /// Adds `method`, `api_key`, optionally `sk`, then `api_sig` and `format=json`.
     fn signed(
         &self,
@@ -354,16 +348,6 @@ impl Lastfm {
         let v = self
             .get("auth.getSession", vec![("token".into(), token.into())])
             .await?;
-        session_from(&v)
-    }
-
-    /// `auth.getMobileSession` (username/password login) -> `(session_key, username)`.
-    pub async fn mobile_session(&self, username: &str, password: &str) -> anyhow::Result<(String, String)> {
-        let params = vec![
-            ("username".into(), username.trim().to_string()),
-            ("password".into(), password.to_string()),
-        ];
-        let v = self.post("auth.getMobileSession", params, false).await?;
         session_from(&v)
     }
 
@@ -567,6 +551,7 @@ impl ScrobbleTracker {
     }
 
     /// Time actually spent playing the current track.
+    #[cfg(test)]
     pub fn listened(&self) -> Duration {
         self.current.as_ref().map(|t| t.listened).unwrap_or_default()
     }

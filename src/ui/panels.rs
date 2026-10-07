@@ -1,6 +1,6 @@
 //! Window chrome: sidebar, player bar and the right panel (lyrics / queue).
 
-use egui::{vec2, Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Layout, Margin, Pos2, Rect, Sense, Ui, UiBuilder};
+use egui::{vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Id, Layout, Margin, Pos2, Rect, Sense, Ui, UiBuilder};
 use egui_phosphor::regular as icon;
 
 use super::theme::{self, *};
@@ -30,7 +30,7 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                 // Logo.
                 ui.horizontal(|ui| {
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new(icon::WAVEFORM).size(24.0).color(cx.accent));
+                    ui.label(egui::RichText::new(icon::WAVEFORM).family(theme::icons()).size(24.0).color(cx.accent));
                     ui.label(egui::RichText::new("Medley").font(theme::bold_font(21.0)));
                 });
                 ui.add_space(8.0);
@@ -45,7 +45,7 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(ui.available_height() - 8.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(icon::BOOKS).size(18.0).color(TEXT_DIM));
+                    ui.label(egui::RichText::new(icon::BOOKS).family(theme::icons()).size(18.0).color(TEXT_DIM));
                     ui.label(egui::RichText::new("Your Library").font(theme::bold_font(15.0)).color(TEXT_DIM));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if widgets::icon_button(ui, icon::PLUS, 16.0, TEXT_DIM, "New playlist").clicked() {
@@ -85,7 +85,7 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                         let is_playing = playing_context == p.name;
                         text_trunc(ui, Pos2::new(x, rect.top() + 10.0), &p.name, theme::font(14.0), if is_playing { cx.accent } else { TEXT }, w);
                         let src = match p.kind.source() {
-                            Some(s) => format!("{} · {}", theme::source_icon(s), s.label()),
+                            Some(s) => s.label().to_string(),
                             None => "Playlist".into(),
                         };
                         text_trunc(
@@ -102,7 +102,7 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                         }
                         resp.context_menu(|ui| {
                             ui.set_min_width(180.0);
-                            if ui.button(format!("{}  Play", icon::PLAY)).clicked() {
+                            if ui.button(theme::ic(icon::PLAY, "Play")).clicked() {
                                 cx.actions.push(Action::Cmd(Command::Play {
                                     tracks: cx.lib.tracks_for(&p.track_ids),
                                     start: 0,
@@ -110,23 +110,23 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
                                 }));
                                 ui.close();
                             }
-                            if ui.button(format!("{}  Add to queue", icon::LIST_PLUS)).clicked() {
+                            if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
                                 cx.actions.push(Action::Cmd(Command::Enqueue(cx.lib.tracks_for(&p.track_ids))));
                                 ui.close();
                             }
                             if p.kind.is_editable() && p.kind != PlaylistKind::Liked {
                                 ui.separator();
-                                if ui.button(format!("{}  Rename", icon::TEXT_ALIGN_LEFT)).clicked() {
+                                if ui.button(theme::ic(icon::TEXT_ALIGN_LEFT, "Rename")).clicked() {
                                     cx.actions.push(Action::Rename(p.id.clone(), p.name.clone()));
                                     ui.close();
                                 }
-                                if ui.button(format!("{}  Delete", icon::TRASH)).clicked() {
+                                if ui.button(theme::ic(icon::TRASH, "Delete")).clicked() {
                                     cx.actions.push(Action::Delete(p.id.clone()));
                                     ui.close();
                                 }
                             } else if p.kind != PlaylistKind::Liked {
                                 ui.separator();
-                                if ui.button(format!("{}  Remove from Medley", icon::TRASH)).clicked() {
+                                if ui.button(theme::ic(icon::TRASH, "Remove from Medley")).clicked() {
                                     cx.actions.push(Action::Delete(p.id.clone()));
                                     ui.close();
                                 }
@@ -154,8 +154,7 @@ fn nav_item(ui: &mut Ui, cx: &mut Cx, glyph: &str, label: &str, target: View, cu
     if active {
         ui.painter().rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 10));
     }
-    let font = if active { theme::fill_icon_font(20.0) } else { FontId::proportional(20.0) };
-    let glyph = if active { fill_variant(glyph) } else { glyph };
+    let font = if active { theme::fill_icon_font(20.0) } else { theme::icon_font(20.0) };
     ui.painter().text(rect.left_center() + vec2(14.0, 0.0), Align2::CENTER_CENTER, glyph, font, color);
     ui.painter().text(
         rect.left_center() + vec2(36.0, 0.0),
@@ -167,11 +166,6 @@ fn nav_item(ui: &mut Ui, cx: &mut Cx, glyph: &str, label: &str, target: View, cu
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         cx.actions.push(Action::Go(target));
     }
-}
-
-/// The filled twin of a regular Phosphor glyph (same codepoint, different font).
-fn fill_variant(glyph: &str) -> &str {
-    glyph
 }
 
 // ------------------------------------------------------------------ player bar
@@ -217,12 +211,14 @@ fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
     if title_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         cx.actions.push(Action::Go(View::NowPlaying));
     }
-    let via = match &cx.player.via {
-        Some(v) => format!("{} via {}", theme::source_icon(v.source), v.source.label()),
-        None => format!("{} {}", theme::source_icon(t.source), t.source.label()),
+    let (src, prefix) = match &cx.player.via {
+        Some(v) => (v.source, "via "),
+        None => (t.source, ""),
     };
-    let src_color = cx.player.via.as_ref().map(|v| v.source).unwrap_or(t.source);
-    text_trunc(ui, Pos2::new(x, rect.center().y + 16.0), &via, theme::font(11.5), theme::with_alpha(source_color(src_color), 200), w);
+    let src_color = theme::with_alpha(source_color(src), 210);
+    let y = rect.center().y + 16.0;
+    ui.painter().text(Pos2::new(x, y), Align2::LEFT_TOP, theme::source_icon(src), theme::icon_font(12.5), src_color);
+    text_trunc(ui, Pos2::new(x + 17.0, y), &format!("{prefix}{}", src.label()), theme::font(11.5), src_color, w - 17.0);
 
     // Like button.
     let liked = cx.lib.is_liked(&t.id);
@@ -231,7 +227,7 @@ fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
     let (glyph, font, color) = if liked {
         (egui_phosphor::fill::HEART, theme::fill_icon_font(18.0), cx.accent)
     } else {
-        (icon::HEART, FontId::proportional(18.0), if resp.hovered() { TEXT } else { TEXT_DIM })
+        (icon::HEART, theme::icon_font(18.0), if resp.hovered() { TEXT } else { TEXT_DIM })
     };
     ui.painter().text(heart.center(), Align2::CENTER_CENTER, glyph, font, color);
     if resp.on_hover_text(if liked { "Remove from Liked Songs" } else { "Save to Liked Songs" }).clicked() {
@@ -497,7 +493,7 @@ fn provider(ui: &mut Ui, name: &str) {
 pub fn empty_state(ui: &mut Ui, glyph: &str, text: &str) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(glyph).size(42.0).color(TEXT_FAINT));
+        ui.label(egui::RichText::new(glyph).family(theme::icons()).size(42.0).color(TEXT_FAINT));
         ui.add_space(8.0);
         ui.label(egui::RichText::new(text).color(TEXT_DIM));
     });
@@ -554,7 +550,7 @@ fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<us
         let x_rect = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
         let xr = ui.interact(x_rect, Id::new(("q-remove", i)), Sense::click());
         if resp.hovered() || xr.hovered() {
-            ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, icon::X, FontId::proportional(14.0), if xr.hovered() { TEXT } else { TEXT_DIM });
+            ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, icon::X, theme::icon_font(14.0), if xr.hovered() { TEXT } else { TEXT_DIM });
         }
         if xr.clicked() {
             cx.actions.push(Action::Cmd(Command::RemoveUpcoming(i)));

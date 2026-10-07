@@ -54,7 +54,12 @@ impl Mpv {
         let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        let socket = runtime_dir.join(format!("medley-mpv-{}.sock", std::process::id()));
+        let name = format!("medley-mpv-{}.sock", std::process::id());
+        let mut socket = runtime_dir.join(&name);
+        // Unix socket paths are limited to ~108 bytes.
+        if socket.as_os_str().len() > 100 {
+            socket = PathBuf::from("/tmp").join(&name);
+        }
         let _ = std::fs::remove_file(&socket);
 
         let mut cmd = Command::new(&opts.binary);
@@ -80,6 +85,14 @@ impl Mpv {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // Make mpv exit with us even if we're killed without a chance to clean up.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
         if !opts.audio_device.is_empty() {
             cmd.arg(format!("--audio-device={}", opts.audio_device));
         }

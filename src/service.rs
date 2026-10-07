@@ -343,6 +343,12 @@ type Receivers = (
     UnboundedReceiver<SpotifyEvent>,
     UnboundedReceiver<Internal>,
 );
+type Started = (
+    Service,
+    UnboundedReceiver<MpvEvent>,
+    UnboundedReceiver<SpotifyEvent>,
+    UnboundedReceiver<Internal>,
+);
 
 impl Service {
     fn new(
@@ -350,7 +356,7 @@ impl Service {
         paths: Paths,
         cfg: Config,
         cmd_tx: UnboundedSender<Command>,
-    ) -> Result<(Service, UnboundedReceiver<MpvEvent>, UnboundedReceiver<SpotifyEvent>, UnboundedReceiver<Internal>)> {
+    ) -> Result<Started> {
         let db = Db::open(&paths.database())?;
         let lib = Library::load(&db)?;
         *shared.library.write().unwrap() = lib;

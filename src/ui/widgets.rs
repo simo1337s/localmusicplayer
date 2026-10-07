@@ -3,7 +3,7 @@
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
     vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Mesh, Pos2, Rect, Response, Sense, Shape,
-    Stroke, StrokeKind, Ui, Vec2,
+    Stroke, Ui,
 };
 use egui_phosphor::regular as icon;
 
@@ -49,7 +49,7 @@ pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) 
         rect.center(),
         Align2::CENTER_CENTER,
         glyph,
-        FontId::proportional(rect.height() * 0.38),
+        theme::icon_font(rect.height() * 0.38),
         theme::with_alpha(Color32::WHITE, 200),
     );
 }
@@ -110,7 +110,7 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip:
         ui.painter().rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 14));
     }
     let c = if hovered { theme::mix(color, Color32::WHITE, 0.35) } else { color };
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(size), c);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, theme::icon_font(size), c);
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if tooltip.is_empty() {
         resp
@@ -172,6 +172,16 @@ pub fn bar(ui: &mut Ui, id: Id, width: f32, fraction: f32, accent: Color32) -> (
         painter.circle_filled(Pos2::new(filled.right(), track.center().y), 6.5, Color32::WHITE);
     }
     (resp.on_hover_cursor(CursorIcon::PointingHand), changed)
+}
+
+/// Section heading with a leading icon.
+pub fn heading_icon(ui: &mut Ui, glyph: &str, color: Color32, text: &str) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(glyph).family(theme::icons()).size(20.0).color(color));
+        ui.label(egui::RichText::new(text).font(theme::bold_font(20.0)).color(TEXT));
+    });
+    ui.add_space(4.0);
 }
 
 /// Section heading.
@@ -279,7 +289,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         if show_album {
             p.text(hrect.left_center() + vec2(album_x, 0.0), Align2::LEFT_CENTER, "ALBUM", f.clone(), TEXT_FAINT);
         }
-        p.text(hrect.right_center() - vec2(20.0, 0.0), Align2::RIGHT_CENTER, icon::CLOCK, f, TEXT_FAINT);
+        p.text(hrect.right_center() - vec2(20.0, 0.0), Align2::RIGHT_CENTER, icon::CLOCK, theme::icon_font(13.0), TEXT_FAINT);
         p.line_segment(
             [hrect.left_bottom() + vec2(0.0, -1.0), hrect.right_bottom() + vec2(0.0, -1.0)],
             Stroke::new(1.0, theme::with_alpha(Color32::WHITE, 18)),
@@ -352,7 +362,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             src_pos,
             Align2::CENTER_CENTER,
             theme::source_icon(t.source),
-            FontId::proportional(15.0),
+            theme::icon_font(15.0),
             theme::with_alpha(source_color(t.source), if hovered { 255 } else { 170 }),
         );
         let liked = cx.lib.is_liked(&t.id);
@@ -362,7 +372,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             let (glyph, f, c) = if liked {
                 (egui_phosphor::fill::HEART, theme::fill_icon_font(16.0), cx.accent)
             } else {
-                (icon::HEART, FontId::proportional(16.0), if heart.hovered() { TEXT } else { TEXT_DIM })
+                (icon::HEART, theme::icon_font(16.0), if heart.hovered() { TEXT } else { TEXT_DIM })
             };
             ui.painter().text(heart_rect.center(), Align2::CENTER_CENTER, glyph, f, c);
         }
@@ -427,23 +437,23 @@ fn draw_eq(ui: &Ui, center: Pos2, color: Color32, animate: bool) {
 /// Right-click menu for a track. `in_playlist` = (playlist being viewed, row index).
 pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Option<&Playlist>, usize)>) {
     ui.set_min_width(220.0);
-    if ui.button(format!("{}  Play next", icon::QUEUE)).clicked() {
+    if ui.button(theme::ic(icon::QUEUE, "Play next")).clicked() {
         cx.actions.push(Action::Cmd(Command::PlayNext(vec![t.clone()])));
         ui.close();
     }
-    if ui.button(format!("{}  Add to queue", icon::LIST_PLUS)).clicked() {
+    if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
         cx.actions.push(Action::Cmd(Command::Enqueue(vec![t.clone()])));
         ui.close();
     }
     let liked = cx.lib.is_liked(&t.id);
     let like_label = if liked { "Remove from Liked Songs" } else { "Save to Liked Songs" };
-    if ui.button(format!("{}  {like_label}", icon::HEART)).clicked() {
+    if ui.button(theme::ic(icon::HEART, like_label)).clicked() {
         cx.actions.push(Action::Cmd(Command::ToggleLike(t.clone())));
         ui.close();
     }
-    ui.menu_button(format!("{}  Add to playlist", icon::PLUS), |ui| {
+    ui.menu_button(theme::ic(icon::PLUS, "Add to playlist"), |ui| {
         ui.set_min_width(200.0);
-        if ui.button(format!("{}  New playlist…", icon::PLUS)).clicked() {
+        if ui.button(theme::ic(icon::PLUS, "New playlist…")).clicked() {
             cx.actions.push(Action::NewPlaylist(vec![t.clone()]));
             ui.close();
         }
@@ -459,7 +469,7 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
         }
     });
     if let Some((Some(p), idx)) = in_playlist {
-        if p.kind.is_editable() && p.kind != PlaylistKind::Liked && ui.button(format!("{}  Remove from this playlist", icon::TRASH)).clicked() {
+        if p.kind.is_editable() && p.kind != PlaylistKind::Liked && ui.button(theme::ic(icon::TRASH, "Remove from this playlist")).clicked() {
             cx.actions.push(Action::Cmd(Command::RemoveFromPlaylist {
                 playlist_id: p.id.clone(),
                 index: idx,
@@ -471,20 +481,20 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
     match t.source {
         Source::Spotify => {
             if let Some(id) = t.id.strip_prefix("spotify:track:") {
-                if ui.button(format!("{}  Open in Spotify", icon::ARROW_SQUARE_OUT)).clicked() {
+                if ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Open in Spotify")).clicked() {
                     cx.actions.push(Action::OpenUrl(format!("https://open.spotify.com/track/{id}")));
                     ui.close();
                 }
             }
         }
         Source::SoundCloud => {
-            if t.uri.starts_with("http") && ui.button(format!("{}  Open on SoundCloud", icon::ARROW_SQUARE_OUT)).clicked() {
+            if t.uri.starts_with("http") && ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Open on SoundCloud")).clicked() {
                 cx.actions.push(Action::OpenUrl(t.uri.clone()));
                 ui.close();
             }
         }
         Source::Local => {
-            if ui.button(format!("{}  Show in folder", icon::FOLDER_OPEN)).clicked() {
+            if ui.button(theme::ic(icon::FOLDER_OPEN, "Show in folder")).clicked() {
                 if let Some(dir) = std::path::Path::new(&t.uri).parent() {
                     cx.actions.push(Action::OpenUrl(dir.to_string_lossy().to_string()));
                 }
@@ -499,8 +509,11 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
 
 /// Small source badge "● Spotify".
 pub fn source_badge(ui: &mut Ui, source: Source) {
-    let text = format!("{} {}", theme::source_icon(source), source.label());
-    ui.label(egui::RichText::new(text).size(12.0).color(source_color(source)));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new(theme::source_icon(source)).family(theme::icons()).size(13.0).color(source_color(source)));
+        ui.label(egui::RichText::new(source.label()).size(12.0).color(source_color(source)));
+    });
 }
 
 pub fn card_frame() -> egui::Frame {
@@ -510,10 +523,3 @@ pub fn card_frame() -> egui::Frame {
         .inner_margin(egui::Margin::same(16))
 }
 
-pub fn stroke_rect(ui: &Ui, rect: Rect, color: Color32) {
-    ui.painter().rect_stroke(rect, CornerRadius::same(8), Stroke::new(1.0, color), StrokeKind::Inside);
-}
-
-pub fn size2(w: f32, h: f32) -> Vec2 {
-    vec2(w, h)
-}
