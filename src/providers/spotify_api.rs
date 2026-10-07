@@ -272,7 +272,6 @@ impl SpotifyApi {
         Ok(out)
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// Tracks and artists in one request (keeps rate-limit use low). First page only.
     pub async fn search_with_artists(
         &self,
@@ -704,7 +703,6 @@ pub fn parse_user(v: &Value) -> Option<SpotifyUser> {
     })
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// Maps a Web API artist object to a search hit.
 pub fn parse_artist_hit(v: &Value) -> Option<ArtistHit> {
     let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;

@@ -57,7 +57,6 @@ pub struct ScUser {
     pub followers: Option<u64>,
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// What a soundcloud.com URL points at.
 #[derive(Debug, Clone)]
 pub enum ScResolved {
@@ -241,29 +240,23 @@ impl SoundCloud {
         Ok(out)
     }
 
-    /// Track search.
+    /// Track search. One request (no paging) so results show up fast.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>> {
         let query = query.trim();
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let page_size = limit.min(200).to_string();
-        let items = self
-            .paginate(
-                &api("/search/tracks"),
-                &[
-                    ("q", query),
-                    ("limit", page_size.as_str()),
-                    ("linked_partitioning", "1"),
-                ],
-                limit,
-            )
+        let v = self
+            .get_json(&api("/search/tracks"), &[("q", query), ("limit", page_size.as_str())])
             .await
             .with_context(|| format!("SoundCloud search for \"{query}\" failed"))?;
-        Ok(items.iter().filter_map(parse_track).collect())
+        Ok(v.get("collection")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(parse_track).take(limit).collect())
+            .unwrap_or_default())
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// Artists / users matching `query`.
     pub async fn search_users(&self, query: &str, limit: usize) -> Result<Vec<ArtistHit>> {
         let query = query.trim();
@@ -281,7 +274,6 @@ impl SoundCloud {
             .unwrap_or_default())
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// One user by numeric id.
     pub async fn user(&self, id: u64) -> Result<ScUser> {
         let v = self
@@ -291,7 +283,6 @@ impl SoundCloud {
         parse_user(&v).context("unexpected SoundCloud user response")
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// A user's popular tracks first, then the rest of their uploads (newest first).
     pub async fn user_tracks(&self, id: u64) -> Result<Vec<Track>> {
         let top_url = api(&format!("/users/{id}/toptracks"));
@@ -320,7 +311,6 @@ impl SoundCloud {
             .collect())
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// Resolves any soundcloud.com URL (profile, track or playlist/album).
     pub async fn resolve_url(&self, url: &str) -> Result<ScResolved> {
         let v = self
@@ -338,7 +328,6 @@ impl SoundCloud {
         }
     }
 
-    #[allow(dead_code)] // used by the artist pages / artist search that land in the next update
     /// Seeds the client_id cache (e.g. from disk) so the first request doesn't need to scrape.
     /// A seeded id that gets rejected is re-scraped right away.
     pub async fn seed_client_id(&self, id: &str) {
@@ -760,9 +749,7 @@ fn parse_user(v: &Value) -> Option<ScUser> {
     })
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
-/// Builds the playlist from its JSON and the (ordered) track ids, looking the tracks up in
-/// `tracks`. Ids that couldn't be loaded are dropped.
+/// A user as an artist search result.
 pub fn artist_hit(u: &ScUser) -> ArtistHit {
     ArtistHit {
         key: format!("soundcloud:user:{}", u.id),
@@ -776,6 +763,8 @@ pub fn artist_hit(u: &ScUser) -> ArtistHit {
     }
 }
 
+/// Builds the playlist from its JSON and the (ordered) track ids, looking the tracks up in
+/// `tracks`. Ids that couldn't be loaded are dropped.
 fn assemble_playlist(pl: &Value, order: &[u64], tracks: &HashMap<u64, Track>) -> ImportedPlaylist {
     let tracks: Vec<Track> = order.iter().filter_map(|id| tracks.get(id).cloned()).collect();
     let art = non_empty(pl.get("artwork_url"))

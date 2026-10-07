@@ -15,15 +15,16 @@ use crate::integrations::lastfm::{Lastfm, ScrobbleTracker};
 use crate::integrations::lyrics::LyricsFetcher;
 use crate::integrations::mpris::Mpris;
 use crate::library::{self, liked_playlist, Db, Library, LIKED_ID};
+use crate::links::{self, LinkKind, Target};
 use crate::model::{
-    normalize_artist, normalize_title, now_unix, AudioQuality, ImportedPlaylist, Lyrics, Playlist, PlaylistKind,
-    RepeatMode, Source, Track,
+    normalize_artist, normalize_title, now_unix, ArtistHit, AudioQuality, ImportedPlaylist, Lyrics, Playlist,
+    PlaylistKind, RepeatMode, Source, Track,
 };
 use crate::player::mpv::{Mpv, MpvEvent, MpvOptions};
 use crate::player::queue::Queue;
 use crate::player::spotify::{self, SpotifyAuth, SpotifyEngine, SpotifyEvent};
 use crate::providers::apple_music::{self, AppleMusicApi};
-use crate::providers::soundcloud::SoundCloud;
+use crate::providers::soundcloud::{self, ScResolved, ScUser, SoundCloud};
 use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
 
 /// Requests from the UI (and MPRIS).
@@ -86,6 +87,8 @@ pub enum Command {
     LastfmLogin,
     LastfmLogout,
     Search(String),
+    /// Load an artist / album / playlist / song page: a page key or a pasted link.
+    OpenPage(String),
     UpdateConfig(Box<Config>),
     Raise,
     Quit,
@@ -183,8 +186,37 @@ pub struct SearchState {
     pub query: String,
     pub spotify: Vec<Track>,
     pub soundcloud: Vec<Track>,
-    pub pending: u8,
+    /// Spotify artists and SoundCloud profiles, best matches first.
+    pub artists: Vec<ArtistHit>,
+    pub spotify_pending: bool,
+    pub soundcloud_pending: bool,
     pub errors: Vec<String>,
+}
+
+impl SearchState {
+    pub fn pending(&self) -> bool {
+        self.spotify_pending || self.soundcloud_pending
+    }
+}
+
+/// An artist / album / playlist / song page from one of the services.
+#[derive(Debug, Clone, Default)]
+pub struct PageState {
+    /// The page key or link it was opened with.
+    pub key: String,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// "Artist", "Album", "Playlist" or "Song".
+    pub kind: String,
+    pub source: Option<Source>,
+    pub title: String,
+    pub subtitle: String,
+    pub image: Option<String>,
+    /// Artist pictures are drawn round.
+    pub round: bool,
+    pub tracks: Vec<Track>,
+    /// The page on the service's website.
+    pub external_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -199,6 +231,7 @@ pub struct LyricsState {
 pub struct Feed {
     pub toasts: Vec<Toast>,
     pub search: SearchState,
+    pub page: PageState,
     pub lyrics: LyricsState,
     pub spotify: AccountStatus,
     /// True while a Spotify login is stored, whatever the current status message says.
@@ -284,10 +317,22 @@ enum Internal {
         track_id: String,
         lyrics: Option<Lyrics>,
     },
-    Search {
+    SearchResults {
         query: String,
-        spotify: Result<Vec<Track>>,
-        soundcloud: Result<Vec<Track>>,
+        source: Source,
+        tracks: Result<Vec<Track>>,
+        artists: Vec<ArtistHit>,
+    },
+    /// The client_id SoundCloud accepted, saved so the next start needn't scrape one.
+    SoundCloudClientId(String),
+    PageLoaded {
+        key: String,
+        result: Result<PageState>,
+    },
+    /// A short link was expanded to `url`.
+    ShortLink {
+        key: String,
+        result: Result<String>,
     },
     LastfmSession(Result<(String, String)>),
     Quality {
@@ -369,6 +414,12 @@ pub struct Service {
     spotify_syncing: bool,
     spotify_tx: UnboundedSender<SpotifyEvent>,
     spotify_api: Arc<SpotifyApi>,
+    /// A Spotify page waiting for the session to connect.
+    spotify_pending_page: Option<String>,
+    /// Recently loaded pages, so going back doesn't reload them.
+    page_cache: Vec<PageState>,
+    /// Apple Music developer token (from the settings, or scraped once).
+    apple_dev_token: Arc<tokio::sync::Mutex<Option<String>>>,
 
     soundcloud: Arc<SoundCloud>,
     lyrics: Arc<LyricsFetcher>,
@@ -478,6 +529,9 @@ impl Service {
             spotify_syncing: false,
             spotify_tx,
             spotify_api: Arc::new(SpotifyApi::new(http)),
+            spotify_pending_page: None,
+            page_cache: Vec::new(),
+            apple_dev_token: Arc::new(tokio::sync::Mutex::new(None)),
             soundcloud,
             lyrics,
             lastfm,
@@ -527,6 +581,9 @@ impl Service {
         if self.cfg.spotify.enabled && self.spotify_auth.has_login() {
             self.connect_spotify();
             self.start_spotify_sync();
+        }
+        if self.cfg.soundcloud.enabled {
+            self.warm_up_soundcloud();
         }
         if self.cfg.soundcloud.enabled && self.soundcloud_configured() {
             let last: i64 = self
@@ -797,6 +854,7 @@ impl Service {
                 self.publish_accounts();
             }
             Command::Search(q) => self.search(q),
+            Command::OpenPage(key) => self.open_page(key),
             Command::UpdateConfig(cfg) => self.update_config(*cfg).await,
             Command::Raise => {
                 self.shared.feed.write().unwrap().raise = true;
@@ -1763,16 +1821,9 @@ impl Service {
             return;
         }
         // The library is imported through the playback session, so connect first.
-        let Some(session) = self.spotify.as_ref().and_then(|e| e.session()) else {
+        let Some(session) = self.spotify_session() else {
             self.spotify_sync_pending = true;
             self.set_account(|f| &mut f.spotify, AccountStatus::Working("Connecting…".into()));
-            if self.spotify.is_some() {
-                // Session dropped: reconnect from scratch.
-                if let Some(sp) = self.spotify.take() {
-                    sp.shutdown();
-                }
-            }
-            self.connect_spotify();
             return;
         };
         self.spotify_syncing = true;
@@ -2043,43 +2094,259 @@ impl Service {
 
     // ---------------------------------------------------------------- search, last.fm
 
+    /// Searches Spotify and SoundCloud at the same time; each shows up as soon as it answers.
     fn search(&mut self, query: String) {
         let q = query.trim().to_string();
-        {
-            let mut feed = self.shared.feed.write().unwrap();
-            feed.search = SearchState {
-                query: q.clone(),
-                pending: 1,
-                ..Default::default()
-            };
+        let spotify = (!q.is_empty())
+            .then(|| self.web_auth().map(|auth| (auth, self.spotify_api.clone())))
+            .flatten();
+        let sc = (!q.is_empty() && self.cfg.soundcloud.enabled).then(|| self.soundcloud.clone());
+        self.shared.feed.write().unwrap().search = SearchState {
+            query: q.clone(),
+            spotify_pending: spotify.is_some(),
+            soundcloud_pending: sc.is_some(),
+            ..Default::default()
+        };
+        self.shared.repaint();
+        if let Some((auth, api)) = spotify {
+            let tx = self.internal_tx.clone();
+            let q = q.clone();
+            tokio::spawn(async move {
+                let r = async { api.search_with_artists(&auth.token().await?, &q, 20).await }.await;
+                let (tracks, artists) = match r {
+                    Ok((tracks, artists)) => (Ok(tracks), artists),
+                    Err(e) => (Err(e), Vec::new()),
+                };
+                let _ = tx.send(Internal::SearchResults {
+                    query: q,
+                    source: Source::Spotify,
+                    tracks,
+                    artists,
+                });
+            });
         }
-        if q.is_empty() {
-            self.shared.feed.write().unwrap().search.pending = 0;
-            return;
+        if let Some(sc) = sc {
+            let tx = self.internal_tx.clone();
+            tokio::spawn(async move {
+                let (tracks, users) = tokio::join!(sc.search(&q, 20), sc.search_users(&q, 8));
+                let artists = users.unwrap_or_else(|e| {
+                    tracing::warn!("SoundCloud artist search: {e:#}");
+                    Vec::new()
+                });
+                let ok = tracks.is_ok();
+                let _ = tx.send(Internal::SearchResults {
+                    query: q,
+                    source: Source::SoundCloud,
+                    tracks,
+                    artists,
+                });
+                if ok {
+                    if let Ok(id) = sc.client_id().await {
+                        let _ = tx.send(Internal::SoundCloudClientId(id));
+                    }
+                }
+            });
         }
-        let spotify = self.web_auth().map(|auth| (auth, self.spotify_api.clone()));
-        let sc = self.cfg.soundcloud.enabled.then(|| self.soundcloud.clone());
+    }
+
+    /// Seeds SoundCloud's client_id from the last run and checks it in the background, so the
+    /// first search doesn't have to scrape soundcloud.com first.
+    fn warm_up_soundcloud(&mut self) {
+        let saved = self.db.get_kv("soundcloud_client_id").unwrap_or_default();
+        let sc = self.soundcloud.clone();
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
-            let sp_fut = async {
-                match &spotify {
-                    Some((auth, api)) => api.search(&auth.token().await?, &q, 20).await,
-                    None => Ok(Vec::new()),
+            sc.seed_client_id(&saved).await;
+            if saved.is_empty() {
+                match sc.client_id().await {
+                    Ok(id) => {
+                        let _ = tx.send(Internal::SoundCloudClientId(id));
+                    }
+                    Err(e) => tracing::debug!("SoundCloud warm-up: {e:#}"),
                 }
-            };
-            let sc_fut = async {
-                match &sc {
-                    Some(sc) => sc.search(&q, 20).await,
-                    None => Ok(Vec::new()),
-                }
-            };
-            let (spotify, soundcloud) = tokio::join!(sp_fut, sc_fut);
-            let _ = tx.send(Internal::Search {
-                query: q,
-                spotify,
-                soundcloud,
-            });
+            }
         });
+    }
+
+    // ---------------------------------------------------------------- pages
+
+    fn set_page(&self, page: PageState) {
+        let mut feed = self.shared.feed.write().unwrap();
+        if feed.page.key == page.key {
+            feed.page = page;
+        }
+        drop(feed);
+        self.shared.repaint();
+    }
+
+    fn page_failed(&self, key: &str, error: impl Into<String>) {
+        self.set_page(PageState {
+            key: key.to_string(),
+            error: Some(error.into()),
+            ..Default::default()
+        });
+    }
+
+    fn open_page(&mut self, key: String) {
+        let key = key.trim().to_string();
+        if let Some(cached) = self.page_cache.iter().find(|p| p.key == key) {
+            self.shared.feed.write().unwrap().page = cached.clone();
+            self.shared.repaint();
+            return;
+        }
+        self.shared.feed.write().unwrap().page = PageState {
+            key: key.clone(),
+            loading: true,
+            ..Default::default()
+        };
+        self.shared.repaint();
+        match links::target(&key) {
+            Some(target) => self.load_page(key, target),
+            None => self.page_failed(&key, "That isn't a Spotify, SoundCloud or Apple Music link"),
+        }
+    }
+
+    fn load_page(&mut self, key: String, target: Target) {
+        let tx = self.internal_tx.clone();
+        let send = move |key: String, result: Result<PageState>| {
+            let _ = tx.send(Internal::PageLoaded { key, result });
+        };
+        match target {
+            // The UI draws these straight from the library and never asks the service.
+            Target::LocalArtist(_) => self.page_failed(&key, "Open library artists from Your Library"),
+            Target::Spotify(kind, id) => {
+                if !self.cfg.spotify.enabled || !self.spotify_auth.has_login() {
+                    self.page_failed(&key, "Log in to Spotify in Settings to open Spotify pages");
+                    return;
+                }
+                let Some(session) = self.spotify_session() else {
+                    self.spotify_pending_page = Some(key);
+                    return;
+                };
+                tokio::spawn(async move {
+                    let result = tokio::time::timeout(Duration::from_secs(45), spotify_page(session, kind, &id))
+                        .await
+                        .unwrap_or_else(|_| Err(anyhow!("Spotify took too long to answer")));
+                    send(key, result);
+                });
+            }
+            Target::SoundCloudUser(id) => {
+                let sc = self.soundcloud.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let (user, tracks) = tokio::join!(sc.user(id), sc.user_tracks(id));
+                        Ok(soundcloud_user_page(&user?, tracks?))
+                    }
+                    .await;
+                    send(key, result);
+                });
+            }
+            Target::SoundCloudUrl(url) => {
+                let sc = self.soundcloud.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        Ok(match sc.resolve_url(&url).await? {
+                            ScResolved::User(user) => {
+                                let tracks = sc.user_tracks(user.id).await?;
+                                soundcloud_user_page(&user, tracks)
+                            }
+                            ScResolved::Track(t) => PageState {
+                                kind: "Song".into(),
+                                source: Some(Source::SoundCloud),
+                                title: t.title.clone(),
+                                subtitle: t.artist.clone(),
+                                image: t.art.clone(),
+                                external_url: Some(url),
+                                tracks: vec![t],
+                                ..Default::default()
+                            },
+                            ScResolved::Playlist(p) => PageState {
+                                kind: "Playlist".into(),
+                                source: Some(Source::SoundCloud),
+                                subtitle: format!("{} songs", p.tracks.len()),
+                                title: p.name,
+                                image: p.art,
+                                external_url: Some(url),
+                                tracks: p.tracks,
+                                ..Default::default()
+                            },
+                        })
+                    }
+                    .await;
+                    send(key, result);
+                });
+            }
+            Target::AppleMusic { kind, storefront, id } => {
+                let http = self.http.clone();
+                let configured = self.cfg.apple_music.developer_token.trim().to_string();
+                let cache = self.apple_dev_token.clone();
+                tokio::spawn(async move {
+                    let result = async {
+                        let token = {
+                            let mut cached = cache.lock().await;
+                            match (configured.is_empty(), cached.clone()) {
+                                (false, _) => configured,
+                                (true, Some(t)) => t,
+                                (true, None) => {
+                                    let t = apple_music::scrape_developer_token(&http).await?;
+                                    *cached = Some(t.clone());
+                                    t
+                                }
+                            }
+                        };
+                        let api = AppleMusicApi::new(http, &token, "", &storefront);
+                        let page = match kind {
+                            LinkKind::Artist => api.catalog_artist(&id).await,
+                            LinkKind::Album => api.catalog_album(&id).await,
+                            LinkKind::Playlist => api.catalog_playlist(&id).await,
+                            LinkKind::Track => api.catalog_song(&id).await,
+                        };
+                        if page.as_ref().is_err_and(apple_music::is_auth_error) {
+                            // A scraped token may have expired: scrape a new one next time.
+                            *cache.lock().await = None;
+                        }
+                        let page = page?;
+                        Ok(PageState {
+                            kind: links::kind_label(kind).into(),
+                            source: Some(Source::AppleMusic),
+                            title: page.title,
+                            subtitle: page.subtitle,
+                            image: page.image,
+                            round: kind == LinkKind::Artist,
+                            tracks: page.tracks,
+                            external_url: links::web_url(&format!(
+                                "applemusic:{}:{storefront}:{id}",
+                                links::kind_name(kind)
+                            )),
+                            ..Default::default()
+                        })
+                    }
+                    .await;
+                    send(key, result);
+                });
+            }
+            Target::Short(url) => {
+                let http = self.http.clone();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    let result = expand_short_link(&http, &url).await;
+                    let _ = tx.send(Internal::ShortLink { key, result });
+                });
+            }
+        }
+    }
+
+    /// The Spotify session, or `None` while (re)connecting.
+    fn spotify_session(&mut self) -> Option<librespot_core::session::Session> {
+        if let Some(session) = self.spotify.as_ref().and_then(|e| e.session()) {
+            return Some(session);
+        }
+        if let Some(sp) = self.spotify.take() {
+            // Session dropped: reconnect from scratch.
+            sp.shutdown();
+        }
+        self.connect_spotify();
+        None
     }
 
     fn lastfm_login(&mut self) {
@@ -2299,6 +2566,9 @@ impl Service {
                             let name = self.db.get_kv("spotify_user").unwrap_or_default();
                             self.set_account(|f| &mut f.spotify, AccountStatus::Connected(name));
                         }
+                        if let Some(key) = self.spotify_pending_page.take() {
+                            self.open_page(key);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!("Spotify connect failed: {e:#}");
@@ -2308,6 +2578,9 @@ impl Service {
                         );
                         if std::mem::take(&mut self.spotify_sync_pending) {
                             self.start_spotify_web_sync();
+                        }
+                        if let Some(key) = self.spotify_pending_page.take() {
+                            self.page_failed(&key, format!("Couldn't connect to Spotify: {e:#}"));
                         }
                     }
                 }
@@ -2360,28 +2633,74 @@ impl Service {
                 drop(feed);
                 self.shared.repaint();
             }
-            Internal::Search {
+            Internal::SearchResults {
                 query,
-                spotify,
-                soundcloud,
+                source,
+                tracks,
+                artists,
             } => {
                 let mut feed = self.shared.feed.write().unwrap();
-                if feed.search.query == query {
-                    feed.search.pending = 0;
-                    match spotify {
-                        Ok(t) => feed.search.spotify = t,
-                        Err(e) => feed
-                            .search
+                let search = &mut feed.search;
+                if search.query == query {
+                    match (source, tracks) {
+                        (Source::Spotify, Ok(t)) => search.spotify = t,
+                        (_, Ok(t)) => search.soundcloud = t,
+                        (Source::Spotify, Err(e)) => {
+                            search.errors.push(format!("Spotify: {}", friendly_spotify_error(&e)))
+                        }
+                        (_, Err(e)) => search
                             .errors
-                            .push(format!("Spotify: {}", friendly_spotify_error(&e))),
+                            .push(format!("{}: {}", source.label(), friendly_net_error(&e))),
                     }
-                    match soundcloud {
-                        Ok(t) => feed.search.soundcloud = t,
-                        Err(e) => feed.search.errors.push(format!("SoundCloud: {e:#}")),
+                    match source {
+                        Source::Spotify => search.spotify_pending = false,
+                        _ => search.soundcloud_pending = false,
                     }
+                    search.artists.extend(artists);
+                    rank_artists(&mut search.artists, &query);
                 }
                 drop(feed);
                 self.shared.repaint();
+            }
+            Internal::SoundCloudClientId(id) => {
+                if self.db.get_kv("soundcloud_client_id").as_deref() != Some(id.as_str()) {
+                    let _ = self.db.set_kv("soundcloud_client_id", &id);
+                }
+            }
+            Internal::PageLoaded { key, result } => {
+                let page = match result {
+                    Ok(mut page) => {
+                        page.key = key;
+                        self.page_cache.retain(|p| p.key != page.key);
+                        self.page_cache.push(page.clone());
+                        if self.page_cache.len() > 8 {
+                            self.page_cache.remove(0);
+                        }
+                        page
+                    }
+                    Err(e) => {
+                        tracing::warn!("loading page {key}: {e:#}");
+                        PageState {
+                            key,
+                            error: Some(friendly_page_error(&e)),
+                            ..Default::default()
+                        }
+                    }
+                };
+                self.set_page(page);
+            }
+            Internal::ShortLink { key, result } => {
+                if self.shared.feed.read().unwrap().page.key != key {
+                    return;
+                }
+                match result.map(|url| links::target(&url)) {
+                    Ok(Some(target)) if !matches!(target, Target::Short(_)) => self.load_page(key, target),
+                    Ok(_) => self.page_failed(
+                        &key,
+                        "That short link doesn't lead to a song, album, playlist or artist",
+                    ),
+                    Err(e) => self.page_failed(&key, format!("Couldn't open the link: {e:#}")),
+                }
             }
             Internal::Quality { track_id, quality } => {
                 if self.playing.as_ref().is_some_and(|t| t.id == track_id) {
@@ -2584,6 +2903,97 @@ async fn spotify_sync_web(
     })
 }
 
+/// Exact and prefix name matches first; Spotify before SoundCloud on ties. Stable, so each
+/// service's own relevance order is kept.
+fn rank_artists(artists: &mut [ArtistHit], query: &str) {
+    let q = query.trim().to_lowercase();
+    artists.sort_by_cached_key(|a| {
+        let name = a.name.to_lowercase();
+        let rank = if name == q {
+            0
+        } else if name.starts_with(&q) {
+            1
+        } else if name.contains(&q) {
+            2
+        } else {
+            3
+        };
+        (rank, a.source != Source::Spotify)
+    });
+}
+
+async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind, id: &str) -> Result<PageState> {
+    use crate::providers::spotify_internal as si;
+    let data = match kind {
+        LinkKind::Artist => si::artist_page(&session, id).await?,
+        LinkKind::Album => si::album_page(&session, id).await?,
+        LinkKind::Playlist => si::playlist_page(&session, id).await?,
+        LinkKind::Track => si::track_page(&session, id).await?,
+    };
+    Ok(PageState {
+        kind: links::kind_label(kind).into(),
+        source: Some(Source::Spotify),
+        title: data.title,
+        subtitle: data.subtitle,
+        image: data.image,
+        round: kind == LinkKind::Artist,
+        tracks: data.tracks,
+        external_url: links::web_url(&format!("spotify:{}:{id}", links::kind_name(kind))),
+        ..Default::default()
+    })
+}
+
+fn soundcloud_user_page(user: &ScUser, tracks: Vec<Track>) -> PageState {
+    let hit = soundcloud::artist_hit(user);
+    PageState {
+        kind: "Artist".into(),
+        source: Some(Source::SoundCloud),
+        title: user.username.clone(),
+        subtitle: format!("{} · {} tracks", hit.subtitle, tracks.len()),
+        image: user.avatar.clone(),
+        round: true,
+        tracks,
+        external_url: (!user.permalink_url.is_empty()).then(|| user.permalink_url.clone()),
+        ..Default::default()
+    }
+}
+
+/// Follows a short link (spotify.link, on.soundcloud.com) to the page it stands for.
+async fn expand_short_link(http: &reqwest::Client, url: &str) -> Result<String> {
+    let resp = http.get(url).send().await?.error_for_status()?;
+    let landed = resp.url().to_string();
+    if links::parse(&landed).is_some_and(|l| !matches!(l, links::Link::Short { .. })) {
+        return Ok(landed);
+    }
+    // Some short links land on an HTML page that links (or script-redirects) to the target.
+    let body = resp.text().await.unwrap_or_default();
+    links::find_link(&body)
+        .and_then(|link| links::web_url(&links::page_key(&link)))
+        .ok_or_else(|| anyhow!("{url} didn't lead to a music page"))
+}
+
+fn friendly_page_error(e: &anyhow::Error) -> String {
+    if apple_music::is_auth_error(e) {
+        "Apple Music refused the request. Try again, or paste a developer token in Settings → Apple Music.".into()
+    } else {
+        friendly_net_error(e)
+    }
+}
+
+/// Connection problems get a short message instead of a chain of wrapped errors.
+fn friendly_net_error(e: &anyhow::Error) -> String {
+    let offline = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout())
+    });
+    if offline {
+        format!("couldn't connect ({e}). Check your internet connection.")
+    } else {
+        format!("{e:#}")
+    }
+}
+
 /// Turns Web API errors into something actionable.
 fn friendly_spotify_error(e: &anyhow::Error) -> String {
     if spotify_api::error_status(e) == Some(429) || format!("{e:#}").contains("429") {
@@ -2659,6 +3069,67 @@ pub fn best_match(target: &Track, candidates: &[Track]) -> Option<Track> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artists_rank_exact_then_prefix_then_spotify() {
+        let hit = |name: &str, source: Source| ArtistHit {
+            key: format!("{}:{name}", source.as_str()),
+            name: name.into(),
+            image: None,
+            source,
+            subtitle: String::new(),
+        };
+        let mut artists = vec![
+            hit("The Neon Coast Band", Source::SoundCloud),
+            hit("neon coast", Source::SoundCloud),
+            hit("Neon Coastline", Source::Spotify),
+            hit("Neon Coast", Source::Spotify),
+        ];
+        rank_artists(&mut artists, "Neon Coast");
+        let order: Vec<(&str, Source)> = artists.iter().map(|a| (a.name.as_str(), a.source)).collect();
+        assert_eq!(
+            order,
+            vec![
+                ("Neon Coast", Source::Spotify),
+                ("neon coast", Source::SoundCloud),
+                ("Neon Coastline", Source::Spotify),
+                ("The Neon Coast Band", Source::SoundCloud),
+            ]
+        );
+    }
+
+    /// A short link that redirects to a page linking the real target.
+    #[tokio::test]
+    async fn short_links_are_followed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let resp = if head.starts_with("GET /short ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /landing\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    let body = "<html><a href=\"https://open.spotify.com/album/4m2880jivSbbyEGAKfITCa?si=1&amp;x=2\">Open</a></html>";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = expand_short_link(&http, &format!("{base}/short")).await.unwrap();
+        assert_eq!(url, "https://open.spotify.com/album/4m2880jivSbbyEGAKfITCa");
+        assert_eq!(
+            links::target(&url),
+            Some(Target::Spotify(LinkKind::Album, "4m2880jivSbbyEGAKfITCa".into()))
+        );
+    }
 
     fn track(source: Source, artist: &str, title: &str, dur: u64) -> Track {
         Track {

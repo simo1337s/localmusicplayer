@@ -78,14 +78,10 @@ fn text_field(ui: &mut Ui, label: &str, value: &mut String, hint_text: &str, pas
 
 pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, paths: &Paths, rss_mb: f32) {
     egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false, false]).show(ui, |ui| {
-        egui::Frame::new().inner_margin(egui::Margin::same(28)).show(ui, |ui| {
-            ui.set_max_width(760.0);
-            ui.horizontal(|ui| {
-                if widgets::icon_button(ui, icon::CARET_LEFT, 18.0, TEXT, "Back").clicked() {
-                    cx.actions.push(Action::Back);
-                }
-                ui.label(RichText::new("Settings").font(theme::bold_font(30.0)));
-            });
+        egui::Frame::new().inner_margin(egui::Margin::same(24)).show(ui, |ui| {
+            // `set_max_width` can also widen; never go past the panel.
+            ui.set_max_width(ui.available_width().min(760.0));
+            ui.label(RichText::new("Settings").font(theme::bold_font(32.0)));
             ui.add_space(16.0);
 
             // ---------------------------------------------------------- library
@@ -361,7 +357,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
 
             // ---------------------------------------------------------- appearance
             section(ui, icon::SPARKLE, cx.accent, "Appearance", |ui| {
-                ui.checkbox(&mut cfg.ui.dynamic_accent, "Tint the interface with the colours of the current cover");
+                ui.checkbox(&mut cfg.ui.dynamic_accent, "Colour backgrounds with the current cover");
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Accent colour").color(TEXT_DIM));
                     ui.color_edit_button_srgb(&mut cfg.ui.accent);
@@ -394,7 +390,11 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.label(RichText::new(format!("Config: {}", paths.config_file().display())).color(TEXT_FAINT).small());
                 ui.label(RichText::new(format!("Data: {}", paths.data_dir.display())).color(TEXT_FAINT).small());
                 ui.add_space(4.0);
-                hint(ui, "Shortcuts: Space play/pause · ←/→ seek · Ctrl+←/→ prev/next · ↑/↓ volume · Ctrl+F search · L lyrics view");
+                hint(
+                    ui,
+                    "Shortcuts: Space play/pause · ←/→ seek · Ctrl+←/→ prev/next · ↑/↓ volume · Ctrl+K or / search · \
+                     Alt+←/→ back/forward · L lyrics view",
+                );
             });
         });
     });

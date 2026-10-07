@@ -284,6 +284,11 @@ impl fmt::Display for AuthError {
 
 impl std::error::Error for AuthError {}
 
+/// True when Apple rejected the tokens (as opposed to a network or parsing problem).
+pub fn is_auth_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AuthError>().is_some()
+}
+
 /// Client for the user's Apple Music library (`/v1/me/library/...`).
 #[derive(Clone)]
 pub struct AppleMusicApi {
@@ -370,6 +375,102 @@ impl AppleMusicApi {
         Ok(items.iter().filter_map(parse_library_song).collect())
     }
 
+    /// An artist's top songs (catalog, no user token needed).
+    pub async fn catalog_artist(&self, id: &str) -> Result<CatalogPage> {
+        let sf = &self.storefront;
+        let id = urlencoding::encode(id);
+        let artist = self
+            .get_json(&format!("/v1/catalog/{sf}/artists/{id}"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Apple Music artist not found"))?;
+        let attrs = first_attributes(&artist);
+        let mut songs = self
+            .collect_pages(&format!("/v1/catalog/{sf}/artists/{id}/view/top-songs?limit=20"))
+            .await
+            .unwrap_or_default();
+        if songs.is_empty() {
+            songs = self
+                .collect_pages(&format!("/v1/catalog/{sf}/artists/{id}/songs?limit=20"))
+                .await?;
+        }
+        let tracks: Vec<Track> = songs.iter().filter_map(parse_library_song).collect();
+        Ok(CatalogPage {
+            title: attr_text(attrs, "name"),
+            subtitle: format!("Artist · {} songs", tracks.len()),
+            image: attrs.and_then(json_artwork),
+            tracks,
+        })
+    }
+
+    pub async fn catalog_album(&self, id: &str) -> Result<CatalogPage> {
+        let sf = &self.storefront;
+        let id = urlencoding::encode(id);
+        let album = self
+            .get_json(&format!("/v1/catalog/{sf}/albums/{id}"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Apple Music album not found"))?;
+        let attrs = first_attributes(&album);
+        let tracks: Vec<Track> = self
+            .collect_pages(&format!("/v1/catalog/{sf}/albums/{id}/tracks?limit=100"))
+            .await?
+            .iter()
+            .filter_map(parse_library_song)
+            .collect();
+        Ok(CatalogPage {
+            title: attr_text(attrs, "name"),
+            subtitle: format!("Album · {} · {} songs", attr_text(attrs, "artistName"), tracks.len()),
+            image: attrs.and_then(json_artwork),
+            tracks,
+        })
+    }
+
+    pub async fn catalog_playlist(&self, id: &str) -> Result<CatalogPage> {
+        let sf = &self.storefront;
+        let id = urlencoding::encode(id);
+        let playlist = self
+            .get_json(&format!("/v1/catalog/{sf}/playlists/{id}"))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Apple Music playlist not found"))?;
+        let attrs = first_attributes(&playlist);
+        let tracks: Vec<Track> = self
+            .collect_pages(&format!("/v1/catalog/{sf}/playlists/{id}/tracks?limit=100"))
+            .await?
+            .iter()
+            .filter_map(parse_library_song)
+            .collect();
+        let curator = attr_text(attrs, "curatorName");
+        Ok(CatalogPage {
+            title: attr_text(attrs, "name"),
+            subtitle: if curator.is_empty() {
+                format!("Playlist · {} songs", tracks.len())
+            } else {
+                format!("Playlist · {curator} · {} songs", tracks.len())
+            },
+            image: attrs.and_then(json_artwork),
+            tracks,
+        })
+    }
+
+    pub async fn catalog_song(&self, id: &str) -> Result<CatalogPage> {
+        let sf = &self.storefront;
+        let song = self
+            .get_json(&format!("/v1/catalog/{sf}/songs/{}", urlencoding::encode(id)))
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Apple Music song not found"))?;
+        let track = song
+            .get("data")
+            .and_then(Json::as_array)
+            .and_then(|d| d.first())
+            .and_then(parse_library_song)
+            .ok_or_else(|| anyhow::anyhow!("unexpected Apple Music song response"))?;
+        Ok(CatalogPage {
+            title: track.title.clone(),
+            subtitle: format!("Song · {}", track.artist),
+            image: track.art.clone(),
+            tracks: vec![track],
+        })
+    }
+
     /// Fetch `first` and every following `next` page, returning all `data` items.
     async fn collect_pages(&self, first: &str) -> Result<Vec<Json>> {
         let mut out = Vec::new();
@@ -401,11 +502,15 @@ impl AppleMusicApi {
 
         let mut attempt = 0;
         loop {
-            let resp = self
+            let mut req = self
                 .http
                 .get(&url)
-                .header(header::AUTHORIZATION, format!("Bearer {}", self.developer_token))
-                .header("Music-User-Token", &self.user_token)
+                .header(header::AUTHORIZATION, format!("Bearer {}", self.developer_token));
+            // Catalog lookups work without a user token.
+            if !self.user_token.is_empty() {
+                req = req.header("Music-User-Token", &self.user_token);
+            }
+            let resp = req
                 .header(header::ORIGIN, WEB_PLAYER)
                 .header(header::REFERER, format!("{WEB_PLAYER}/"))
                 .header(header::ACCEPT, "application/json")
@@ -453,6 +558,28 @@ impl AppleMusicApi {
             }
         }
     }
+}
+
+/// Header and songs of a catalog artist / album / playlist page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogPage {
+    pub title: String,
+    pub subtitle: String,
+    pub image: Option<String>,
+    pub tracks: Vec<Track>,
+}
+
+fn first_attributes(v: &Json) -> Option<&Json> {
+    v.get("data")?.as_array()?.first()?.get("attributes")
+}
+
+fn attr_text(attrs: Option<&Json>, key: &str) -> String {
+    attrs
+        .and_then(|a| a.get(key))
+        .and_then(Json::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 /// Apple's `next` links are relative and drop the `limit` parameter (falling back to 25 per
@@ -1248,5 +1375,25 @@ mod tests {
         assert_eq!(api.storefront(), "us");
         let dbg = format!("{api:?}");
         assert!(!dbg.contains("secret"), "{dbg}");
+    }
+
+    #[test]
+    fn catalog_helpers() {
+        let v = serde_json::json!({"data": [{"id": "159260351", "type": "artists",
+            "attributes": {"name": "Taylor Swift",
+                "artwork": {"url": "https://is1-ssl.mzstatic.com/image/thumb/x/{w}x{h}bb.jpg"}}}]});
+        let attrs = first_attributes(&v);
+        assert_eq!(attr_text(attrs, "name"), "Taylor Swift");
+        assert_eq!(attr_text(attrs, "missing"), "");
+        assert_eq!(
+            attrs.and_then(json_artwork).as_deref(),
+            Some("https://is1-ssl.mzstatic.com/image/thumb/x/300x300bb.jpg")
+        );
+        let song = serde_json::json!({"id": "1440935808", "type": "songs", "attributes": {
+            "name": "Style", "artistName": "Taylor Swift", "albumName": "1989",
+            "durationInMillis": 231000, "trackNumber": 3}});
+        let t = parse_library_song(&song).unwrap();
+        assert_eq!(t.id, "applemusic:1440935808");
+        assert_eq!(t.duration_ms, 231_000);
     }
 }

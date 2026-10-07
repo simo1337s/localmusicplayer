@@ -7,17 +7,23 @@ use egui::{Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
 
 use crate::model::Source;
 
-pub const WINDOW_BG: Color32 = Color32::from_rgb(0x09, 0x09, 0x0c);
-pub const PANEL: Color32 = Color32::from_rgb(0x12, 0x12, 0x18);
-pub const CARD: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x22);
-pub const HOVER: Color32 = Color32::from_rgb(0x24, 0x24, 0x2e);
-pub const SELECTED: Color32 = Color32::from_rgb(0x2c, 0x2c, 0x38);
-pub const TEXT: Color32 = Color32::from_rgb(0xec, 0xec, 0xf1);
-pub const TEXT_DIM: Color32 = Color32::from_rgb(0xa0, 0xa0, 0xb0);
-pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6c, 0x6c, 0x7c);
-pub const DANGER: Color32 = Color32::from_rgb(0xf0, 0x5a, 0x6a);
+// Graphite surfaces with warm off-white text, matching the logo's stacked tiles.
+/// Window background (sidebar and player dock sit directly on it).
+pub const WINDOW_BG: Color32 = Color32::from_rgb(0x0e, 0x0e, 0x10);
+/// Main view and right panel.
+pub const PANEL: Color32 = Color32::from_rgb(0x16, 0x16, 0x19);
+/// Cards, inputs and the player dock.
+pub const CARD: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x22);
+/// Hovered rows and buttons.
+pub const HOVER: Color32 = Color32::from_rgb(0x27, 0x27, 0x2c);
+pub const SELECTED: Color32 = Color32::from_rgb(0x30, 0x30, 0x36);
+pub const TEXT: Color32 = Color32::from_rgb(0xee, 0xec, 0xe7);
+pub const TEXT_DIM: Color32 = Color32::from_rgb(0xa4, 0xa3, 0xa9);
+pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6c, 0x6b, 0x72);
+pub const DANGER: Color32 = Color32::from_rgb(0xef, 0x6b, 0x6b);
 
-pub const RADIUS: u8 = 10;
+/// Corner radius of panels and cards ("tiles").
+pub const RADIUS: u8 = 14;
 
 pub fn source_color(s: Source) -> Color32 {
     match s {
@@ -77,6 +83,22 @@ pub fn ic(glyph: &str, text: impl Into<String>) -> egui::WidgetText {
     job.into()
 }
 
+/// Paints an icon optically centred on `center`: by the glyph's ink, not its line box, so
+/// icons of any size line up with each other. Returns the painted ink rect.
+pub fn paint_icon(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    glyph: &str,
+    font: FontId,
+    color: Color32,
+) -> egui::Rect {
+    let galley = painter.layout_no_wrap(glyph.to_string(), font, color);
+    let ink = galley.mesh_bounds;
+    let pos = (center - ink.center().to_vec2()).round();
+    painter.galley(pos, galley, color);
+    ink.translate(pos.to_vec2())
+}
+
 pub fn font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Proportional)
 }
@@ -85,7 +107,6 @@ pub fn bold_font(size: f32) -> FontId {
     FontId::new(size, bold())
 }
 
-/// Mixes `a` towards `b` by `t` (0..1).
 /// Uploads the bundled logo once at startup.
 pub fn load_logo(ctx: &egui::Context) -> egui::TextureHandle {
     let img = image::load_from_memory(include_bytes!("../../assets/icon-64.png"))
@@ -107,14 +128,15 @@ pub fn logo(ui: &mut egui::Ui, texture: egui::TextureId, size: f32) -> egui::Res
 /// Soft drop shadow under artwork.
 pub fn art_shadow(ui: &egui::Ui, rect: egui::Rect, radius: u8) {
     let shadow = Shadow {
-        offset: [0, 10],
-        blur: 36,
+        offset: [0, 8],
+        blur: 28,
         spread: 0,
-        color: Color32::from_black_alpha(130),
+        color: Color32::from_black_alpha(90),
     };
     ui.painter().add(shadow.as_shape(rect, CornerRadius::same(radius)));
 }
 
+/// Mixes `a` towards `b` by `t` (0..1).
 pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     let l = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
@@ -138,13 +160,13 @@ pub fn apply_style(ctx: &egui::Context, accent: Color32) {
     let mut v = Visuals::dark();
     v.override_text_color = Some(TEXT);
     v.panel_fill = PANEL;
-    v.window_fill = CARD;
-    v.extreme_bg_color = Color32::from_rgb(0x0d, 0x0d, 0x12);
-    v.faint_bg_color = Color32::from_rgb(0x16, 0x16, 0x1d);
+    v.extreme_bg_color = CARD;
+    v.faint_bg_color = Color32::from_rgb(0x1a, 0x1a, 0x1e);
     v.code_bg_color = CARD;
+    v.window_fill = Color32::from_rgb(0x22, 0x22, 0x27);
     v.window_corner_radius = CornerRadius::same(12);
     v.menu_corner_radius = CornerRadius::same(10);
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2a, 0x34));
+    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(0x33, 0x33, 0x3a));
     v.window_shadow = Shadow {
         offset: [0, 8],
         blur: 24,
@@ -165,17 +187,17 @@ pub fn apply_style(ctx: &egui::Context, accent: Color32) {
     let r = CornerRadius::same(8);
     v.widgets.noninteractive.bg_fill = PANEL;
     v.widgets.noninteractive.weak_bg_fill = PANEL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x24, 0x24, 0x2c));
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x2a, 0x2a, 0x30));
     v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
     v.widgets.noninteractive.corner_radius = r;
     // bg_fill: checkbox boxes, slider rails. weak_bg_fill: buttons, combo boxes.
-    v.widgets.inactive.bg_fill = Color32::from_rgb(0x2c, 0x2c, 0x38);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(0x25, 0x25, 0x30);
+    v.widgets.inactive.bg_fill = Color32::from_rgb(0x3a, 0x3a, 0x41);
+    v.widgets.inactive.weak_bg_fill = CARD;
     v.widgets.inactive.bg_stroke = Stroke::NONE;
     v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
     v.widgets.inactive.corner_radius = r;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(0x36, 0x36, 0x44);
-    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x30, 0x30, 0x3c);
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x48, 0x48, 0x50);
+    v.widgets.hovered.weak_bg_fill = HOVER;
     v.widgets.hovered.bg_stroke = Stroke::NONE;
     v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
     v.widgets.hovered.corner_radius = r;

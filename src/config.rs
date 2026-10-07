@@ -200,16 +200,27 @@ impl Default for LyricsConfig {
     }
 }
 
+/// The logo's off-white.
+pub const DEFAULT_ACCENT: [u8; 3] = [0xe9, 0xe6, 0xdf];
+/// The accent older versions used by default; replaced by the new default on load.
+const OLD_DEFAULT_ACCENT: [u8; 3] = [0x8b, 0x7c, 0xf6];
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct UiConfig {
-    /// Fallback accent color.
+    /// Accent colour (buttons, the playing song).
     pub accent: [u8; 3],
-    /// Tint the UI with the dominant color of the current cover.
+    /// Colour page backgrounds with the dominant colour of the current cover.
     pub dynamic_accent: bool,
     /// UI zoom factor.
     pub scale: f32,
     pub show_right_panel: bool,
+    /// Show the sidebar as a narrow strip of icons and covers.
+    pub collapse_library: bool,
+    /// Width of the expanded sidebar (drag its edge to change it).
+    pub sidebar_width: f32,
+    /// Width of the lyrics / queue panel.
+    pub right_panel_width: f32,
     /// Max decoded cover images kept in memory.
     pub art_cache_size: usize,
 }
@@ -217,10 +228,13 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         UiConfig {
-            accent: [0x8b, 0x7c, 0xf6],
+            accent: DEFAULT_ACCENT,
             dynamic_accent: true,
             scale: 1.0,
             show_right_panel: true,
+            collapse_library: false,
+            sidebar_width: 248.0,
+            right_panel_width: 352.0,
             art_cache_size: 200,
         }
     }
@@ -309,8 +323,11 @@ impl Config {
     pub fn load(paths: &Paths) -> Config {
         let file = paths.config_file();
         match std::fs::read_to_string(&file) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(cfg) => cfg,
+            Ok(text) => match toml::from_str::<Config>(&text) {
+                Ok(mut cfg) => {
+                    cfg.upgrade();
+                    cfg
+                }
                 Err(e) => {
                     tracing::error!("invalid config {}: {e}; using defaults", file.display());
                     Config::default()
@@ -321,6 +338,13 @@ impl Config {
                 let _ = cfg.save(paths);
                 cfg
             }
+        }
+    }
+
+    /// Adjusts settings saved by older versions.
+    fn upgrade(&mut self) {
+        if self.ui.accent == OLD_DEFAULT_ACCENT {
+            self.ui.accent = DEFAULT_ACCENT;
         }
     }
 
@@ -376,5 +400,16 @@ mod tests {
         assert_eq!(cfg.playback.volume, 30.0);
         assert_eq!(cfg.playback.mpv_path, "mpv");
         assert_eq!(cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID);
+    }
+
+    #[test]
+    fn old_default_accent_is_replaced() {
+        let mut cfg: Config = toml::from_str("[ui]\naccent = [139, 124, 246]\n").unwrap();
+        cfg.upgrade();
+        assert_eq!(cfg.ui.accent, DEFAULT_ACCENT);
+        // A colour the user picked is kept.
+        let mut cfg: Config = toml::from_str("[ui]\naccent = [200, 10, 10]\n").unwrap();
+        cfg.upgrade();
+        assert_eq!(cfg.ui.accent, [200, 10, 10]);
     }
 }

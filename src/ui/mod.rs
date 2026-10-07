@@ -24,16 +24,24 @@ use art::ArtCache;
 pub enum View {
     Home,
     Search,
+    /// Local files.
     Songs,
     Albums,
+    /// Every artist in the library.
+    Artists,
     Album(String),
     Playlist(String),
+    /// An artist in the library, by key.
+    Artist(String),
+    /// A Spotify / SoundCloud / Apple Music page, by page key or link.
+    Page(String),
     NowPlaying,
     Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RightTab {
+    NowPlaying,
     Lyrics,
     Queue,
 }
@@ -44,12 +52,18 @@ pub enum Action {
     Cmd(Command),
     Go(View),
     Back,
+    Forward,
+    /// Open a page key (`local:artist:…`, `spotify:artist:…`, …) or a pasted link.
+    Open(String),
+    /// Search everywhere for this text.
+    Search(String),
     NewPlaylist(Vec<Track>),
     Rename(String, String),
     Delete(String),
     OpenUrl(String),
     RightTab(RightTab),
     ToggleRightPanel,
+    ToggleLibrary,
 }
 
 /// Per-frame context handed to every view.
@@ -58,11 +72,17 @@ pub struct Cx<'a> {
     pub player: &'a PlayerView,
     pub feed: &'a Feed,
     pub art: &'a mut ArtCache,
+    /// Buttons and the playing song.
     pub accent: Color32,
+    /// Background colour taken from the current cover (or a neutral grey).
+    pub tint: Color32,
     pub actions: &'a mut Vec<Action>,
     /// The app logo (same artwork as the window and launcher icon).
     pub logo: egui::TextureId,
 }
+
+/// Background tint when there is no cover colour to use.
+const NEUTRAL_TINT: Color32 = Color32::from_rgb(0x53, 0x53, 0x53);
 
 enum Dialog {
     NewPlaylist { name: String, tracks: Vec<Track> },
@@ -81,14 +101,23 @@ pub struct App {
     logo: egui::TextureHandle,
     view: View,
     history: Vec<View>,
+    forward: Vec<View>,
     right_tab: RightTab,
     accent: Color32,
     styled_accent: Color32,
+    tint: Color32,
     search_text: String,
     search_sent: String,
     search_changed_at: Option<Instant>,
     search_cache: (String, u64, Vec<String>),
     filter_text: String,
+    /// The page last asked of the service (see `View::Page`).
+    requested_page: String,
+    /// Bumped to make the sidebar panel start over at its saved width (collapse / expand).
+    sidebar_epoch: u32,
+    /// The view drawn last frame and when it changed, for the fade between views.
+    shown_view: View,
+    view_changed_at: Instant,
     dialog: Option<Dialog>,
     settings: settings::SettingsState,
     cjk_loaded: bool,
@@ -126,14 +155,20 @@ impl App {
             logo,
             view: View::Home,
             history: Vec::new(),
-            right_tab: RightTab::Lyrics,
+            forward: Vec::new(),
+            right_tab: RightTab::NowPlaying,
             accent,
             styled_accent: accent,
+            tint: NEUTRAL_TINT,
             search_text: String::new(),
             search_sent: String::new(),
             search_changed_at: None,
             search_cache: (String::new(), 0, Vec::new()),
             filter_text: String::new(),
+            requested_page: String::new(),
+            sidebar_epoch: 0,
+            shown_view: View::Home,
+            view_changed_at: Instant::now() - Duration::from_secs(1),
             dialog: None,
             settings: settings::SettingsState::default(),
             cjk_loaded: false,
@@ -154,6 +189,7 @@ impl App {
             if self.history.len() > 50 {
                 self.history.remove(0);
             }
+            self.forward.clear();
             self.filter_text.clear();
             if self.view == View::Search {
                 self.focus_search = true;
@@ -161,16 +197,62 @@ impl App {
         }
     }
 
+    fn back(&mut self) {
+        if let Some(v) = self.history.pop() {
+            self.forward.push(std::mem::replace(&mut self.view, v));
+            self.filter_text.clear();
+        }
+    }
+
+    fn forward(&mut self) {
+        if let Some(v) = self.forward.pop() {
+            self.history.push(std::mem::replace(&mut self.view, v));
+            self.filter_text.clear();
+        }
+    }
+
+    /// Opens a page key or link: library artists directly, everything else via the service.
+    fn open(&mut self, key: &str) {
+        let key = key.trim();
+        if let Some(name) = key.strip_prefix("local:artist:") {
+            self.go(View::Artist(name.to_lowercase()));
+        } else if !key.is_empty() {
+            self.go(View::Page(key.to_string()));
+            self.request_page(key);
+        }
+    }
+
+    fn request_page(&mut self, key: &str) {
+        if self.requested_page != key {
+            self.requested_page = key.to_string();
+            self.send(Command::OpenPage(key.to_string()));
+        }
+    }
+
+    fn search_for(&mut self, text: String) {
+        self.search_text = text.trim().to_string();
+        self.search_sent = self.search_text.clone();
+        self.search_changed_at = None;
+        self.send(Command::Search(self.search_sent.clone()));
+        self.go(View::Search);
+        self.focus_search = false;
+    }
+
     fn apply(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for a in actions {
             match a {
                 Action::Cmd(c) => self.send(c),
                 Action::Go(v) => self.go(v),
-                Action::Back => {
-                    if let Some(v) = self.history.pop() {
-                        self.view = v;
+                Action::Back => self.back(),
+                Action::Forward => self.forward(),
+                Action::Open(key) => {
+                    if key == self.requested_page {
+                        // Opening the same page again (e.g. "Try again") reloads it.
+                        self.requested_page.clear();
                     }
+                    self.open(&key);
                 }
+                Action::Search(text) => self.search_for(text),
                 Action::NewPlaylist(tracks) => {
                     self.dialog = Some(Dialog::NewPlaylist {
                         name: String::new(),
@@ -205,6 +287,11 @@ impl App {
                     self.cfg.ui.show_right_panel = !self.cfg.ui.show_right_panel;
                     self.cfg_changed_at = Some(Instant::now());
                 }
+                Action::ToggleLibrary => {
+                    self.cfg.ui.collapse_library = !self.cfg.ui.collapse_library;
+                    self.sidebar_epoch += 1;
+                    self.cfg_changed_at = Some(Instant::now());
+                }
             }
         }
         let _ = ctx;
@@ -230,12 +317,29 @@ impl App {
                 i.key_pressed(Key::ArrowUp),
                 i.key_pressed(Key::ArrowDown),
                 i.modifiers.matches_logically(Modifiers::COMMAND),
-                i.key_pressed(Key::F),
+                i.key_pressed(Key::F) || i.key_pressed(Key::K),
                 i.key_pressed(Key::Escape),
                 i.key_pressed(Key::L),
                 i.key_pressed(Key::Q),
             )
         });
+        let (alt, mouse_back, mouse_fwd, slash) = ctx.input(|i| {
+            (
+                i.modifiers.alt,
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
+                i.key_pressed(Key::Slash),
+            )
+        });
+        if mouse_back || (alt && left) {
+            self.back();
+        }
+        if mouse_fwd || (alt && right) {
+            self.forward();
+        }
+        if alt && (left || right) {
+            return;
+        }
         if space {
             self.send(Command::TogglePause);
         }
@@ -257,19 +361,18 @@ impl App {
             let v = player.volume + if up { 5.0 } else { -5.0 };
             self.send(Command::SetVolume(v));
         }
-        if ctrl && f {
-            self.go(View::Search);
+        if (ctrl && f) || slash {
             self.focus_search = true;
         }
         if l {
             if self.view == View::NowPlaying {
-                self.apply(ctx, vec![Action::Back]);
+                self.back();
             } else {
                 self.go(View::NowPlaying);
             }
         }
         if esc && self.view == View::NowPlaying {
-            self.apply(ctx, vec![Action::Back]);
+            self.back();
         }
         if ctrl && q {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -301,8 +404,14 @@ impl App {
         }
     }
 
-    fn update_accent(&mut self, ctx: &egui::Context, player: &PlayerView) {
-        let base = Color32::from_rgb(self.cfg.ui.accent[0], self.cfg.ui.accent[1], self.cfg.ui.accent[2]);
+    /// The accent comes from the settings; the background tint follows the current cover.
+    fn update_colors(&mut self, ctx: &egui::Context, player: &PlayerView) {
+        let accent = Color32::from_rgb(self.cfg.ui.accent[0], self.cfg.ui.accent[1], self.cfg.ui.accent[2]);
+        if accent != self.styled_accent {
+            theme::apply_style(ctx, accent);
+            self.styled_accent = accent;
+        }
+        self.accent = accent;
         let target = if self.cfg.ui.dynamic_accent {
             player
                 .current
@@ -317,24 +426,46 @@ impl App {
                     let _ = self.art.get(Some(&a), art::THUMB);
                     self.art.accent(&a)
                 })
-                .unwrap_or(base)
+                .unwrap_or(NEUTRAL_TINT)
         } else {
-            base
+            NEUTRAL_TINT
         };
-        // Animate the accent change.
+        // Fade between covers.
         let anim = |id: &str, v: u8| ctx.animate_value_with_time(egui::Id::new(id), v as f32, 0.6).round() as u8;
-        self.accent = Color32::from_rgb(
-            anim("acc-r", target.r()),
-            anim("acc-g", target.g()),
-            anim("acc-b", target.b()),
+        self.tint = Color32::from_rgb(
+            anim("tint-r", target.r()),
+            anim("tint-g", target.g()),
+            anim("tint-b", target.b()),
         );
-        let d = |a: u8, b: u8| (a as i16 - b as i16).unsigned_abs();
-        let s = self.styled_accent;
-        if d(s.r(), self.accent.r()) + d(s.g(), self.accent.g()) + d(s.b(), self.accent.b()) > 6
-            || (self.accent == target && s != target)
-        {
-            theme::apply_style(ctx, self.accent);
-            self.styled_accent = self.accent;
+    }
+
+    /// Saves panel widths the user dragged to. A sidebar dragged narrow snaps to the rail.
+    fn remember_sizes(&mut self, ctx: &egui::Context, sidebar: Option<f32>, right: Option<f32>) {
+        let ui_cfg = &mut self.cfg.ui;
+        let mut changed = false;
+        if let Some(w) = sidebar {
+            if w < panels::SIDEBAR_COLLAPSE_AT {
+                changed |= !ui_cfg.collapse_library;
+                ui_cfg.collapse_library = true;
+                if (w - panels::SIDEBAR_RAIL).abs() > 0.5 {
+                    // Start the panel over at the rail width.
+                    self.sidebar_epoch += 1;
+                    ctx.request_repaint();
+                }
+            } else {
+                changed |= ui_cfg.collapse_library || (w - ui_cfg.sidebar_width).abs() >= 1.0;
+                ui_cfg.collapse_library = false;
+                ui_cfg.sidebar_width = w.round();
+            }
+        }
+        if let Some(w) = right {
+            if (w - ui_cfg.right_panel_width).abs() >= 1.0 {
+                ui_cfg.right_panel_width = w.round();
+                changed = true;
+            }
+        }
+        if changed {
+            self.cfg_changed_at = Some(Instant::now());
         }
     }
 
@@ -356,13 +487,18 @@ impl App {
         }
     }
 
-    fn sync_config(&mut self) {
+    /// Saves settings shortly after the last change.
+    fn sync_config(&mut self, ctx: &egui::Context) {
         if self.cfg != self.sent_cfg {
             let changed = *self.cfg_changed_at.get_or_insert_with(Instant::now);
-            if changed.elapsed() > Duration::from_millis(700) {
+            let delay = Duration::from_millis(700);
+            if changed.elapsed() > delay {
                 self.send(Command::UpdateConfig(Box::new(self.cfg.clone())));
                 self.sent_cfg = self.cfg.clone();
                 self.cfg_changed_at = None;
+            } else {
+                // Nothing else may redraw (and so save) once the mouse stops moving.
+                ctx.request_repaint_after(delay.saturating_sub(changed.elapsed()) + Duration::from_millis(20));
             }
         } else {
             self.cfg_changed_at = None;
@@ -374,7 +510,7 @@ impl App {
         let mut close = false;
         let mut submit: Option<Command> = None;
         let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
-            ui.set_width(360.0);
+            ui.set_width(380.0);
             match dialog {
                 Dialog::NewPlaylist { name, tracks } => {
                     ui.label(egui::RichText::new("New playlist").font(theme::bold_font(18.0)));
@@ -447,6 +583,9 @@ impl App {
             if let Command::DeletePlaylist(id) = &c {
                 if self.view == View::Playlist(id.clone()) {
                     self.view = View::Home;
+                    let gone = View::Playlist(id.clone());
+                    self.history.retain(|v| *v != gone);
+                    self.forward.retain(|v| *v != gone);
                 }
             }
             self.send(c);
@@ -462,17 +601,17 @@ impl App {
             return;
         }
         egui::Area::new(egui::Id::new("toasts"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -110.0))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -100.0))
             .interactable(false)
             .show(ctx, |ui| {
                 for t in feed.toasts.iter().rev().take(3) {
                     let fill = match t.kind {
-                        crate::service::ToastKind::Info => Color32::from_rgb(0x2a, 0x2a, 0x36),
-                        crate::service::ToastKind::Error => Color32::from_rgb(0x5a, 0x22, 0x2a),
+                        crate::service::ToastKind::Info => Color32::from_rgb(0x2e, 0x77, 0xd0),
+                        crate::service::ToastKind::Error => Color32::from_rgb(0xc4, 0x23, 0x35),
                     };
                     egui::Frame::new()
                         .fill(fill)
-                        .corner_radius(egui::CornerRadius::same(10))
+                        .corner_radius(egui::CornerRadius::same(8))
                         .inner_margin(egui::Margin::symmetric(16, 10))
                         .shadow(egui::epaint::Shadow {
                             offset: [0, 4],
@@ -482,7 +621,7 @@ impl App {
                         })
                         .show(ui, |ui| {
                             ui.set_max_width(520.0);
-                            ui.label(egui::RichText::new(&t.text).color(theme::TEXT));
+                            ui.label(egui::RichText::new(&t.text).color(Color32::WHITE));
                         });
                     ui.add_space(6.0);
                 }
@@ -533,18 +672,43 @@ impl eframe::App for App {
 
         let player_guard = shared.player.read().unwrap();
         let player: &PlayerView = &player_guard;
-        self.update_accent(&ctx, player);
+        self.update_colors(&ctx, player);
         self.keyboard(&ctx, player);
         let lib_guard = shared.library.read().unwrap();
         let feed_guard = shared.feed.read().unwrap();
         self.maybe_load_cjk(&ctx, &lib_guard);
 
         let mut actions = Vec::new();
+        let mut resized: Option<(Option<f32>, Option<f32>)> = None;
+        if self.shown_view != self.view {
+            self.shown_view = self.view.clone();
+            self.view_changed_at = Instant::now();
+        }
+        // New views fade in over a few frames.
+        let fade = (self.view_changed_at.elapsed().as_secs_f32() / 0.16).min(1.0);
+        if fade < 1.0 {
+            ctx.request_repaint();
+        }
         {
             // Window background.
             ui.painter().rect_filled(ui.max_rect(), 0.0, theme::WINDOW_BG);
-            let accent = self.accent;
-            let show_right = self.cfg.ui.show_right_panel && self.view != View::NowPlaying;
+            let width = ui.available_width();
+            // Narrow windows get the icon sidebar and no right panel.
+            let narrow = width < 820.0;
+            let collapsed = self.cfg.ui.collapse_library || narrow;
+            let sidebar_w = if collapsed {
+                panels::SIDEBAR_RAIL
+            } else {
+                self.cfg.ui.sidebar_width
+            };
+            let right_w = self
+                .cfg
+                .ui
+                .right_panel_width
+                .clamp(panels::RIGHT_MIN, panels::RIGHT_MAX);
+            let show_right = self.cfg.ui.show_right_panel
+                && self.view != View::NowPlaying
+                && width - sidebar_w - right_w - 2.0 * panels::GAP >= 420.0;
             let right_tab = self.right_tab;
 
             let mut cx = Cx {
@@ -552,64 +716,111 @@ impl eframe::App for App {
                 player,
                 feed: &feed_guard,
                 art: &mut self.art,
-                accent,
+                accent: self.accent,
+                tint: self.tint,
                 actions: &mut actions,
                 logo: self.logo.id(),
             };
 
-            panels::player_bar(ui, &mut cx, show_right.then_some(right_tab));
-            panels::sidebar(ui, &mut cx, &self.view);
-            if show_right {
-                panels::right_panel(ui, &mut cx, right_tab);
-            }
-            let mut state = views::ViewState {
+            panels::player_dock(ui, &mut cx, show_right.then_some(right_tab));
+            let mut side = panels::SidebarState {
                 view: &self.view,
-                can_go_back: !self.history.is_empty(),
                 search_text: &mut self.search_text,
-                search_cache: &mut self.search_cache,
-                filter_text: &mut self.filter_text,
                 focus_search: &mut self.focus_search,
+                collapsed,
             };
+            let sidebar_size = if narrow {
+                panels::SidebarSize {
+                    id: egui::Id::new("sidebar-narrow"),
+                    default: None,
+                }
+            } else {
+                panels::SidebarSize {
+                    id: egui::Id::new(("sidebar", self.sidebar_epoch)),
+                    default: Some(sidebar_w),
+                }
+            };
+            let sidebar_used = panels::sidebar(ui, &mut cx, &mut side, sidebar_size);
+            let collapsed = side.collapsed;
+            let right_used = show_right.then(|| panels::right_panel(ui, &mut cx, right_tab, right_w));
+            // Remember dragged sizes once the mouse is released.
+            if !ctx.input(|i| i.pointer.any_down()) {
+                resized = Some(((!narrow).then_some(sidebar_used), right_used));
+            }
+            let (can_back, can_forward) = (!self.history.is_empty(), !self.forward.is_empty());
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::new()
                         .fill(theme::PANEL)
                         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
                         .outer_margin(egui::Margin {
-                            left: 0,
-                            right: if show_right { 0 } else { 8 },
-                            top: 8,
+                            left: panels::GAP as i8,
+                            right: panels::GAP as i8,
+                            top: panels::GAP as i8,
                             bottom: 0,
                         }),
                 )
                 .show(ui, |ui| {
+                    ui.multiply_opacity(1.0 - (1.0 - fade).powi(2));
+                    if self.view != View::NowPlaying {
+                        // The icon-only sidebar has no room for the search field: it moves up here.
+                        let mut search = collapsed.then_some(panels::SidebarState {
+                            view: &self.view,
+                            search_text: &mut self.search_text,
+                            focus_search: &mut self.focus_search,
+                            collapsed,
+                        });
+                        panels::toolbar(ui, &mut cx, can_back, can_forward, search.as_mut());
+                    }
                     if self.view == View::Settings {
                         settings::show(ui, &mut cx, &mut self.cfg, &mut self.settings, &self.paths, self.rss_mb);
                     } else {
+                        let mut state = views::ViewState {
+                            view: &self.view,
+                            search_text: &self.search_text,
+                            search_cache: &mut self.search_cache,
+                            filter_text: &mut self.filter_text,
+                        };
                         views::show(ui, &mut cx, &mut state);
                     }
                 });
         }
         self.toasts(&ctx, &feed_guard);
+        if let Some((sidebar, right)) = resized {
+            self.remember_sizes(&ctx, sidebar, right);
+        }
 
-        // Debounced remote search while typing.
-        if self.view == View::Search && self.search_text.trim() != self.search_sent {
+        // Pages are loaded by the service; ask again after going back / forward to one.
+        if let View::Page(key) = &self.view {
+            let key = key.clone();
+            self.request_page(&key);
+        }
+
+        // Debounced remote search while typing (links open their page instead).
+        let typed = self.search_text.trim().to_string();
+        if self.view == View::Search && typed != self.search_sent && !crate::links::looks_like_link(&typed) {
             let changed = *self.search_changed_at.get_or_insert_with(Instant::now);
-            if changed.elapsed() > Duration::from_millis(450) {
-                self.search_sent = self.search_text.trim().to_string();
+            if changed.elapsed() > Duration::from_millis(300) {
+                self.search_sent = typed;
                 self.search_changed_at = None;
                 actions.push(Action::Cmd(Command::Search(self.search_sent.clone())));
             } else {
-                ctx.request_repaint_after(Duration::from_millis(150));
+                ctx.request_repaint_after(Duration::from_millis(100));
             }
         }
 
         // Repaint pacing: only while something moves.
         if player.status == PlayStatus::Playing {
-            let fast =
-                self.view == View::NowPlaying || (self.cfg.ui.show_right_panel && self.right_tab == RightTab::Lyrics);
+            let fast = self.view == View::NowPlaying
+                || (self.cfg.ui.show_right_panel
+                    && self.right_tab != RightTab::Queue
+                    && feed_guard.lyrics.lyrics.is_some());
             ctx.request_repaint_after(Duration::from_millis(if fast { 100 } else { 500 }));
-        } else if player.status == PlayStatus::Loading || feed_guard.scan.is_some() {
+        } else if player.status == PlayStatus::Loading
+            || feed_guard.scan.is_some()
+            || feed_guard.page.loading
+            || feed_guard.search.pending()
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
         drop(feed_guard);
@@ -618,7 +829,7 @@ impl eframe::App for App {
 
         self.apply(&ctx, actions);
         self.dialogs(&ctx);
-        self.sync_config();
+        self.sync_config(&ctx);
         self.check_memory(&ctx);
 
         if ctx.input(|i| i.viewport().close_requested()) {

@@ -22,6 +22,15 @@ pub fn text_trunc(ui: &Ui, pos: Pos2, text: &str, font: FontId, color: Color32, 
     rect
 }
 
+/// Paints `color` behind `rect`, fading it in and out as `on` changes (hover highlights).
+pub fn fade_fill(ui: &Ui, id: Id, rect: Rect, radius: u8, on: bool, color: Color32) {
+    let t = ui.ctx().animate_bool_with_time(id.with("fade"), on, 0.14);
+    if t > 0.0 {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(radius), color.gamma_multiply(t));
+    }
+}
+
 /// Vertical gradient, `top` colour fading to `bottom`.
 pub fn gradient(ui: &Ui, rect: Rect, top: Color32, bottom: Color32) {
     let mut mesh = Mesh::default();
@@ -71,9 +80,9 @@ pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) 
     let top = theme::mix(base, Color32::BLACK, 0.35);
     let bottom = theme::mix(base, Color32::BLACK, 0.7);
     rounded_gradient(ui, rect, top, bottom, radius);
-    ui.painter().text(
+    theme::paint_icon(
+        ui.painter(),
         rect.center(),
-        Align2::CENTER_CENTER,
         glyph,
         theme::icon_font(rect.height() * 0.38),
         theme::with_alpha(Color32::WHITE, 200),
@@ -99,13 +108,41 @@ pub fn cover(ui: &Ui, art: &mut ArtCache, src: Option<&str>, rect: Rect, radius:
     }
 }
 
+/// Round artwork (artists).
+pub fn cover_round(ui: &Ui, art: &mut ArtCache, src: Option<&str>, rect: Rect, fallback: (Color32, &str)) {
+    let size = if rect.width() <= 64.0 { THUMB } else { MEDIUM };
+    let radius = (rect.width() / 2.0).min(255.0) as u8;
+    match art.get(src, size) {
+        Some(tex) => {
+            egui::Image::from_texture(egui::load::SizedTexture::new(tex.id(), rect.size()))
+                .corner_radius(CornerRadius::same(radius))
+                .paint_at(ui, rect);
+        }
+        None => {
+            ui.painter()
+                .circle_filled(rect.center(), rect.width() / 2.0, fallback.0);
+            theme::paint_icon(
+                ui.painter(),
+                rect.center(),
+                fallback.1,
+                theme::icon_font(rect.height() * 0.38),
+                theme::with_alpha(Color32::WHITE, 200),
+            );
+        }
+    }
+}
+
+pub fn artist_fallback() -> (Color32, &'static str) {
+    (Color32::from_rgb(0x33, 0x33, 0x33), icon::USER)
+}
+
 pub fn track_fallback(t: &Track) -> (Color32, &'static str) {
     (theme::mix(source_color(t.source), PANEL, 0.4), icon::MUSIC_NOTE)
 }
 
 pub fn playlist_fallback(p: &Playlist) -> (Color32, &'static str) {
     match p.kind {
-        PlaylistKind::Liked => (Color32::from_rgb(0x6d, 0x4a, 0xff), icon::HEART),
+        PlaylistKind::Liked => (Color32::from_rgb(0x50, 0x38, 0xa0), icon::HEART),
         PlaylistKind::SpotifyLiked => (source_color(Source::Spotify), icon::HEART),
         PlaylistKind::SoundCloudLikes => (source_color(Source::SoundCloud), icon::HEART),
         k => (
@@ -127,9 +164,9 @@ pub fn playlist_cover(ui: &Ui, art: &mut ArtCache, p: &Playlist, rect: Rect, rad
         let top = theme::mix(base, Color32::WHITE, 0.12);
         let bottom = theme::mix(base, Color32::BLACK, 0.45);
         rounded_gradient(ui, rect, top, bottom, radius);
-        ui.painter().text(
+        theme::paint_icon(
+            ui.painter(),
             rect.center(),
-            Align2::CENTER_CENTER,
             glyph,
             theme::fill_icon_font(rect.height() * 0.42),
             Color32::WHITE,
@@ -139,21 +176,7 @@ pub fn playlist_cover(ui: &Ui, art: &mut ArtCache, p: &Playlist, rect: Rect, rad
     cover(ui, art, p.art.as_deref(), rect, radius, playlist_fallback(p));
 }
 
-/// A flat icon button that lights up on hover.
-pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip: &str) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 12.0), Sense::click());
-    let hovered = resp.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 14));
-    }
-    let c = if hovered {
-        theme::mix(color, Color32::WHITE, 0.35)
-    } else {
-        color
-    };
-    ui.painter()
-        .text(rect.center(), Align2::CENTER_CENTER, glyph, theme::icon_font(size), c);
+fn with_tooltip(resp: Response, tooltip: &str) -> Response {
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if tooltip.is_empty() {
         resp
@@ -162,31 +185,107 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip:
     }
 }
 
-/// Big round play/pause button in the accent colour.
-pub fn play_circle(ui: &mut Ui, size: f32, accent: Color32, playing: bool) -> Response {
-    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
-    let scale = if resp.hovered() { 1.05 } else { 1.0 };
-    let fill = if resp.hovered() {
-        theme::mix(accent, Color32::WHITE, 0.15)
+/// A flat icon button (a `size + 12` square) whose icon brightens on hover.
+pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip: &str) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 12.0), Sense::click());
+    let c = if resp.hovered() {
+        theme::mix(color, Color32::WHITE, 0.6)
     } else {
-        accent
+        color
     };
-    ui.painter().circle_filled(rect.center(), size * 0.5 * scale, fill);
-    let glyph = if playing {
-        egui_phosphor::fill::PAUSE
+    theme::paint_icon(ui.painter(), rect.center(), glyph, theme::icon_font(size), c);
+    with_tooltip(resp, tooltip)
+}
+
+/// Size of the player dock controls.
+pub const CONTROL: f32 = 32.0;
+
+/// A row of options in one rounded box (tabs); returns the clicked option.
+pub fn segmented<T: Copy + PartialEq>(ui: &mut Ui, options: &[(T, &str)], selected: T) -> Option<T> {
+    let font = theme::font(13.0);
+    let widths: Vec<f32> = options
+        .iter()
+        .map(|(_, label)| {
+            ui.painter()
+                .layout_no_wrap(label.to_string(), font.clone(), TEXT)
+                .size()
+                .x
+                + 22.0
+        })
+        .collect();
+    let total: f32 = widths.iter().sum::<f32>() + 6.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(total, 34.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(10), CARD);
+    let mut x = rect.left() + 3.0;
+    let mut clicked = None;
+    for ((value, label), w) in options.iter().zip(widths) {
+        let seg = Rect::from_min_size(Pos2::new(x, rect.top() + 3.0), vec2(w, 28.0));
+        let resp = ui
+            .interact(seg, Id::new(("segmented", *label)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand);
+        let active = *value == selected;
+        if active {
+            ui.painter().rect_filled(seg, CornerRadius::same(8), SELECTED);
+        } else {
+            fade_fill(ui, resp.id, seg, 8, resp.hovered(), HOVER);
+        }
+        ui.painter().text(
+            seg.center(),
+            Align2::CENTER_CENTER,
+            *label,
+            font.clone(),
+            if active || resp.hovered() { TEXT } else { TEXT_DIM },
+        );
+        if resp.clicked() {
+            clicked = Some(*value);
+        }
+        x += w;
+    }
+    clicked
+}
+
+/// Labelled button with an icon ("▶ Play"). `primary` uses the accent.
+pub fn action_button(ui: &mut Ui, glyph: &str, label: &str, primary: bool, accent: Color32) -> Response {
+    let fg = if primary { theme::on_color(accent) } else { TEXT };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), theme::bold_font(14.0), fg);
+    let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 58.0, 42.0), Sense::click());
+    let hovered = resp.hovered();
+    let fill = match (primary, hovered) {
+        (true, false) => accent,
+        (true, true) => theme::mix(accent, Color32::WHITE, 0.15),
+        (false, false) => CARD,
+        (false, true) => HOVER,
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(12), fill);
+    let font = if primary {
+        theme::fill_icon_font(17.0)
     } else {
-        egui_phosphor::fill::PLAY
+        theme::icon_font(17.0)
     };
-    // The play triangle looks centred when nudged right a bit.
-    let offset = if playing { 0.0 } else { size * 0.04 };
-    ui.painter().text(
-        rect.center() + vec2(offset, 0.0),
-        Align2::CENTER_CENTER,
+    theme::paint_icon(
+        ui.painter(),
+        Pos2::new(rect.left() + 26.0, rect.center().y),
         glyph,
-        theme::fill_icon_font(size * 0.42),
-        theme::on_color(fill),
+        font,
+        fg,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + 42.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        fg,
     );
     resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Width [`pill`] will take for `text`.
+pub fn pill_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), theme::bold_font(14.0), TEXT)
+        .size()
+        .x
+        + 28.0
 }
 
 /// Rounded "pill" button.
@@ -210,7 +309,7 @@ pub fn bar(ui: &mut Ui, id: Id, width: f32, fraction: f32, accent: Color32) -> (
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 16.0), Sense::click_and_drag());
     let _ = id;
     let active = resp.hovered() || resp.dragged();
-    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), if active { 6.0 } else { 4.0 }));
+    let track = Rect::from_center_size(rect.center(), vec2(rect.width(), 4.0));
     let mut f = fraction.clamp(0.0, 1.0);
     let mut changed = None;
     if let Some(p) = resp.interact_pointer_pos() {
@@ -220,11 +319,11 @@ pub fn bar(ui: &mut Ui, id: Id, width: f32, fraction: f32, accent: Color32) -> (
         }
     }
     let painter = ui.painter();
-    painter.rect_filled(track, CornerRadius::same(3), theme::with_alpha(Color32::WHITE, 40));
+    painter.rect_filled(track, CornerRadius::same(2), Color32::from_rgb(0x4d, 0x4d, 0x4d));
     let filled = Rect::from_min_max(track.min, Pos2::new(track.left() + track.width() * f, track.max.y));
-    painter.rect_filled(filled, CornerRadius::same(3), if active { accent } else { TEXT });
+    painter.rect_filled(filled, CornerRadius::same(2), if active { accent } else { TEXT });
     if active {
-        painter.circle_filled(Pos2::new(filled.right(), track.center().y), 6.5, Color32::WHITE);
+        painter.circle_filled(Pos2::new(filled.right(), track.center().y), 6.0, Color32::WHITE);
     }
     (resp.on_hover_cursor(CursorIcon::PointingHand), changed)
 }
@@ -239,16 +338,16 @@ pub fn heading_icon(ui: &mut Ui, glyph: &str, color: Color32, text: &str) {
                 .size(20.0)
                 .color(color),
         );
-        ui.label(egui::RichText::new(text).font(theme::bold_font(20.0)).color(TEXT));
+        ui.label(egui::RichText::new(text).font(theme::bold_font(18.0)).color(TEXT));
     });
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 }
 
 /// Section heading.
 pub fn heading(ui: &mut Ui, text: &str) {
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new(text).font(theme::bold_font(18.0)).color(TEXT));
     ui.add_space(6.0);
-    ui.label(egui::RichText::new(text).font(theme::bold_font(20.0)).color(TEXT));
-    ui.add_space(4.0);
 }
 
 /// Square tile with art, title and subtitle (playlists, albums). Returns (clicked, play clicked).
@@ -263,10 +362,7 @@ pub fn tile(
     let height = width + 58.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let hovered = resp.hovered();
-    if hovered {
-        ui.painter()
-            .rect_filled(rect.expand(6.0), CornerRadius::same(12), HOVER);
-    }
+    fade_fill(ui, resp.id, rect.expand(8.0), RADIUS + 2, hovered, CARD);
     let art_rect = Rect::from_min_size(rect.min, vec2(width, width));
     draw_art(ui, art_rect);
     text_trunc(
@@ -289,30 +385,34 @@ pub fn tile(
     let mut play = false;
     let t = ui.ctx().animate_bool_with_time(resp.id.with("play"), hovered, 0.15);
     if t > 0.0 {
-        let c = art_rect.right_bottom() - vec2(30.0, 30.0 - 8.0 * (1.0 - t));
-        let r = 22.0;
-        let btn = Rect::from_center_size(c, vec2(r * 2.0, r * 2.0));
-        let over = ui.rect_contains_pointer(btn);
-        ui.painter()
-            .circle_filled(c + vec2(0.0, 3.0), r, Color32::from_black_alpha((90.0 * t) as u8));
-        ui.painter().circle_filled(
-            c,
-            r,
-            theme::with_alpha(
-                if over {
-                    theme::mix(accent, Color32::WHITE, 0.15)
-                } else {
-                    accent
-                },
-                (255.0 * t) as u8,
-            ),
+        let btn = Rect::from_min_size(
+            art_rect.right_bottom() - vec2(52.0, 52.0 - 6.0 * (1.0 - t)),
+            vec2(40.0, 40.0),
         );
-        ui.painter().text(
-            c + vec2(1.5, 0.0),
-            Align2::CENTER_CENTER,
+        let over = ui.rect_contains_pointer(btn);
+        let alpha = (255.0 * t) as u8;
+        ui.painter().add(
+            egui::epaint::Shadow {
+                offset: [0, 4],
+                blur: 14,
+                spread: 0,
+                color: Color32::from_black_alpha((110.0 * t) as u8),
+            }
+            .as_shape(btn, CornerRadius::same(12)),
+        );
+        let fill = if over {
+            theme::mix(accent, Color32::WHITE, 0.15)
+        } else {
+            accent
+        };
+        ui.painter()
+            .rect_filled(btn, CornerRadius::same(12), theme::with_alpha(fill, alpha));
+        theme::paint_icon(
+            ui.painter(),
+            btn.center() + vec2(1.0, 0.0),
             egui_phosphor::fill::PLAY,
-            theme::fill_icon_font(18.0),
-            theme::with_alpha(theme::on_color(accent), (255.0 * t) as u8),
+            theme::fill_icon_font(17.0),
+            theme::with_alpha(theme::on_color(accent), alpha),
         );
         if over && resp.clicked() {
             play = true;
@@ -381,7 +481,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         p.text(
             hrect.left_center() + vec2(num_w + 8.0, 0.0),
             Align2::LEFT_CENTER,
-            "TITLE",
+            "Title",
             f.clone(),
             TEXT_FAINT,
         );
@@ -389,7 +489,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             p.text(
                 hrect.left_center() + vec2(album_x, 0.0),
                 Align2::LEFT_CENTER,
-                "ALBUM",
+                "Album",
                 f.clone(),
                 TEXT_FAINT,
             );
@@ -427,11 +527,15 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         let row = Rect::from_min_size(rect.min + vec2(0.0, i as f32 * ROW_H), vec2(width, ROW_H));
         let resp = ui.interact(row, Id::new((opts.id, i)), Sense::click());
         let is_current = current_id == Some(t.id.as_str());
-        let hovered = resp.hovered() || resp.context_menu_opened();
+        let hovered = ui.rect_contains_pointer(row) || resp.context_menu_opened();
         if selected == Some(i) {
-            ui.painter().rect_filled(row, CornerRadius::same(8), SELECTED);
-        } else if hovered {
-            ui.painter().rect_filled(row, CornerRadius::same(8), HOVER);
+            ui.painter().rect_filled(row, CornerRadius::same(10), SELECTED);
+        } else {
+            if is_current {
+                ui.painter()
+                    .rect_filled(row, CornerRadius::same(10), theme::with_alpha(cx.accent, 14));
+            }
+            fade_fill(ui, resp.id, row, 10, hovered, HOVER);
         }
 
         // Number / play icon / equalizer.
@@ -462,7 +566,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
 
         // Art + title + artist.
         let art_rect = Rect::from_min_size(row.min + vec2(num_w + 8.0, (ROW_H - 40.0) / 2.0), vec2(40.0, 40.0));
-        cover(ui, cx.art, t.art.as_deref(), art_rect, 5, track_fallback(t));
+        cover(ui, cx.art, t.art.as_deref(), art_rect, 6, track_fallback(t));
         let tx = art_rect.right() + 12.0;
         let tw = title_w - 60.0;
         let title_color = if is_current { cx.accent } else { TEXT };
@@ -474,14 +578,18 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             title_color,
             tw,
         );
-        text_trunc(
+        let artist = link_text(
             ui,
+            Id::new((opts.id, i, "artist")),
             Pos2::new(tx, row.top() + 30.0),
             &t.artist,
             theme::font(12.5),
-            TEXT_DIM,
+            if hovered { TEXT } else { TEXT_DIM },
             tw,
         );
+        if artist.clicked() {
+            cx.actions.push(artist_action(cx.lib, &t.artist));
+        }
         if show_album {
             text_trunc(
                 ui,
@@ -536,7 +644,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         );
 
         // Interactions.
-        if resp.clicked() && !heart.clicked() {
+        if resp.clicked() && !heart.clicked() && !artist.clicked() {
             let num_rect = Rect::from_min_size(row.min, vec2(num_w, ROW_H));
             if ui.rect_contains_pointer(num_rect) {
                 if is_current {
@@ -553,6 +661,40 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         }
         resp.context_menu(|ui| track_menu(ui, cx, t, Some((opts.playlist, i))));
     }
+}
+
+/// One line of text that underlines on hover and can be clicked (artist names).
+pub fn link_text(ui: &Ui, id: Id, pos: Pos2, text: &str, font: FontId, color: Color32, max_w: f32) -> Response {
+    let mut job = LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap = TextWrapping::truncate_at_width(max_w.max(8.0));
+    let galley = ui.painter().layout_job(job);
+    let rect = Rect::from_min_size(pos, galley.size());
+    let resp = ui.interact(rect, id, Sense::click());
+    let color = if resp.hovered() { TEXT } else { color };
+    ui.painter().galley_with_override_text_color(pos, galley, color);
+    if resp.hovered() {
+        let y = rect.bottom() - 1.5;
+        ui.painter().line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            Stroke::new(1.0, color),
+        );
+    }
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+/// Where clicking an artist name leads: their page in the library, else a search for them.
+pub fn artist_action(lib: &crate::library::Library, artist: &str) -> Action {
+    let main = crate::library::credited_artists(artist, &Default::default())
+        .into_iter()
+        .next()
+        .unwrap_or(artist.trim());
+    let first = main.split(", ").next().unwrap_or(main);
+    for name in [main, first] {
+        if let Some(a) = lib.artist(name) {
+            return Action::Open(format!("local:artist:{}", a.key));
+        }
+    }
+    Action::Search(first.to_string())
 }
 
 fn play_from(cx: &mut Cx, tracks: &[&Track], i: usize, context: &str) {
@@ -725,6 +867,6 @@ pub fn source_badge(ui: &mut Ui, source: Source) {
 pub fn card_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(CARD)
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::same(16))
 }

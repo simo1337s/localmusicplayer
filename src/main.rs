@@ -4,6 +4,7 @@ mod config;
 mod http;
 mod integrations;
 mod library;
+mod links;
 mod model;
 mod player;
 mod providers;

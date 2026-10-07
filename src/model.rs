@@ -225,7 +225,6 @@ pub struct ImportedPlaylist {
     pub tracks: Vec<Track>,
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// An artist (or SoundCloud user) in search results; `key` opens their page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArtistHit {
@@ -237,7 +236,6 @@ pub struct ArtistHit {
     pub subtitle: String,
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// 1234 -> "1.2K", 2500000 -> "2.5M".
 pub fn human_count(n: u64) -> String {
     let f = |v: f64, unit: &str| {

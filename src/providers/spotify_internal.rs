@@ -207,7 +207,6 @@ pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String
     Ok(out)
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// Header and tracks of an artist / album / playlist page.
 pub struct PageData {
     pub title: String,
@@ -216,7 +215,6 @@ pub struct PageData {
     pub tracks: Vec<Track>,
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// Tracks for `uris`, in that order, skipping anything without metadata.
 async fn ordered_tracks(session: &Session, uris: &[String]) -> Result<Vec<Track>> {
     let mut seen = std::collections::HashSet::new();
@@ -229,13 +227,11 @@ async fn ordered_tracks(session: &Session, uris: &[String]) -> Result<Vec<Track>
     Ok(unique.iter().filter_map(|u| map.remove(u)).collect())
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 fn gid_uri(kind: &str, gid: &[u8]) -> Option<String> {
     let id = librespot_core::SpotifyId::from_raw(gid).ok()?.to_base62().ok()?;
     Some(format!("spotify:{kind}:{id}"))
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 fn pick_image<'a>(group: &'a [metadata::Image], fallback: &'a [metadata::Image]) -> Option<String> {
     let imgs = if group.is_empty() { fallback } else { group };
     imgs.iter()
@@ -245,7 +241,6 @@ fn pick_image<'a>(group: &'a [metadata::Image], fallback: &'a [metadata::Image])
         .map(|i| image_url(i.file_id()))
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 /// An artist's popular tracks followed by tracks of their latest releases.
 pub async fn artist_page(session: &Session, id: &str) -> Result<PageData> {
     let uri = format!("spotify:artist:{id}");
@@ -300,7 +295,6 @@ pub async fn artist_page(session: &Session, id: &str) -> Result<PageData> {
     })
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 pub async fn album_page(session: &Session, id: &str) -> Result<PageData> {
     let uri = format!("spotify:album:{id}");
     let (_, bytes) = fetch_batch(session, std::slice::from_ref(&uri), ExtensionKind::ALBUM_V4)
@@ -325,7 +319,6 @@ pub async fn album_page(session: &Session, id: &str) -> Result<PageData> {
     })
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 pub async fn playlist_page(session: &Session, id: &str) -> Result<PageData> {
     let list = playlist(session, id).await?;
     let uris: Vec<String> = list.items.iter().map(|(u, _)| u.clone()).collect();
@@ -342,7 +335,6 @@ pub async fn playlist_page(session: &Session, id: &str) -> Result<PageData> {
     })
 }
 
-#[allow(dead_code)] // used by the artist pages / artist search that land in the next update
 pub async fn track_page(session: &Session, id: &str) -> Result<PageData> {
     let tracks = ordered_tracks(session, &[format!("spotify:track:{id}")]).await?;
     let t = tracks

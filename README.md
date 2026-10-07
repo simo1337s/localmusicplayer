@@ -8,9 +8,11 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 
 ![Home](docs/screenshots/home.png)
 
-| Now playing + synced lyrics | Playlist |
+| Search (songs + artists everywhere) | Playlist |
 | --- | --- |
-| ![Now playing](docs/screenshots/now-playing.png) | ![Playlist](docs/screenshots/playlist.png) |
+| ![Search](docs/screenshots/search.png) | ![Playlist](docs/screenshots/playlist.png) |
+| **Artist page** | **Full-screen lyrics** |
+| ![Artist](docs/screenshots/artist.png) | ![Now playing](docs/screenshots/now-playing.png) |
 
 ## Features
 
@@ -20,12 +22,14 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
   - **SoundCloud**: imports your likes and playlists (your own and liked ones), searches the catalogue and plays streams.
   - **Apple Music**: imports your library and playlists from a `Library.xml` export or the Apple Music API. Apple Music streams are DRM-protected and can't play on Linux, so each song plays from a matching local file, Spotify track or SoundCloud upload. MultiMusic finds the match automatically and remembers it.
   - **M3U/M3U8** playlist import and export.
+- **Search everything at once**: one search box finds songs *and* artists in your library, on Spotify and on SoundCloud (artist profiles included, so small SoundCloud artists show up too). Results appear per service as soon as each one answers.
+- **Artist pages and links**: click any artist name to see all their songs in your library, or open their Spotify / SoundCloud / Apple Music page. **Paste a link** into the search box to open it, e.g. `https://open.spotify.com/artist/…`, `https://soundcloud.com/someone`, a SoundCloud set, `https://music.apple.com/…/album/…`, a `spotify:` URI, or a `spotify.link` / `on.soundcloud.com` short link. Any page can be saved as a MultiMusic playlist.
 - **Custom playlists that mix sources**: drop a Spotify song, a SoundCloud upload and a FLAC into the same playlist. A cross-source **Liked Songs** collection (♥) also syncs likes back to Spotify and Last.fm.
 - **Synced lyrics**: reads `.lrc` files next to your music, then embedded lyrics tags, then [LRCLIB](https://lrclib.net). Lyrics are shown in a side panel and in a full-screen *Now playing* view with a large cover. Click a line to jump to it.
 - **Discord Rich Presence** shows "Listening to <song>" with the album cover, a progress bar and an "Open in Spotify/SoundCloud" button. Works with the Discord app, Vesktop and arRPC.
 - **Last.fm scrobbling** follows the official rules (half the track or 4 minutes), sends "now playing" updates, and queues scrobbles offline to send later.
 - **MPRIS / media keys**: works with `playerctl`, waybar, polybar, KDE/GNOME media widgets and headset buttons.
-- **A good-looking UI**: a dark, Spotify-style layout whose accent colour follows the current album cover. Includes a queue, search across every source, an albums grid, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window).
+- **Its own look**: graphite and off-white like the logo, rounded "tile" panels, a floating player dock, header cards that glow in the colours of the cover, and soft hover and page transitions. **Drag the edges** of the sidebar and the lyrics / queue panel to resize them (sizes are remembered); drag the sidebar narrow and it becomes a strip of icons and covers. Also: a queue, back / forward navigation, albums and artists grids, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window). The accent colour can be changed in Settings.
 - **Low memory use**: cover art is decoded at the size it's drawn and kept in a small LRU cache, fonts are memory-mapped from your system, and only two runtime threads are used. The window doesn't redraw at all while nothing changes.
 
 ## Install (Arch Linux)
@@ -52,7 +56,7 @@ To run without packaging: `cargo build --release && ./target/release/multimusic`
 
 ## Setting up your accounts
 
-Everything is under **Settings** (gear icon in the sidebar).
+Everything is under **Settings** (bottom of the sidebar).
 
 | Service | What to do |
 | --- | --- |
@@ -65,7 +69,7 @@ Everything is under **Settings** (gear icon in the sidebar).
 
 ## Lossless & hi-res
 
-- Local **FLAC, ALAC, WAV, AIFF, APE and WavPack** play at their native bit depth and sample rate. The player bar shows the format (e.g. `FLAC · 24-bit / 96 kHz`) with a **LOSSLESS** or **HI-RES** badge.
+- Local **FLAC, ALAC, WAV, AIFF, APE and WavPack** play at their native bit depth and sample rate. The player dock shows the format (e.g. `FLAC · 24-bit / 96 kHz`) with a **LOSSLESS** or **HI-RES** badge.
 - **Settings → Playback → Output device** picks the exact output (e.g. your USB DAC). **Bit-perfect output** opens the device exclusively and skips ReplayGain. For true bit-perfect playback, choose an `alsa/hw:…` device, keep MultiMusic's volume at 100% and use your DAC or amp for volume.
 - On **PipeWire**, everything is resampled to PipeWire's rate unless you let it switch rates. Create `~/.config/pipewire/pipewire.conf.d/10-rates.conf`:
 
@@ -86,12 +90,13 @@ Everything is under **Settings** (gear icon in the sidebar).
 | `←` / `→` | Seek −5 s / +5 s |
 | `Ctrl+←` / `Ctrl+→` | Previous / next track |
 | `↑` / `↓` | Volume up / down |
-| `Ctrl+F` | Search |
+| `Ctrl+K`, `Ctrl+F` or `/` | Search (paste a link to open it) |
+| `Alt+←` / `Alt+→`, mouse back / forward buttons | Back / forward |
 | `L` | Toggle the full-screen *Now playing* / lyrics view |
 | `Esc` | Leave the *Now playing* view |
 | `Ctrl+Q` | Quit |
 
-Double-click a song to play it. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like* and *Open in Spotify / Show in folder*.
+Double-click a song to play it. Click an artist name to open the artist. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like* and *Open in Spotify / Show in folder*. Drag the sidebar or the right panel by its edge to resize it; drag the sidebar narrow (or click the logo) for the compact icons-and-covers strip.
 
 ## Memory use
 
@@ -123,6 +128,8 @@ Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 - **Upgrading from Medley**: your settings, library and logins move to the new `multimusic` folders automatically on first start.
 - **Spotify "HTTP 429 Too Many Requests"**: that's the shared Web API key being rate limited. Library import no longer uses it. For search, add your own Spotify app (see *Setting up your accounts*).
 - **Spotify says Premium is required**: playlists and search work on free accounts, but librespot can only stream with Premium.
+- **A pasted Spotify link says "Log in to Spotify"**: Spotify pages load through your Spotify login, so log in under Settings first. SoundCloud and Apple Music links work without an account.
+- **`makepkg` fails in `check()`**: update to the latest commit (`git pull`); an older test could fail when a network port was busy. `makepkg -si --nocheck` skips the tests.
 - **Some SoundCloud tracks won't play**: SoundCloud Go+ tracks only offer 30-second previews to third-party apps, and some tracks are region-locked.
 - **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. MultiMusic loads a CJK font only when your library needs it.
 - **Media keys don't work**: MultiMusic registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has.
@@ -133,10 +140,11 @@ Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 ```
 src/
   main.rs              window + runtime setup
-  service.rs           background service: playback state machine, sync jobs, integrations
+  service.rs           background service: playback state machine, sync jobs, search, pages, integrations
+  links.rs             recognises pasted Spotify / SoundCloud / Apple Music links
   player/              play queue, mpv (JSON IPC) engine, librespot engine + Spotify OAuth
   library/             SQLite store, incremental tag scanner (lofty), M3U import/export
-  providers/           Spotify Web API, SoundCloud api-v2, Apple Music (XML + API)
+  providers/           Spotify (session + Web API), SoundCloud api-v2, Apple Music (XML + catalog API)
   integrations/        lyrics (LRC/LRCLIB), Last.fm, Discord RPC, MPRIS
   ui/                  egui views, theme, widgets, cover art cache
 ```

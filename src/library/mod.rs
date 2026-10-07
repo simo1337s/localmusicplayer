@@ -24,6 +24,18 @@ pub struct Album {
     pub track_ids: Vec<String>,
 }
 
+/// An artist with songs in the library (local files or any playlist).
+#[derive(Debug, Clone)]
+pub struct Artist {
+    pub name: String,
+    /// Lower-cased name; the artist page is `local:artist:<key>`.
+    pub key: String,
+    /// Cover of one of their songs (there are no artist pictures for library artists).
+    pub art: Option<String>,
+    /// Local files first (by album and track number), then everything else by title.
+    pub track_ids: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Library {
     pub tracks: HashMap<String, Track>,
@@ -31,6 +43,8 @@ pub struct Library {
     /// Local track ids sorted by artist, album, track number.
     pub local: Vec<String>,
     pub albums: Vec<Album>,
+    /// Artists with the most songs first.
+    pub artists: Vec<Artist>,
     /// Recently played track ids, newest first.
     pub recent: Vec<String>,
     /// Bumped on every change so views can invalidate caches.
@@ -38,6 +52,8 @@ pub struct Library {
     liked: HashSet<String>,
     /// match key -> local track id, to play imported songs from local files.
     local_match: HashMap<String, String>,
+    /// Artist key -> index into `artists`.
+    artist_index: HashMap<String, usize>,
 }
 
 impl Library {
@@ -99,7 +115,97 @@ impl Library {
             .map(|p| p.track_ids.iter().cloned().collect())
             .unwrap_or_default();
         self.sort_playlists();
+        self.index_artists();
         self.version += 1;
+    }
+
+    /// Groups local files and playlist songs by artist.
+    fn index_artists(&mut self) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let members: Vec<&Track> = self
+            .local
+            .iter()
+            .chain(self.playlists.iter().flat_map(|p| p.track_ids.iter()))
+            .filter(|id| seen.insert(id.as_str()))
+            .filter_map(|id| self.tracks.get(id))
+            .collect();
+        let solo: HashSet<String> = members.iter().map(|t| t.artist.trim().to_lowercase()).collect();
+
+        let mut artists: Vec<Artist> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
+        for t in &members {
+            for name in credited_artists(&t.artist, &solo) {
+                let key = name.to_lowercase();
+                let i = *index.entry(key.clone()).or_insert_with(|| {
+                    artists.push(Artist {
+                        name: name.to_string(),
+                        key,
+                        art: None,
+                        track_ids: Vec::new(),
+                    });
+                    artists.len() - 1
+                });
+                let a = &mut artists[i];
+                a.track_ids.push(t.id.clone());
+                if a.art.is_none() {
+                    a.art = t.art.clone();
+                }
+            }
+        }
+        for a in &mut artists {
+            let tracks = &self.tracks;
+            a.track_ids.sort_by_cached_key(|id| {
+                let t = &tracks[id];
+                let local = t.source == Source::Local;
+                (
+                    !local,
+                    if local { sort_key(&t.album) } else { String::new() },
+                    if local { t.track_no.unwrap_or(0) } else { 0 },
+                    sort_key(&t.title),
+                )
+            });
+        }
+        artists.sort_by(|a, b| {
+            b.track_ids
+                .len()
+                .cmp(&a.track_ids.len())
+                .then_with(|| sort_key(&a.name).cmp(&sort_key(&b.name)))
+        });
+        self.artist_index = artists.iter().enumerate().map(|(i, a)| (a.key.clone(), i)).collect();
+        self.artists = artists;
+    }
+
+    pub fn artist(&self, key: &str) -> Option<&Artist> {
+        self.artist_index
+            .get(&key.to_lowercase())
+            .and_then(|&i| self.artists.get(i))
+    }
+
+    /// Library artists whose name contains every word of `query`; exact and prefix matches first.
+    pub fn search_artists(&self, query: &str, limit: usize) -> Vec<&Artist> {
+        let q = query.trim().to_lowercase();
+        let terms: Vec<&str> = q.split_whitespace().collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<(u8, usize, &Artist)> = self
+            .artists
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| terms.iter().all(|term| a.key.contains(term)))
+            .map(|(i, a)| {
+                let rank = if a.key == q {
+                    0
+                } else if a.key.starts_with(&q) {
+                    1
+                } else {
+                    2
+                };
+                (rank, i, a)
+            })
+            .collect();
+        hits.sort_by_key(|&(rank, i, _)| (rank, i));
+        hits.into_iter().take(limit).map(|(_, _, a)| a).collect()
     }
 
     fn sort_playlists(&mut self) {
@@ -178,6 +284,39 @@ impl Library {
     }
 }
 
+/// The artists credited on a track. "A, B" is split only when "A" also appears as an artist on
+/// its own (so "Tyler, The Creator" stays one name); featured artists are dropped.
+pub fn credited_artists<'a>(artist: &'a str, solo: &HashSet<String>) -> Vec<&'a str> {
+    const FEATURING: &[&str] = &[" feat. ", " feat ", " ft. ", " featuring ", " (feat. "];
+    let main_len = artist
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|&i| {
+            FEATURING.iter().any(|sep| {
+                artist
+                    .get(i..i + sep.len())
+                    .is_some_and(|s| s.eq_ignore_ascii_case(sep))
+            })
+        })
+        .unwrap_or(artist.len());
+    let main = artist[..main_len].trim();
+    if main.is_empty() {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = main.split(", ").map(str::trim).filter(|p| !p.is_empty()).collect();
+    if parts.len() > 1 && solo.contains(&parts[0].to_lowercase()) {
+        let mut out: Vec<&str> = Vec::with_capacity(parts.len());
+        for p in parts {
+            if !out.iter().any(|o| o.eq_ignore_ascii_case(p)) {
+                out.push(p);
+            }
+        }
+        out
+    } else {
+        vec![main]
+    }
+}
+
 pub fn liked_playlist() -> Playlist {
     Playlist {
         id: LIKED_ID.into(),
@@ -239,5 +378,51 @@ mod tests {
         let hits = lib.search("waterloo", 10);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source, Source::Local);
+    }
+
+    #[test]
+    fn credits_split_only_known_artists() {
+        let solo: HashSet<String> = ["daft punk", "abba"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            credited_artists("Daft Punk, Pharrell Williams", &solo),
+            vec!["Daft Punk", "Pharrell Williams"]
+        );
+        assert_eq!(
+            credited_artists("Tyler, The Creator", &solo),
+            vec!["Tyler, The Creator"]
+        );
+        assert_eq!(credited_artists("ABBA feat. Someone", &solo), vec!["ABBA"]);
+        assert_eq!(credited_artists("Artist FT. Guest", &solo), vec!["Artist"]);
+        assert_eq!(credited_artists("Beyoncé (feat. Jay-Z)", &solo), vec!["Beyoncé"]);
+        assert_eq!(credited_artists("  ", &solo), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn indexes_artists_from_files_and_playlists() {
+        let mut lib = Library::default();
+        for tr in [
+            t("local:/a2", "Abba", "Gold", "SOS", 2),
+            t("local:/a1", "Abba", "Gold", "Waterloo", 1),
+            t("spotify:track:1", "Daft Punk", "Discovery", "One More Time", 1),
+            t("spotify:track:2", "Daft Punk, Pharrell Williams", "RAM", "Get Lucky", 8),
+            t("spotify:track:3", "Not In Any Playlist", "X", "Y", 1),
+        ] {
+            lib.tracks.insert(tr.id.clone(), tr);
+        }
+        let mut p = liked_playlist();
+        p.track_ids = vec!["spotify:track:2".into(), "spotify:track:1".into(), "local:/a1".into()];
+        lib.playlists.push(p);
+        lib.reindex();
+        let names: Vec<&str> = lib.artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Abba", "Daft Punk", "Pharrell Williams"]);
+        assert_eq!(lib.artist("ABBA").unwrap().track_ids, vec!["local:/a1", "local:/a2"]);
+        assert_eq!(
+            lib.artist("daft punk").unwrap().track_ids,
+            vec!["spotify:track:2", "spotify:track:1"]
+        );
+        assert!(lib.artist("not in any playlist").is_none());
+        let found: Vec<&str> = lib.search_artists("punk", 5).iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(found, vec!["Daft Punk"]);
+        assert_eq!(lib.search_artists("p", 5)[0].name, "Pharrell Williams");
     }
 }
