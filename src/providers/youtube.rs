@@ -472,8 +472,17 @@ mod tests {
     fn fake_ytdlp(dir: &Path, name: &str, body: &str) -> String {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(&path, format!("#!/bin/sh\n[ \"$1\" = --probe ] && exit 0\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Another test starting a process while this file was open for writing can leave the
+        // child holding it for a moment, and running it then fails with "Text file busy".
+        for _ in 0..100 {
+            match std::process::Command::new(&path).arg("--probe").status() {
+                Ok(_) => break,
+                Err(e) if e.raw_os_error() == Some(26) => std::thread::sleep(Duration::from_millis(20)),
+                Err(e) => panic!("can't run {}: {e}", path.display()),
+            }
+        }
         path.to_string_lossy().into_owned()
     }
 
@@ -527,8 +536,8 @@ echo "mmfile $file""#,
         let failing = fake_ytdlp(
             &dir,
             "failing",
-            r#"for a; do last="$a"; done
-touch "$4/.multimusic-yt-abcdefghijk.webm.part" 2>/dev/null
+            r#"while [ $# -gt 0 ]; do [ "$1" = --paths ] && dir="$2"; shift; done
+touch "$dir/.multimusic-yt-abcdefghijk.webm.part"
 echo "ERROR: [youtube] abcdefghijk: Video unavailable" >&2
 exit 1"#,
         );
