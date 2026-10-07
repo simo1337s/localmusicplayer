@@ -1,1 +1,1229 @@
-//! TODO
+//! SoundCloud provider built on the (undocumented) `api-v2.soundcloud.com` API that the
+//! soundcloud.com web app uses.
+//!
+//! * The API needs a `client_id`. Unless the user configured one, it is scraped from the JS
+//!   bundles referenced by the soundcloud.com homepage and cached in memory. When the API starts
+//!   rejecting it (401/403) the cache is dropped and the id is scraped again once.
+//! * An optional `oauth_token` (the cookie of a logged-in browser session) is sent as
+//!   `Authorization: OAuth <token>` and unlocks private likes/playlists and Go+ streams.
+//! * `stream_url` turns a track into a direct media URL (progressive MP3 or an HLS playlist)
+//!   that mpv can play.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, bail, Context, Result};
+use regex::Regex;
+use reqwest::header::{HeaderMap, ACCEPT, AUTHORIZATION, RETRY_AFTER, USER_AGENT};
+use reqwest::{StatusCode, Url};
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use crate::model::{ImportedPlaylist, Source, Track};
+
+const API_BASE: &str = "https://api-v2.soundcloud.com";
+const WEB_BASE: &str = "https://soundcloud.com/";
+/// soundcloud.com serves its regular page (with the asset bundles) to browsers; use a browser
+/// user agent for the scraping requests only.
+const BROWSER_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+/// Maximum number of liked tracks imported.
+const MAX_LIKES: usize = 5000;
+/// Maximum number of own / liked playlists imported (each).
+const MAX_PLAYLISTS: usize = 1000;
+/// Track ids per `GET /tracks?ids=` request.
+const TRACK_BATCH: usize = 50;
+/// Safety net against pagination loops.
+const MAX_PAGES: usize = 200;
+/// How often a 429 response is retried.
+const MAX_429_RETRIES: u32 = 3;
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(2);
+/// A client_id scraped less than this long ago is considered fresh: a 401/403 then means the
+/// resource itself is forbidden, so re-scraping would not help.
+const MIN_RESCRAPE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A SoundCloud account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScUser {
+    pub id: u64,
+    pub username: String,
+    /// Avatar URL (500x500), `None` for the default avatar.
+    pub avatar: Option<String>,
+    pub permalink_url: String,
+}
+
+/// SoundCloud api-v2 client. Cheap to share behind an `Arc`; all methods take `&self`.
+pub struct SoundCloud {
+    http: reqwest::Client,
+    /// Scraped client_id and when it was scraped.
+    client_id: Mutex<Option<(String, Instant)>>,
+    client_id_override: Option<String>,
+    oauth_token: Option<String>,
+    /// Set once SoundCloud rejected the OAuth token; anonymous requests then stop sending it.
+    token_rejected: AtomicBool,
+}
+
+impl SoundCloud {
+    /// Empty strings mean "not set".
+    pub fn new(http: reqwest::Client, client_id_override: &str, oauth_token: &str) -> Self {
+        let client_id_override = Some(client_id_override.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        // Accept the token with or without the "OAuth " prefix the web app uses.
+        let token = oauth_token.trim();
+        let token = token.strip_prefix("OAuth ").unwrap_or(token).trim();
+        let oauth_token = Some(token).filter(|s| !s.is_empty()).map(str::to_owned);
+        Self {
+            http,
+            client_id: Mutex::new(None),
+            client_id_override,
+            oauth_token,
+            token_rejected: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns API client_id: override if set, else scraped from soundcloud.com and cached in memory.
+    pub async fn client_id(&self) -> Result<String> {
+        if let Some(id) = &self.client_id_override {
+            return Ok(id.clone());
+        }
+        // Holding the lock while scraping makes concurrent callers wait for a single scrape.
+        let mut cached = self.client_id.lock().await;
+        if let Some((id, _)) = cached.as_ref() {
+            return Ok(id.clone());
+        }
+        let id = self.scrape_client_id().await?;
+        *cached = Some((id.clone(), Instant::now()));
+        Ok(id)
+    }
+
+    /// Resolves a profile URL (or bare username) to the user.
+    pub async fn resolve_user(&self, profile_url: &str) -> Result<ScUser> {
+        let url = normalize_profile_url(profile_url)?;
+        let v = self
+            .get_json(&api("/resolve"), &[("url", url.as_str())])
+            .await
+            .with_context(|| format!("couldn't resolve SoundCloud profile {url}"))?;
+        match v.get("kind").and_then(Value::as_str) {
+            Some("user") | None => {}
+            Some(kind) => bail!("{url} is a SoundCloud {kind}, not a profile"),
+        }
+        parse_user(&v).with_context(|| format!("unexpected response resolving {url}"))
+    }
+
+    /// The account the OAuth token belongs to.
+    pub async fn me(&self) -> Result<ScUser> {
+        if self.oauth_token.is_none() {
+            bail!("no SoundCloud OAuth token configured");
+        }
+        let v = self
+            .request_json(&api("/me"), &[], true)
+            .await
+            .context("couldn't fetch the SoundCloud account for the OAuth token")?;
+        parse_user(&v).context("unexpected response from SoundCloud /me")
+    }
+
+    /// All liked tracks (up to 5000), newest first. `added_at` is the time of the like.
+    pub async fn likes(&self, user_id: u64) -> Result<Vec<Track>> {
+        let items = self
+            .paginate(
+                &api(&format!("/users/{user_id}/track_likes")),
+                &[("limit", "200"), ("linked_partitioning", "1")],
+                MAX_LIKES,
+            )
+            .await
+            .context("couldn't fetch SoundCloud likes")?;
+
+        // Likes normally carry full track objects; fetch any compact ones in bulk.
+        let mut full: HashMap<u64, Track> = HashMap::new();
+        let mut order: Vec<(u64, i64)> = Vec::with_capacity(items.len());
+        let mut missing = Vec::new();
+        for item in &items {
+            let Some(t) = item.get("track") else { continue };
+            let Some(id) = json_id(t) else { continue };
+            let liked_at = item
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(parse_timestamp)
+                .unwrap_or(0);
+            match parse_track(t) {
+                Some(track) => {
+                    full.insert(id, track);
+                }
+                None => missing.push(id),
+            }
+            order.push((id, liked_at));
+        }
+        if !missing.is_empty() {
+            self.fetch_tracks(&missing, &[], &mut full).await?;
+        }
+
+        let mut seen = HashSet::new();
+        let tracks: Vec<Track> = order
+            .into_iter()
+            .filter(|(id, _)| seen.insert(*id))
+            .filter_map(|(id, liked_at)| {
+                let mut t = full.get(&id)?.clone();
+                t.added_at = liked_at;
+                Some(t)
+            })
+            .collect();
+        info!("SoundCloud: {} liked tracks for user {user_id}", tracks.len());
+        Ok(tracks)
+    }
+
+    /// The user's own playlists followed by the playlists they liked, with full track lists.
+    /// A playlist that can't be loaded (e.g. a liked playlist that went private) is skipped.
+    pub async fn playlists(&self, user_id: u64) -> Result<Vec<ImportedPlaylist>> {
+        let params = [("limit", "50"), ("linked_partitioning", "1")];
+        let own = match self
+            .paginate(&api(&format!("/users/{user_id}/playlists_without_albums")), &params, MAX_PLAYLISTS)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("SoundCloud playlists_without_albums failed ({e:#}); falling back to /playlists");
+                self.paginate(&api(&format!("/users/{user_id}/playlists")), &params, MAX_PLAYLISTS)
+                    .await
+                    .context("couldn't fetch SoundCloud playlists")?
+            }
+        };
+        let liked: Vec<Value> = match self
+            .paginate(&api(&format!("/users/{user_id}/playlist_likes")), &params, MAX_PLAYLISTS)
+            .await
+        {
+            Ok(items) => items
+                .into_iter()
+                .filter_map(|mut item| item.get_mut("playlist").map(Value::take))
+                .collect(),
+            Err(e) => {
+                warn!("SoundCloud: couldn't fetch liked playlists: {e:#}");
+                Vec::new()
+            }
+        };
+
+        let mut seen = HashSet::new();
+        let mut cache: HashMap<u64, Track> = HashMap::new();
+        let mut out = Vec::new();
+        for pl in own.into_iter().chain(liked) {
+            let Some(id) = json_id(&pl) else { continue };
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.load_playlist(pl, &mut cache).await {
+                Ok(p) => out.push(p),
+                Err(e) => warn!("SoundCloud: skipping playlist {id}: {e:#}"),
+            }
+        }
+        info!("SoundCloud: {} playlists for user {user_id}", out.len());
+        Ok(out)
+    }
+
+    /// Track search.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Track>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let page_size = limit.min(200).to_string();
+        let items = self
+            .paginate(
+                &api("/search/tracks"),
+                &[("q", query), ("limit", page_size.as_str()), ("linked_partitioning", "1")],
+                limit,
+            )
+            .await
+            .with_context(|| format!("SoundCloud search for \"{query}\" failed"))?;
+        Ok(items.iter().filter_map(parse_track).collect())
+    }
+
+    /// Direct stream URL for mpv. Accepts a Track whose id is "soundcloud:<numeric id>" (uri = permalink URL).
+    pub async fn stream_url(&self, track: &Track) -> Result<String> {
+        let json = self.track_json(track).await?;
+        let title = json
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(track.title.as_str())
+            .to_owned();
+
+        let policy = json.get("policy").and_then(Value::as_str).unwrap_or("");
+        if policy.eq_ignore_ascii_case("BLOCK") {
+            bail!("\"{title}\" is not available in your region (blocked by SoundCloud)");
+        }
+        let transcodings: &[Value] = json
+            .get("media")
+            .and_then(|m| m.get("transcodings"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let Some(chosen) = pick_transcoding(transcodings) else {
+            bail!(
+                "\"{title}\" has no playable stream on SoundCloud \
+                 (not available in your region / Go+ only)"
+            );
+        };
+        if chosen.get("snipped").and_then(Value::as_bool) == Some(true) {
+            warn!("SoundCloud: only a 30 second preview of \"{title}\" is available (Go+ track)");
+        }
+        let endpoint = chosen
+            .get("url")
+            .and_then(Value::as_str)
+            .context("transcoding without url")?;
+        // (Computed outside the macro: tracing's macros shadow `Value`.)
+        let protocol = chosen.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("?");
+        let mime = chosen.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("?");
+        debug!("SoundCloud: streaming \"{title}\" as {protocol} {mime}");
+
+        let mut params = Vec::new();
+        if let Some(auth) = json.get("track_authorization").and_then(Value::as_str) {
+            params.push(("track_authorization", auth));
+        }
+        let resp = self
+            .get_json(endpoint, &params)
+            .await
+            .with_context(|| format!("couldn't get a stream URL for \"{title}\""))?;
+        resp.get("url")
+            .and_then(Value::as_str)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned)
+            .with_context(|| format!("SoundCloud returned no stream URL for \"{title}\""))
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Internals
+    // ---------------------------------------------------------------------------------------
+
+    /// Full api-v2 JSON of a track: by numeric id, falling back to resolving the permalink.
+    async fn track_json(&self, track: &Track) -> Result<Value> {
+        let numeric = track
+            .id
+            .strip_prefix("soundcloud:")
+            .and_then(|rest| rest.rsplit(':').next())
+            .and_then(|s| s.parse::<u64>().ok());
+        let permalink = Some(track.uri.as_str()).filter(|u| u.starts_with("http"));
+
+        let by_id = match numeric {
+            Some(id) => match self.get_json(&api(&format!("/tracks/{id}")), &[]).await {
+                Ok(v) => return Ok(v),
+                Err(e) => Some(e),
+            },
+            None => None,
+        };
+        let Some(url) = permalink else {
+            return Err(by_id.unwrap_or_else(|| {
+                anyhow!("\"{}\" ({}) is not a SoundCloud track", track.title, track.id)
+            }));
+        };
+        if let Some(e) = &by_id {
+            debug!("SoundCloud: /tracks lookup for {} failed ({e:#}); resolving {url}", track.id);
+        }
+        match self.get_json(&api("/resolve"), &[("url", url)]).await {
+            Ok(v) if v.get("kind").and_then(Value::as_str) == Some("track") => Ok(v),
+            Ok(_) => Err(anyhow!("{url} is not a SoundCloud track")),
+            Err(e) => Err(by_id.unwrap_or(e)),
+        }
+        .with_context(|| format!("couldn't load \"{}\" from SoundCloud", track.title))
+    }
+
+    /// Fills in a playlist's track list (fetching compact track stubs in bulk) and converts it.
+    async fn load_playlist(
+        &self,
+        mut pl: Value,
+        cache: &mut HashMap<u64, Track>,
+    ) -> Result<ImportedPlaylist> {
+        let id = json_id(&pl).context("playlist without id")?;
+        let track_count = pl.get("track_count").and_then(Value::as_u64).unwrap_or(0);
+        let has_tracks = pl
+            .get("tracks")
+            .and_then(Value::as_array)
+            .is_some_and(|t| !t.is_empty());
+        if !has_tracks && track_count > 0 {
+            pl = self
+                .get_json(&api(&format!("/playlists/{id}")), &[])
+                .await
+                .context("couldn't fetch playlist")?;
+        }
+
+        let entries = pl.get("tracks").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let mut order = Vec::with_capacity(entries.len());
+        let mut missing = Vec::new();
+        for entry in entries {
+            let Some(tid) = json_id(entry) else { continue };
+            if let Some(track) = parse_track(entry) {
+                cache.insert(tid, track);
+            } else if !cache.contains_key(&tid) {
+                missing.push(tid);
+            }
+            order.push(tid);
+        }
+        if !missing.is_empty() {
+            let pid = id.to_string();
+            let mut extra = vec![("playlistId", pid.as_str())];
+            if let Some(secret) = pl.get("secret_token").and_then(Value::as_str) {
+                extra.push(("playlistSecretToken", secret));
+            }
+            self.fetch_tracks(&missing, &extra, cache).await?;
+        }
+        Ok(assemble_playlist(&pl, &order, cache))
+    }
+
+    /// Fetches full track objects for `ids` (in batches) into `into`. Unavailable tracks are
+    /// silently absent from SoundCloud's answer.
+    async fn fetch_tracks(
+        &self,
+        ids: &[u64],
+        extra: &[(&str, &str)],
+        into: &mut HashMap<u64, Track>,
+    ) -> Result<()> {
+        let mut unique: Vec<u64> = ids.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        for chunk in unique.chunks(TRACK_BATCH) {
+            let joined = chunk.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            let mut params = vec![("ids", joined.as_str())];
+            params.extend_from_slice(extra);
+            let v = self
+                .get_json(&api("/tracks"), &params)
+                .await
+                .context("couldn't fetch SoundCloud tracks")?;
+            let list = v
+                .as_array()
+                .or_else(|| v.get("collection").and_then(Value::as_array))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for t in list {
+                if let (Some(id), Some(track)) = (json_id(t), parse_track(t)) {
+                    into.insert(id, track);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Collects `collection` items of a linked-partitioning endpoint, following `next_href`.
+    async fn paginate(&self, url: &str, params: &[(&str, &str)], cap: usize) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut page = self.get_json(url, params).await?;
+        let mut current = url.to_owned();
+        let mut empty_pages = 0;
+        for _ in 0..MAX_PAGES {
+            let next = page
+                .get("next_href")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let items = match page.get_mut("collection").map(Value::take) {
+                Some(Value::Array(items)) => items,
+                _ => match page {
+                    Value::Array(items) => items,
+                    _ => Vec::new(),
+                },
+            };
+            empty_pages = if items.is_empty() { empty_pages + 1 } else { 0 };
+            out.extend(items);
+            if out.len() >= cap {
+                out.truncate(cap);
+                return Ok(out);
+            }
+            match next {
+                Some(next) if next != current && empty_pages < 2 => {
+                    page = self.get_json(&next, &[]).await?;
+                    current = next;
+                }
+                _ => return Ok(out),
+            }
+        }
+        warn!("SoundCloud: stopped paginating {} after {MAX_PAGES} pages", url_path(url));
+        Ok(out)
+    }
+
+    async fn get_json(&self, url: &str, params: &[(&str, &str)]) -> Result<Value> {
+        self.request_json(url, params, false).await
+    }
+
+    /// GET an api-v2 URL with `client_id` (+ OAuth header when available), handling client_id
+    /// expiry (401/403 → re-scrape once), rejected OAuth tokens and rate limiting.
+    async fn request_json(
+        &self,
+        url: &str,
+        params: &[(&str, &str)],
+        require_auth: bool,
+    ) -> Result<Value> {
+        let what = url_path(url);
+        let mut rescraped = false;
+        loop {
+            let cid = self.client_id().await?;
+            let full = build_url(url, params, &cid)?;
+            let token = self.token(require_auth);
+            let mut req = self.http.get(full).header(ACCEPT, "application/json");
+            if let Some(token) = token {
+                req = req.header(AUTHORIZATION, format!("OAuth {token}"));
+            }
+            let resp = self.send_throttled(req, &what).await?;
+            let status = resp.status();
+            if status.is_success() {
+                return resp
+                    .json::<Value>()
+                    .await
+                    .with_context(|| format!("invalid JSON from SoundCloud {what}"));
+            }
+
+            let denied = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+            if denied && !rescraped && self.client_id_override.is_none() {
+                rescraped = true;
+                if self.invalidate_client_id(&cid).await {
+                    warn!("SoundCloud: HTTP {status} for {what}; refreshing client_id and retrying");
+                    continue;
+                }
+            }
+            if status == StatusCode::UNAUTHORIZED && token.is_some() && !require_auth {
+                warn!(
+                    "SoundCloud rejected the OAuth token (expired?); continuing without it. \
+                     Update the oauth_token in the settings."
+                );
+                self.token_rejected.store(true, Ordering::Relaxed);
+                continue;
+            }
+            let body = resp.text().await.unwrap_or_default();
+            return Err(status_error(status, &what, &body, token.is_some()));
+        }
+    }
+
+    /// The OAuth token to send, if any.
+    fn token(&self, require_auth: bool) -> Option<&str> {
+        let token = self.oauth_token.as_deref()?;
+        (require_auth || !self.token_rejected.load(Ordering::Relaxed)).then_some(token)
+    }
+
+    /// Sends a request, waiting out 429 responses (Retry-After, default 2s) up to 3 times.
+    async fn send_throttled(
+        &self,
+        req: reqwest::RequestBuilder,
+        what: &str,
+    ) -> Result<reqwest::Response> {
+        let mut attempts = 0;
+        loop {
+            let attempt = req.try_clone().context("request can't be retried")?;
+            let resp = attempt
+                .send()
+                .await
+                .with_context(|| format!("request to SoundCloud {what} failed"))?;
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS && attempts < MAX_429_RETRIES {
+                attempts += 1;
+                let wait = retry_after(resp.headers());
+                warn!("SoundCloud rate limit on {what}; retrying in {wait:?} ({attempts}/{MAX_429_RETRIES})");
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
+    /// Drops the cached client_id after it was rejected. Returns whether retrying makes sense.
+    async fn invalidate_client_id(&self, rejected: &str) -> bool {
+        let mut cached = self.client_id.lock().await;
+        match cached.as_ref() {
+            Some((id, scraped)) if id == rejected => {
+                if scraped.elapsed() < MIN_RESCRAPE_INTERVAL {
+                    // Just scraped: the id is fine, access to the resource itself is denied.
+                    return false;
+                }
+                *cached = None;
+                true
+            }
+            // Another request already refreshed (or is refreshing) it.
+            _ => true,
+        }
+    }
+
+    async fn scrape_client_id(&self) -> Result<String> {
+        info!("SoundCloud: scraping an API client_id from soundcloud.com");
+        let html = self
+            .fetch_text(WEB_BASE)
+            .await
+            .context("couldn't load soundcloud.com to find an API client_id")?;
+        if let Some(id) = extract_client_id(&html) {
+            return Ok(id);
+        }
+        let scripts = extract_script_urls(&html);
+        if scripts.is_empty() {
+            bail!("no script bundles found on soundcloud.com; set a client_id in the settings");
+        }
+        // The id usually lives in one of the last bundles.
+        for url in scripts.iter().rev() {
+            match self.fetch_text(url).await {
+                Ok(js) => {
+                    if let Some(id) = extract_client_id(&js) {
+                        debug!("SoundCloud: found client_id in {url}");
+                        return Ok(id);
+                    }
+                }
+                Err(e) => debug!("SoundCloud: couldn't fetch {url}: {e:#}"),
+            }
+        }
+        bail!(
+            "couldn't find an API client_id in soundcloud.com's scripts; \
+             set a client_id in the settings"
+        )
+    }
+
+    async fn fetch_text(&self, url: &str) -> Result<String> {
+        let req = self.http.get(url).header(USER_AGENT, BROWSER_UA);
+        let resp = self.send_throttled(req, url).await?;
+        let resp = resp.error_for_status()?;
+        Ok(resp.text().await?)
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// JSON mapping
+// -------------------------------------------------------------------------------------------
+
+/// Maps an api-v2 track JSON object to a [`Track`]. Returns `None` for compact stubs (objects
+/// without a title) and for non-track objects.
+pub fn parse_track(v: &Value) -> Option<Track> {
+    if v.get("kind").and_then(Value::as_str).is_some_and(|k| k != "track") {
+        return None;
+    }
+    let id = json_id(v)?;
+    let title = v.get("title")?.as_str()?.trim().to_owned();
+    let user = v.get("user");
+    let meta = v.get("publisher_metadata");
+
+    let artist = meta
+        .and_then(|m| non_empty(m.get("artist")))
+        .or_else(|| user.and_then(|u| non_empty(u.get("username"))))
+        .unwrap_or_default()
+        .to_owned();
+    let album = meta
+        .and_then(|m| non_empty(m.get("album_title")))
+        .unwrap_or_default()
+        .to_owned();
+    let duration_ms = v
+        .get("full_duration")
+        .and_then(Value::as_u64)
+        .filter(|&d| d > 0)
+        .or_else(|| v.get("duration").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let art = non_empty(v.get("artwork_url"))
+        .or_else(|| user.and_then(|u| non_empty(u.get("avatar_url"))))
+        .filter(|u| !is_default_avatar(u))
+        .map(upscale_art);
+    let uri = non_empty(v.get("permalink_url")).unwrap_or_default().to_owned();
+
+    Some(Track {
+        id: Track::soundcloud_id(id),
+        source: Source::SoundCloud,
+        title,
+        artist,
+        album,
+        duration_ms,
+        track_no: None,
+        art,
+        uri,
+        added_at: 0,
+    })
+}
+
+fn parse_user(v: &Value) -> Option<ScUser> {
+    let id = json_id(v)?;
+    let username = non_empty(v.get("username"))?.to_owned();
+    let avatar = non_empty(v.get("avatar_url"))
+        .filter(|u| !is_default_avatar(u))
+        .map(upscale_art);
+    let permalink_url = non_empty(v.get("permalink_url"))
+        .map(str::to_owned)
+        .or_else(|| non_empty(v.get("permalink")).map(|p| format!("https://soundcloud.com/{p}")))
+        .unwrap_or_default();
+    Some(ScUser { id, username, avatar, permalink_url })
+}
+
+/// Builds the playlist from its JSON and the (ordered) track ids, looking the tracks up in
+/// `tracks`. Ids that couldn't be loaded are dropped.
+fn assemble_playlist(pl: &Value, order: &[u64], tracks: &HashMap<u64, Track>) -> ImportedPlaylist {
+    let tracks: Vec<Track> = order.iter().filter_map(|id| tracks.get(id).cloned()).collect();
+    let art = non_empty(pl.get("artwork_url"))
+        .map(upscale_art)
+        .or_else(|| tracks.iter().find_map(|t| t.art.clone()));
+    ImportedPlaylist {
+        remote_id: json_id(pl).map(|id| id.to_string()).unwrap_or_default(),
+        name: non_empty(pl.get("title")).unwrap_or("Untitled playlist").to_owned(),
+        description: non_empty(pl.get("description")).unwrap_or_default().to_owned(),
+        art,
+        tracks,
+    }
+}
+
+/// Numeric `id` field (SoundCloud ids are numbers, tolerate numeric strings).
+fn json_id(v: &Value) -> Option<u64> {
+    match v.get("id")? {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse().ok(),
+        _ => None,
+    }
+}
+
+fn non_empty(v: Option<&Value>) -> Option<&str> {
+    v.and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// SoundCloud image URLs come in fixed sizes; "-large" is 100x100, "-t500x500" is 500x500.
+fn upscale_art(url: &str) -> String {
+    url.replace("-large.", "-t500x500.")
+}
+
+fn is_default_avatar(url: &str) -> bool {
+    url.contains("default_avatar")
+}
+
+/// Picks the best transcoding mpv can play: progressive MP3 > HLS Opus > HLS MP3 > HLS AAC >
+/// anything else. Snipped (30s preview) streams are used only when nothing else exists, and
+/// DRM encrypted streams never.
+fn pick_transcoding(transcodings: &[Value]) -> Option<&Value> {
+    fn rank(t: &Value) -> Option<u32> {
+        t.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+        let protocol = t.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("");
+        let mime = t.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
+        if protocol.contains("encrypted") {
+            return None;
+        }
+        let format = match (protocol, mime) {
+            ("progressive", m) if m.starts_with("audio/mpeg") => 0,
+            ("hls", m) if m.starts_with("audio/ogg") => 1,
+            ("hls", m) if m.starts_with("audio/mpeg") => 2,
+            ("hls", m) if m.starts_with("audio/mp4") => 3,
+            _ => 4,
+        };
+        let snipped = t.get("snipped").and_then(Value::as_bool).unwrap_or(false);
+        let hq = t.get("quality").and_then(Value::as_str) == Some("hq");
+        Some(u32::from(snipped) * 100 + format * 2 + u32::from(!hq))
+    }
+    transcodings
+        .iter()
+        .filter_map(|t| rank(t).map(|r| (r, t)))
+        .min_by_key(|(r, _)| *r)
+        .map(|(_, t)| t)
+}
+
+// -------------------------------------------------------------------------------------------
+// client_id scraping
+// -------------------------------------------------------------------------------------------
+
+static SCRIPT_SRC_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).expect("valid regex")
+});
+
+static CLIENT_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"client_id\s*[:=]\s*"([a-zA-Z0-9]{32})"|client_id=([a-zA-Z0-9]{32})\b"#)
+        .expect("valid regex")
+});
+
+/// Asset bundle URLs (`https://a-v2.sndcdn.com/assets/*.js`) referenced by the homepage, in
+/// page order.
+fn extract_script_urls(html: &str) -> Vec<String> {
+    SCRIPT_SRC_RE
+        .captures_iter(html)
+        .filter_map(|c| c.get(1))
+        .map(|m| m.as_str())
+        .filter(|src| src.contains("sndcdn.com/assets/") && src.contains(".js"))
+        .map(|src| match src.strip_prefix("//") {
+            Some(rest) => format!("https://{rest}"),
+            None => src.to_owned(),
+        })
+        .collect()
+}
+
+fn extract_client_id(text: &str) -> Option<String> {
+    let caps = CLIENT_ID_RE.captures(text)?;
+    caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str().to_owned())
+}
+
+// -------------------------------------------------------------------------------------------
+// Small helpers
+// -------------------------------------------------------------------------------------------
+
+fn api(path: &str) -> String {
+    format!("{API_BASE}{path}")
+}
+
+/// `url` with `params` and `client_id` added. Any `client_id` already present (e.g. in a
+/// `next_href`) is replaced so a refreshed id is always used.
+fn build_url(url: &str, params: &[(&str, &str)], client_id: &str) -> Result<Url> {
+    let mut url = Url::parse(url).with_context(|| format!("invalid SoundCloud URL: {url}"))?;
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| k != "client_id")
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (k, v) in &kept {
+            query.append_pair(k, v);
+        }
+        for (k, v) in params {
+            query.append_pair(k, v);
+        }
+        query.append_pair("client_id", client_id);
+    }
+    Ok(url)
+}
+
+/// The path of a URL, for logs and errors (never includes query parameters / credentials).
+fn url_path(url: &str) -> String {
+    Url::parse(url)
+        .map(|u| u.path().to_owned())
+        .unwrap_or_else(|_| url.split('?').next().unwrap_or(url).to_owned())
+}
+
+fn retry_after(headers: &HeaderMap) -> Duration {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| Duration::from_secs(secs.clamp(1, 60)))
+        .unwrap_or(DEFAULT_RETRY_AFTER)
+}
+
+fn status_error(status: StatusCode, what: &str, body: &str, sent_token: bool) -> anyhow::Error {
+    let code = status.as_u16();
+    match status {
+        StatusCode::UNAUTHORIZED if sent_token => anyhow!(
+            "SoundCloud rejected the OAuth token (HTTP 401) for {what}; it may have expired, \
+             copy a fresh oauth_token cookie from soundcloud.com"
+        ),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => anyhow!(
+            "SoundCloud denied access (HTTP {code}) to {what}; it may be private or not \
+             available in your region"
+        ),
+        StatusCode::NOT_FOUND => anyhow!("not found on SoundCloud (HTTP 404): {what}"),
+        StatusCode::TOO_MANY_REQUESTS => {
+            anyhow!("SoundCloud rate limit hit for {what}; try again in a minute")
+        }
+        _ => {
+            let snippet: String = body.trim().chars().take(200).collect();
+            anyhow!("SoundCloud API error (HTTP {code}) for {what}: {snippet}")
+        }
+    }
+}
+
+/// Turns a profile URL, `soundcloud.com/name` or a bare username into
+/// `https://soundcloud.com/<name>`. Other hosts (e.g. on.soundcloud.com short links) are
+/// passed through for `/resolve` to follow.
+fn normalize_profile_url(input: &str) -> Result<String> {
+    let s = input.trim().trim_start_matches('@');
+    if s.is_empty() {
+        bail!("no SoundCloud profile URL configured");
+    }
+    let with_scheme = if s.contains("://") {
+        s.to_owned()
+    } else if s.split('/').next().is_some_and(|first| first.contains('.')) {
+        format!("https://{s}")
+    } else {
+        format!("https://soundcloud.com/{s}")
+    };
+    let url = Url::parse(&with_scheme)
+        .with_context(|| format!("invalid SoundCloud profile URL: {input}"))?;
+    match url.host_str() {
+        Some("soundcloud.com" | "www.soundcloud.com" | "m.soundcloud.com") => {
+            let name = url
+                .path_segments()
+                .and_then(|mut segs| segs.find(|s| !s.is_empty()))
+                .with_context(|| format!("{input} doesn't contain a SoundCloud username"))?;
+            Ok(format!("https://soundcloud.com/{name}"))
+        }
+        Some(_) => Ok(url.to_string()),
+        None => bail!("invalid SoundCloud profile URL: {input}"),
+    }
+}
+
+/// Parses SoundCloud timestamps ("2024-02-29T12:00:00Z", "2014/05/24 18:30:05 +0000") to Unix
+/// seconds (UTC).
+fn parse_timestamp(s: &str) -> Option<i64> {
+    let nums: Vec<i64> = s
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .take(6)
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    let &[y, mo, d, h, mi, sec] = nums.as_slice() else {
+        return None;
+    };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn full_track_fixture() -> Value {
+        json!({
+            "artwork_url": "https://i1.sndcdn.com/artworks-000067273316-smsiqx-large.jpg",
+            "caption": null,
+            "comment_count": 1532,
+            "created_at": "2008-07-02T22:09:23Z",
+            "description": "From the Soulhack album",
+            "duration": 30000,
+            "full_duration": 213890,
+            "genre": "Electronica",
+            "id": 293,
+            "kind": "track",
+            "media": {
+                "transcodings": [
+                    {
+                        "url": "https://api-v2.soundcloud.com/media/soundcloud:tracks:293/0ff8d3c1/stream/hls",
+                        "preset": "mp3_1_0",
+                        "duration": 30000,
+                        "snipped": true,
+                        "format": { "protocol": "hls", "mime_type": "audio/mpeg" },
+                        "quality": "sq"
+                    }
+                ]
+            },
+            "monetization_model": "SUB_HIGH_TIER",
+            "permalink": "flickermood",
+            "permalink_url": "https://soundcloud.com/forss/flickermood",
+            "policy": "SNIP",
+            "publisher_metadata": {
+                "id": 293,
+                "urn": "soundcloud:tracks:293",
+                "artist": "Forss",
+                "album_title": "Soulhack",
+                "contains_music": true,
+                "isrc": "SEWNV0800101"
+            },
+            "streamable": true,
+            "title": "Flickermood",
+            "track_authorization": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.e30.sig",
+            "urn": "soundcloud:tracks:293",
+            "user_id": 183,
+            "user": {
+                "avatar_url": "https://i1.sndcdn.com/avatars-000005478225-7ec8jg-large.jpg",
+                "first_name": "",
+                "id": 183,
+                "kind": "user",
+                "permalink": "forss",
+                "permalink_url": "https://soundcloud.com/forss",
+                "username": "Forss",
+                "verified": true
+            }
+        })
+    }
+
+    #[test]
+    fn parse_track_maps_full_object() {
+        let t = parse_track(&full_track_fixture()).expect("track");
+        assert_eq!(
+            t,
+            Track {
+                id: "soundcloud:293".into(),
+                source: Source::SoundCloud,
+                title: "Flickermood".into(),
+                artist: "Forss".into(),
+                album: "Soulhack".into(),
+                duration_ms: 213_890,
+                track_no: None,
+                art: Some("https://i1.sndcdn.com/artworks-000067273316-smsiqx-t500x500.jpg".into()),
+                uri: "https://soundcloud.com/forss/flickermood".into(),
+                added_at: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_track_falls_back_to_uploader_and_avatar() {
+        let v = json!({
+            "artwork_url": null,
+            "duration": 184_000,
+            "id": 1_234_567_890u64,
+            "kind": "track",
+            "permalink_url": "https://soundcloud.com/some-dj/live-mix",
+            "publisher_metadata": { "id": 1_234_567_890u64, "urn": "soundcloud:tracks:1234567890", "artist": "", "contains_music": true },
+            "title": "Live Mix @ Somewhere ",
+            "user": {
+                "avatar_url": "https://i1.sndcdn.com/avatars-abcDEF123-xyz-large.png",
+                "id": 42,
+                "kind": "user",
+                "permalink_url": "https://soundcloud.com/some-dj",
+                "username": "Some DJ"
+            }
+        });
+        let t = parse_track(&v).expect("track");
+        assert_eq!(t.id, "soundcloud:1234567890");
+        assert_eq!(t.title, "Live Mix @ Somewhere");
+        assert_eq!(t.artist, "Some DJ");
+        assert_eq!(t.album, "");
+        assert_eq!(t.duration_ms, 184_000);
+        assert_eq!(t.art.as_deref(), Some("https://i1.sndcdn.com/avatars-abcDEF123-xyz-t500x500.png"));
+        assert_eq!(t.uri, "https://soundcloud.com/some-dj/live-mix");
+
+        // Default avatars are no cover art.
+        let mut v = v;
+        v["user"]["avatar_url"] = json!("https://a1.sndcdn.com/images/default_avatar_large.png");
+        assert_eq!(parse_track(&v).unwrap().art, None);
+    }
+
+    #[test]
+    fn parse_track_rejects_stubs_and_non_tracks() {
+        let stub = json!({ "id": 1_548_320_001u64, "kind": "track", "monetization_model": "NOT_APPLICABLE", "policy": "ALLOW" });
+        assert_eq!(parse_track(&stub), None);
+        let playlist = json!({ "id": 99, "kind": "playlist", "title": "Not a track" });
+        assert_eq!(parse_track(&playlist), None);
+        assert_eq!(parse_track(&json!({ "title": "no id" })), None);
+    }
+
+    #[test]
+    fn parse_user_maps_fields() {
+        let u = parse_user(&full_track_fixture()["user"]).unwrap();
+        assert_eq!(
+            u,
+            ScUser {
+                id: 183,
+                username: "Forss".into(),
+                avatar: Some("https://i1.sndcdn.com/avatars-000005478225-7ec8jg-t500x500.jpg".into()),
+                permalink_url: "https://soundcloud.com/forss".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn extracts_client_id_from_js() {
+        let js = r#"(window.webpackJsonp=window.webpackJsonp||[]).push([[49],{123:function(e,t,n){"use strict";var r=n(4);e.exports={env:"production",client_id:"a3e059563d7fd3372b49b37f00a00bcf",api_host:"https://api-v2.soundcloud.com"}}}]);"#;
+        assert_eq!(extract_client_id(js).as_deref(), Some("a3e059563d7fd3372b49b37f00a00bcf"));
+
+        let assign = r#"var o={};o.client_id = "Zx9YwVuTsRqPoNmLkJiHgFeDcBa98765";"#;
+        assert_eq!(extract_client_id(assign).as_deref(), Some("Zx9YwVuTsRqPoNmLkJiHgFeDcBa98765"));
+
+        let query = r#"fetch("https://api-v2.soundcloud.com/me?client_id=0123456789abcdefABCDEF0123456789&app_version=1")"#;
+        assert_eq!(extract_client_id(query).as_deref(), Some("0123456789abcdefABCDEF0123456789"));
+
+        // Wrong lengths don't match.
+        assert_eq!(extract_client_id(r#"client_id:"tooshort""#), None);
+        assert_eq!(extract_client_id("client_id=0123456789abcdefABCDEF0123456789XYZ"), None);
+        assert_eq!(extract_client_id("nothing to see here"), None);
+    }
+
+    #[test]
+    fn extracts_asset_scripts_from_html() {
+        let html = r#"<!DOCTYPE html><html><head>
+<script src="https://www.google.com/recaptcha/api.js"></script>
+<link rel="stylesheet" href="https://a-v2.sndcdn.com/assets/app-1f2e3d.css">
+</head><body>
+<script>window.__sc_hydration = [];</script>
+<script crossorigin src="https://a-v2.sndcdn.com/assets/0-8a7d7b0e.js"></script>
+<script crossorigin src="https://a-v2.sndcdn.com/assets/2-45b2bd1a.js"></script>
+<script src="//a-v2.sndcdn.com/assets/49-4786a8a0.js" crossorigin></script>
+</body></html>"#;
+        assert_eq!(
+            extract_script_urls(html),
+            vec![
+                "https://a-v2.sndcdn.com/assets/0-8a7d7b0e.js",
+                "https://a-v2.sndcdn.com/assets/2-45b2bd1a.js",
+                "https://a-v2.sndcdn.com/assets/49-4786a8a0.js",
+            ]
+        );
+    }
+
+    fn transcoding(protocol: &str, mime: &str, snipped: bool, quality: &str) -> Value {
+        json!({
+            "url": format!("https://api-v2.soundcloud.com/media/soundcloud:tracks:1/abc/stream/{protocol}?m={mime}"),
+            "preset": "x",
+            "duration": 213890,
+            "snipped": snipped,
+            "format": { "protocol": protocol, "mime_type": mime },
+            "quality": quality
+        })
+    }
+
+    fn picked(list: &[Value]) -> Option<(String, String, bool)> {
+        pick_transcoding(list).map(|t| {
+            (
+                t["format"]["protocol"].as_str().unwrap().to_owned(),
+                t["format"]["mime_type"].as_str().unwrap().to_owned(),
+                t["snipped"].as_bool().unwrap(),
+            )
+        })
+    }
+
+    #[test]
+    fn transcoding_preference() {
+        let aac = transcoding("hls", r#"audio/mp4; codecs="mp4a.40.2""#, false, "sq");
+        let hls_mp3 = transcoding("hls", "audio/mpeg", false, "sq");
+        let prog_mp3 = transcoding("progressive", "audio/mpeg", false, "sq");
+        let opus = transcoding("hls", r#"audio/ogg; codecs="opus""#, false, "sq");
+        let drm = transcoding("ctr-encrypted-hls", r#"audio/mp4; codecs="mp4a.40.2""#, false, "hq");
+
+        let all = [drm.clone(), aac.clone(), hls_mp3.clone(), prog_mp3.clone(), opus.clone()];
+        assert_eq!(picked(&all).unwrap().0, "progressive");
+
+        let no_progressive = [aac.clone(), hls_mp3.clone(), opus.clone()];
+        assert!(picked(&no_progressive).unwrap().1.starts_with("audio/ogg"));
+
+        let mp3_or_aac = [aac.clone(), hls_mp3.clone()];
+        assert_eq!(picked(&mp3_or_aac).unwrap().1, "audio/mpeg");
+
+        assert!(picked(&[drm.clone(), aac.clone()]).unwrap().1.starts_with("audio/mp4"));
+
+        // Unknown formats are still better than nothing; encrypted ones are never used.
+        let odd = transcoding("hls", "audio/flac", false, "sq");
+        assert_eq!(picked(&[drm.clone(), odd]).unwrap().1, "audio/flac");
+        assert_eq!(picked(std::slice::from_ref(&drm)), None);
+        assert_eq!(picked(&[]), None);
+
+        // Within a format, hq wins.
+        let aac_hq = transcoding("hls", r#"audio/mp4; codecs="mp4a.40.2""#, false, "hq");
+        let both = [aac.clone(), aac_hq];
+        assert_eq!(pick_transcoding(&both).unwrap()["quality"], "hq");
+    }
+
+    #[test]
+    fn snipped_transcodings_are_a_last_resort() {
+        let snip_prog = transcoding("progressive", "audio/mpeg", true, "sq");
+        let full_aac = transcoding("hls", "audio/mp4", false, "sq");
+        assert!(!picked(&[snip_prog.clone(), full_aac]).unwrap().2);
+        assert_eq!(picked(&[snip_prog]).unwrap(), ("progressive".into(), "audio/mpeg".into(), true));
+    }
+
+    #[test]
+    fn build_url_replaces_client_id() {
+        let next = "https://api-v2.soundcloud.com/users/183/track_likes?offset=1709208000000%2C123&limit=200&client_id=OLD";
+        let url = build_url(next, &[], "NEW").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-v2.soundcloud.com/users/183/track_likes?offset=1709208000000%2C123&limit=200&client_id=NEW"
+        );
+        let url = build_url(&api("/search/tracks"), &[("q", "daft punk & co"), ("limit", "5")], "ID").unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api-v2.soundcloud.com/search/tracks?q=daft+punk+%26+co&limit=5&client_id=ID"
+        );
+        assert_eq!(url_path(url.as_str()), "/search/tracks");
+    }
+
+    #[test]
+    fn playlist_assembly_restores_order() {
+        let pl = json!({
+            "id": 1_234_567,
+            "kind": "playlist",
+            "title": "Late night",
+            "description": null,
+            "artwork_url": null,
+            "track_count": 3,
+            "tracks": [ { "id": 2 }, { "id": 1 }, { "id": 3 } ]
+        });
+        let mut tracks = HashMap::new();
+        for (id, art) in [(1u64, None), (2, Some("https://i1.sndcdn.com/a-t500x500.jpg")), (3, None)] {
+            let mut v = full_track_fixture();
+            v["id"] = json!(id);
+            v["title"] = json!(format!("T{id}"));
+            let mut t = parse_track(&v).unwrap();
+            t.art = art.map(str::to_owned);
+            tracks.insert(id, t);
+        }
+        // Track 3 was unavailable.
+        tracks.remove(&3);
+        let p = assemble_playlist(&pl, &[2, 1, 3], &tracks);
+        assert_eq!(p.remote_id, "1234567");
+        assert_eq!(p.name, "Late night");
+        assert_eq!(p.description, "");
+        assert_eq!(p.art.as_deref(), Some("https://i1.sndcdn.com/a-t500x500.jpg"));
+        let titles: Vec<_> = p.tracks.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["T2", "T1"]);
+    }
+
+    #[test]
+    fn profile_url_normalization() {
+        let n = |s: &str| normalize_profile_url(s).unwrap();
+        assert_eq!(n("forss"), "https://soundcloud.com/forss");
+        assert_eq!(n("@forss"), "https://soundcloud.com/forss");
+        assert_eq!(n("soundcloud.com/forss/"), "https://soundcloud.com/forss");
+        assert_eq!(n("https://m.soundcloud.com/forss/likes?ref=x#top"), "https://soundcloud.com/forss");
+        assert_eq!(n(" https://soundcloud.com/forss "), "https://soundcloud.com/forss");
+        assert_eq!(n("https://on.soundcloud.com/AbCdE"), "https://on.soundcloud.com/AbCdE");
+        assert!(normalize_profile_url("").is_err());
+        assert!(normalize_profile_url("https://soundcloud.com/").is_err());
+    }
+
+    #[test]
+    fn timestamps() {
+        assert_eq!(parse_timestamp("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_timestamp("2024-02-29T12:00:00Z"), Some(1_709_208_000));
+        assert_eq!(parse_timestamp("2023-11-05T08:15:30.123Z"), Some(1_699_172_130));
+        assert_eq!(parse_timestamp("2014/05/24 18:30:05 +0000"), Some(1_400_956_205));
+        assert_eq!(parse_timestamp("1969-12-31T23:59:59Z"), Some(-1));
+        assert_eq!(parse_timestamp("garbage"), None);
+        assert_eq!(parse_timestamp("2024-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn constructor_trims_settings() {
+        let sc = SoundCloud::new(reqwest::Client::new(), "  ", " OAuth 2-123456-789-abc ");
+        assert_eq!(sc.client_id_override, None);
+        assert_eq!(sc.oauth_token.as_deref(), Some("2-123456-789-abc"));
+        assert_eq!(sc.token(false), Some("2-123456-789-abc"));
+        sc.token_rejected.store(true, Ordering::Relaxed);
+        assert_eq!(sc.token(false), None);
+        assert_eq!(sc.token(true), Some("2-123456-789-abc"));
+
+        let sc = SoundCloud::new(reqwest::Client::new(), "abc", "");
+        assert_eq!(sc.oauth_token, None);
+        let id = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(sc.client_id())
+            .unwrap();
+        assert_eq!(id, "abc");
+    }
+
+    #[test]
+    fn futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let sc = SoundCloud::new(reqwest::Client::new(), "", "");
+        let t = parse_track(&full_track_fixture()).unwrap();
+        assert_send(&sc.client_id());
+        assert_send(&sc.resolve_user("forss"));
+        assert_send(&sc.me());
+        assert_send(&sc.likes(1));
+        assert_send(&sc.playlists(1));
+        assert_send(&sc.search("x", 1));
+        assert_send(&sc.stream_url(&t));
+    }
+
+    /// Manual smoke test against the real API: `cargo test soundcloud -- --ignored`.
+    #[tokio::test]
+    #[ignore = "needs network access to soundcloud.com"]
+    async fn smoke_public_profile() {
+        let sc = SoundCloud::new(crate::http::client(), "", "");
+        let user = sc.resolve_user("https://soundcloud.com/forss").await.unwrap();
+        assert_eq!(user.id, 183);
+        let likes = sc.likes(user.id).await.unwrap();
+        println!("{} likes", likes.len());
+        let playlists = sc.playlists(user.id).await.unwrap();
+        for p in &playlists {
+            println!("playlist {}: {} tracks", p.name, p.tracks.len());
+        }
+        let found = sc.search("forss flickermood", 5).await.unwrap();
+        assert!(!found.is_empty());
+        let url = sc.stream_url(&found[0]).await.unwrap();
+        assert!(url.starts_with("https://"), "{url}");
+    }
+}
