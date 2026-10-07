@@ -114,9 +114,7 @@ impl std::error::Error for ApiError {}
 
 /// HTTP status of the Spotify API error inside `err`, if it is one.
 pub fn error_status(err: &anyhow::Error) -> Option<u16> {
-    err.chain()
-        .find_map(|e| e.downcast_ref::<ApiError>())
-        .map(|e| e.status)
+    err.chain().find_map(|e| e.downcast_ref::<ApiError>()).map(|e| e.status)
 }
 
 /// True when `err` was caused by a 401 (expired / revoked access token): refresh and retry.
@@ -189,9 +187,8 @@ impl SpotifyApi {
                 match self.get_paged(token, &tracks_url, &[100, 50]).await {
                     Ok(raw) => raw,
                     Err(tracks_err) => {
-                        let summary = format!(
-                            "fetching Spotify playlist {id} (/items: {items_err}; /tracks: {tracks_err})"
-                        );
+                        let summary =
+                            format!("fetching Spotify playlist {id} (/items: {items_err}; /tracks: {tracks_err})");
                         // A 404 from the legacy endpoint is less telling than what /items said.
                         let primary = if error_status(&tracks_err) == Some(404) {
                             items_err
@@ -230,11 +227,7 @@ impl SpotifyApi {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let base = format!(
-            "{}/search?type=track&q={}",
-            self.base,
-            urlencoding::encode(query)
-        );
+        let base = format!("{}/search?type=track&q={}", self.base, urlencoding::encode(query));
         let mut url = with_param(&base, "limit", limit);
         let mut page = match self.get_json(token, &url).await {
             Ok(page) => page,
@@ -250,10 +243,7 @@ impl SpotifyApi {
 
         let mut out: Vec<Track> = Vec::new();
         for pages in 1.. {
-            let tracks_page = page
-                .get_mut("tracks")
-                .map(Value::take)
-                .unwrap_or(Value::Null);
+            let tracks_page = page.get_mut("tracks").map(Value::take).unwrap_or(Value::Null);
             let (items, next) = take_page(tracks_page);
             for t in items.iter().filter_map(|t| parse_track(t, None)) {
                 if !out.iter().any(|o| o.id == t.id) {
@@ -263,10 +253,7 @@ impl SpotifyApi {
             if out.len() >= limit as usize || pages >= MAX_SEARCH_PAGES {
                 break;
             }
-            let Some(next) = next
-                .and_then(|n| self.rebase_next(&n))
-                .filter(|n| *n != url)
-            else {
+            let Some(next) = next.and_then(|n| self.rebase_next(&n)).filter(|n| *n != url) else {
                 break;
             };
             match self.get_json(token, &next).await {
@@ -274,9 +261,7 @@ impl SpotifyApi {
                     page = p;
                     url = next;
                 }
-                Err(e) if is_unauthorized(&e) => {
-                    return Err(e.context(format!("searching Spotify for {query:?}")))
-                }
+                Err(e) if is_unauthorized(&e) => return Err(e.context(format!("searching Spotify for {query:?}"))),
                 Err(e) => {
                     warn!(error = %e, "Spotify search: failed to fetch more results, returning what we have");
                     break;
@@ -290,16 +275,12 @@ impl SpotifyApi {
     /// Save (`liked = true`) or remove a track from the user's Liked Songs.
     /// `track_uri` is a `spotify:track:<id>` URI (a bare id or open.spotify.com URL also works).
     pub async fn set_liked(&self, token: &str, track_uri: &str, liked: bool) -> Result<()> {
-        let (uri, id) = normalize_track_uri(track_uri)
-            .ok_or_else(|| anyhow!("not a Spotify track URI: {track_uri:?}"))?;
+        let (uri, id) =
+            normalize_track_uri(track_uri).ok_or_else(|| anyhow!("not a Spotify track URI: {track_uri:?}"))?;
         let method = if liked { Method::PUT } else { Method::DELETE };
         let action = if liked { "saving" } else { "removing" };
 
-        let url = format!(
-            "{}/me/library?uris={}",
-            self.base,
-            urlencoding::encode(&uri)
-        );
+        let url = format!("{}/me/library?uris={}", self.base, urlencoding::encode(&uri));
         match self.send(method.clone(), &url, token).await {
             Ok(_) => Ok(()),
             Err(e) if matches!(error_status(&e), Some(400 | 404 | 405)) => {
@@ -354,10 +335,7 @@ impl SpotifyApi {
         for pages in 1.. {
             let (items, next) = take_page(page);
             out.extend(items);
-            let Some(next) = next
-                .and_then(|n| self.rebase_next(&n))
-                .filter(|n| *n != url)
-            else {
+            let Some(next) = next.and_then(|n| self.rebase_next(&n)).filter(|n| *n != url) else {
                 break;
             };
             if pages >= MAX_PAGES {
@@ -407,8 +385,7 @@ impl SpotifyApi {
                     continue;
                 }
                 Err(e) => {
-                    return Err(anyhow::Error::new(e)
-                        .context(format!("Spotify API {method} {path}: request failed")))
+                    return Err(anyhow::Error::new(e).context(format!("Spotify API {method} {path}: request failed")))
                 }
             };
 
@@ -442,9 +419,9 @@ impl SpotifyApi {
                     continue;
                 }
                 Err(e) if status.is_success() => {
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "Spotify API {method} {path}: reading response failed"
-                    )))
+                    return Err(
+                        anyhow::Error::new(e).context(format!("Spotify API {method} {path}: reading response failed"))
+                    )
                 }
                 // The status is what matters for errors; the body is only decoration.
                 Err(_) => String::new(),
@@ -554,10 +531,7 @@ fn normalize_track_uri(s: &str) -> Option<(String, String)> {
     let id = if let Some(id) = s.strip_prefix("spotify:track:") {
         id
     } else if let Some(i) = s.find("/track/") {
-        s[i + "/track/".len()..]
-            .split(['?', '#', '/'])
-            .next()
-            .unwrap_or("")
+        s[i + "/track/".len()..].split(['?', '#', '/']).next().unwrap_or("")
     } else if !s.contains(':') {
         s
     } else {
@@ -641,17 +615,11 @@ pub fn parse_playlist_item(v: &Value) -> Option<Track> {
 
 /// Maps a (simplified) playlist object from `/me/playlists`.
 pub fn parse_playlist_meta(v: &Value) -> Option<SpotifyPlaylistMeta> {
-    let id = v
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
+    let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let art = v
         .get("images")
         .and_then(Value::as_array)
-        .and_then(|imgs| {
-            imgs.iter()
-                .find_map(|i| i.get("url").and_then(Value::as_str))
-        })
+        .and_then(|imgs| imgs.iter().find_map(|i| i.get("url").and_then(Value::as_str)))
         .map(str::to_owned);
     // New shape: `items: {href, total}`; old shape: `tracks: {href, total}`.
     let total = ["items", "tracks"]
@@ -679,10 +647,7 @@ pub fn parse_playlist_meta(v: &Value) -> Option<SpotifyPlaylistMeta> {
 
 /// Maps the `/me` user object.
 pub fn parse_user(v: &Value) -> Option<SpotifyUser> {
-    let id = v
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
+    let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let display_name = v
         .get("display_name")
         .and_then(Value::as_str)
@@ -703,10 +668,7 @@ fn pick_image(images: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .filter_map(|i| {
-            let url = i
-                .get("url")
-                .and_then(Value::as_str)
-                .filter(|u| !u.is_empty())?;
+            let url = i.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
             Some((url, i.get("width").and_then(as_u64_lenient)))
         })
         .collect();
@@ -725,11 +687,8 @@ fn str_field(v: &Value, key: &str) -> String {
 }
 
 fn as_u64_lenient(v: &Value) -> Option<u64> {
-    v.as_u64().or_else(|| {
-        v.as_f64()
-            .filter(|f| f.is_finite() && *f >= 0.0)
-            .map(|f| f as u64)
-    })
+    v.as_u64()
+        .or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64))
 }
 
 /// Playlist descriptions come HTML-escaped and may contain `<a href=..>` links.
@@ -952,13 +911,7 @@ mod tests {
     fn new_track() -> Value {
         let mut t = old_track();
         let o = t.as_object_mut().unwrap();
-        for k in [
-            "available_markets",
-            "external_ids",
-            "popularity",
-            "track",
-            "episode",
-        ] {
+        for k in ["available_markets", "external_ids", "popularity", "track", "episode"] {
             o.remove(k);
         }
         t
@@ -1040,18 +993,12 @@ mod tests {
 
     #[test]
     fn parses_old_playlist_item_shape() {
-        assert_eq!(
-            parse_playlist_item(&old_playlist_item()),
-            Some(expected_track(ADDED))
-        );
+        assert_eq!(parse_playlist_item(&old_playlist_item()), Some(expected_track(ADDED)));
     }
 
     #[test]
     fn parses_new_playlist_item_shape() {
-        assert_eq!(
-            parse_playlist_item(&new_playlist_item()),
-            Some(expected_track(ADDED))
-        );
+        assert_eq!(parse_playlist_item(&new_playlist_item()), Some(expected_track(ADDED)));
     }
 
     #[test]
@@ -1061,10 +1008,7 @@ mod tests {
             parse_track(&old_track(), Some("2023-05-12T18:22:31Z")),
             Some(expected_track(ADDED))
         );
-        assert_eq!(
-            parse_track(&old_track(), Some("garbage")).unwrap().added_at,
-            0
-        );
+        assert_eq!(parse_track(&old_track(), Some("garbage")).unwrap().added_at, 0);
     }
 
     #[test]
@@ -1093,11 +1037,7 @@ mod tests {
         // Local track object even without the wrapper flag.
         let mut inner = local_item()["track"].clone();
         inner["is_local"] = json!(false);
-        assert_eq!(
-            parse_track(&inner, None),
-            None,
-            "spotify:local URIs are not playable"
-        );
+        assert_eq!(parse_track(&inner, None), None, "spotify:local URIs are not playable");
         assert_eq!(parse_track(&json!(null), None), None);
         assert_eq!(parse_track(&episode_item()["item"], None), None);
     }
@@ -1134,22 +1074,12 @@ mod tests {
     #[test]
     fn image_selection() {
         let img = |w: Option<u64>| json!({"url": format!("u{}", w.map_or("?".to_owned(), |w| w.to_string())), "width": w, "height": w});
-        let pick =
-            |ws: &[Option<u64>]| pick_image(&Value::Array(ws.iter().map(|w| img(*w)).collect()));
+        let pick = |ws: &[Option<u64>]| pick_image(&Value::Array(ws.iter().map(|w| img(*w)).collect()));
         // Largest first (Spotify's order): smallest >= 250.
-        assert_eq!(
-            pick(&[Some(640), Some(300), Some(64)]).as_deref(),
-            Some("u300")
-        );
+        assert_eq!(pick(&[Some(640), Some(300), Some(64)]).as_deref(), Some("u300"));
         // Order doesn't matter.
-        assert_eq!(
-            pick(&[Some(64), Some(640), Some(300)]).as_deref(),
-            Some("u300")
-        );
-        assert_eq!(
-            pick(&[Some(640), Some(250), Some(64)]).as_deref(),
-            Some("u250")
-        );
+        assert_eq!(pick(&[Some(64), Some(640), Some(300)]).as_deref(), Some("u300"));
+        assert_eq!(pick(&[Some(640), Some(250), Some(64)]).as_deref(), Some("u250"));
         // Nothing >= 250: the largest.
         assert_eq!(pick(&[Some(200), Some(64)]).as_deref(), Some("u200"));
         assert_eq!(pick(&[Some(64), Some(200)]).as_deref(), Some("u200"));
@@ -1285,29 +1215,21 @@ mod tests {
             "37i9dQZF1DXcBWIGoYBM5M"
         );
         assert_eq!(
-            normalize_playlist_id(
-                "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=abc"
-            ),
+            normalize_playlist_id("https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M?si=abc"),
             "37i9dQZF1DXcBWIGoYBM5M"
         );
         let want = Some((
             "spotify:track:69kOkLUCkxIZYexIgSG8rq".to_owned(),
             "69kOkLUCkxIZYexIgSG8rq".to_owned(),
         ));
-        assert_eq!(
-            normalize_track_uri("spotify:track:69kOkLUCkxIZYexIgSG8rq"),
-            want
-        );
+        assert_eq!(normalize_track_uri("spotify:track:69kOkLUCkxIZYexIgSG8rq"), want);
         assert_eq!(normalize_track_uri("69kOkLUCkxIZYexIgSG8rq"), want);
         assert_eq!(
             normalize_track_uri("https://open.spotify.com/track/69kOkLUCkxIZYexIgSG8rq?si=x"),
             want
         );
         assert_eq!(normalize_track_uri("spotify:local:a:b:c:1"), None);
-        assert_eq!(
-            normalize_track_uri("spotify:episode:512ojhOuo1ktJprKbVcKyQ"),
-            None
-        );
+        assert_eq!(normalize_track_uri("spotify:episode:512ojhOuo1ktJprKbVcKyQ"), None);
         assert_eq!(normalize_track_uri(""), None);
     }
 
@@ -1330,13 +1252,7 @@ mod tests {
         assert_eq!(error_status(&err), Some(401));
         assert!(format!("{err:#}").contains("401"));
 
-        let e: anyhow::Error = ApiError::new(
-            StatusCode::FORBIDDEN,
-            &Method::GET,
-            "/x",
-            "<html>  nope\n</html>",
-        )
-        .into();
+        let e: anyhow::Error = ApiError::new(StatusCode::FORBIDDEN, &Method::GET, "/x", "<html>  nope\n</html>").into();
         assert!(!is_unauthorized(&e));
         assert_eq!(error_status(&e), Some(403));
         assert!(e.to_string().ends_with(": <html> nope </html>"));
@@ -1344,14 +1260,9 @@ mod tests {
         assert!(is_unauthorized(&anyhow!("upstream said HTTP 401")));
 
         let long = "x".repeat(1000);
+        assert_eq!(error_message(&long).chars().count(), ERROR_SNIPPET_CHARS + 1);
         assert_eq!(
-            error_message(&long).chars().count(),
-            ERROR_SNIPPET_CHARS + 1
-        );
-        assert_eq!(
-            error_message(
-                r#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#
-            ),
+            error_message(r#"{"error":"invalid_grant","error_description":"Refresh token revoked"}"#),
             "Refresh token revoked"
         );
     }
@@ -1362,10 +1273,7 @@ mod tests {
         assert_eq!(retry_after_secs(&h), DEFAULT_RETRY_AFTER_SECS);
         h.insert(header::RETRY_AFTER, "7".parse().unwrap());
         assert_eq!(retry_after_secs(&h), 7);
-        h.insert(
-            header::RETRY_AFTER,
-            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
-        );
+        h.insert(header::RETRY_AFTER, "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap());
         assert_eq!(retry_after_secs(&h), DEFAULT_RETRY_AFTER_SECS);
     }
 
@@ -1390,10 +1298,7 @@ mod tests {
             Some("http://127.0.0.1:9/v1/me/tracks?offset=50&limit=50")
         );
         assert_eq!(with_param("http://x/a", "limit", 5), "http://x/a?limit=5");
-        assert_eq!(
-            with_param("http://x/a?b=1", "limit", 5),
-            "http://x/a?b=1&limit=5"
-        );
+        assert_eq!(with_param("http://x/a?b=1", "limit", 5), "http://x/a?b=1&limit=5");
     }
 
     /// Tiny loopback HTTP/1.1 server so the request / retry / fallback logic can be tested
@@ -1456,10 +1361,7 @@ mod tests {
                         let r = if authed {
                             handler(&method, &path)
                         } else {
-                            reply(
-                                401,
-                                r#"{"error":{"status":401,"message":"No token provided"}}"#,
-                            )
+                            reply(401, r#"{"error":{"status":401,"message":"No token provided"}}"#)
                         };
                         let mut resp = format!(
                             "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -1506,17 +1408,12 @@ mod tests {
                     Some("https://api.spotify.com/v1/playlists/pl1/items?offset=100&limit=100"),
                 ),
             ),
-            "/playlists/pl1/items?offset=100&limit=100" => {
-                reply(200, page(vec![old_playlist_item()], None))
-            }
+            "/playlists/pl1/items?offset=100&limit=100" => reply(200, page(vec![old_playlist_item()], None)),
             _ => reply(404, r#"{"error":{"status":404,"message":"Not found."}}"#),
         })
         .await;
         let api = SpotifyApi::with_base(client(), &base);
-        let tracks = api
-            .playlist_tracks("tok", "spotify:playlist:pl1")
-            .await
-            .unwrap();
+        let tracks = api.playlist_tracks("tok", "spotify:playlist:pl1").await.unwrap();
         assert_eq!(tracks, vec![expected_track(ADDED), expected_track(ADDED)]);
         assert_eq!(
             log_of(&log),
@@ -1533,9 +1430,7 @@ mod tests {
             p if p.starts_with("/playlists/pl2/items") => {
                 reply(404, r#"{"error":{"status":404,"message":"Not found."}}"#)
             }
-            "/playlists/pl2/tracks?limit=100" => {
-                reply(400, r#"{"error":{"status":400,"message":"Invalid limit"}}"#)
-            }
+            "/playlists/pl2/tracks?limit=100" => reply(400, r#"{"error":{"status":400,"message":"Invalid limit"}}"#),
             "/playlists/pl2/tracks?limit=50" => reply(
                 200,
                 page(
@@ -1543,10 +1438,9 @@ mod tests {
                     Some("https://api.spotify.com/v1/playlists/pl2/tracks?offset=50&limit=50"),
                 ),
             ),
-            "/playlists/pl2/tracks?offset=50&limit=50" => reply(
-                200,
-                page(vec![json!({"track": null}), old_playlist_item()], None),
-            ),
+            "/playlists/pl2/tracks?offset=50&limit=50" => {
+                reply(200, page(vec![json!({"track": null}), old_playlist_item()], None))
+            }
             _ => reply(500, "unexpected"),
         })
         .await;
@@ -1578,10 +1472,7 @@ mod tests {
         let err = api.playlist_tracks("tok", "pl3").await.unwrap_err();
         assert_eq!(error_status(&err), Some(403));
         let msg = format!("{err:#}");
-        assert!(
-            msg.contains("HTTP 403") && msg.contains("HTTP 404"),
-            "{msg}"
-        );
+        assert!(msg.contains("HTTP 403") && msg.contains("HTTP 404"), "{msg}");
     }
 
     #[tokio::test]
@@ -1629,10 +1520,7 @@ mod tests {
     async fn rate_limit_gives_up_eventually() {
         let (base, log) = serve(|_, _| Reply {
             headers: vec![("Retry-After", "0".into())],
-            ..reply(
-                429,
-                r#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#,
-            )
+            ..reply(429, r#"{"error":{"status":429,"message":"API rate limit exceeded"}}"#)
         })
         .await;
         let api = SpotifyApi::with_base(client(), &base);
@@ -1656,9 +1544,7 @@ mod tests {
     async fn set_liked_tries_library_then_legacy_endpoint() {
         let (base, log) = serve(|method, path| match (method, path) {
             (_, p) if p.starts_with("/me/library") && method == "PUT" => reply(404, ""),
-            ("DELETE", "/me/library?uris=spotify%3Atrack%3A69kOkLUCkxIZYexIgSG8rq") => {
-                reply(200, "")
-            }
+            ("DELETE", "/me/library?uris=spotify%3Atrack%3A69kOkLUCkxIZYexIgSG8rq") => reply(200, ""),
             ("PUT", "/me/tracks?ids=69kOkLUCkxIZYexIgSG8rq") => reply(200, ""),
             _ => reply(500, "unexpected"),
         })
@@ -1670,10 +1556,7 @@ mod tests {
         api.set_liked("tok", "spotify:track:69kOkLUCkxIZYexIgSG8rq", false)
             .await
             .unwrap();
-        assert!(api
-            .set_liked("tok", "spotify:local:x:y:z:1", true)
-            .await
-            .is_err());
+        assert!(api.set_liked("tok", "spotify:local:x:y:z:1", true).await.is_err());
         assert_eq!(
             log_of(&log),
             [
@@ -1705,7 +1588,10 @@ mod tests {
                         "https://api.spotify.com/v1/search?type=track&q=daft%20punk&offset={}&limit=10",
                         offset + 10
                     );
-                    reply(200, json!({"tracks": {"items": items, "next": next, "total": 1000}}).to_string())
+                    reply(
+                        200,
+                        json!({"tracks": {"items": items, "next": next, "total": 1000}}).to_string(),
+                    )
                 }
                 _ => reply(500, "unexpected"),
             }
@@ -1757,10 +1643,7 @@ mod tests {
         let liked = api.liked_tracks("tok").await.unwrap();
         assert_eq!(liked.len(), 2);
         assert_eq!(liked[0].added_at, ADDED);
-        assert_eq!(
-            liked[1].added_at,
-            parse_rfc3339("2020-01-01T00:00:00Z").unwrap()
-        );
+        assert_eq!(liked[1].added_at, parse_rfc3339("2020-01-01T00:00:00Z").unwrap());
 
         let lists = api.playlists("tok").await.unwrap();
         let summary: Vec<_> = lists

@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection};
+use souvlaki::{
+    MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, MediaPosition, PlatformConfig, SeekDirection,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::Track;
@@ -24,38 +26,38 @@ impl Mpris {
             .then(|| MediaControls::new(config).ok())
             .flatten()
             .and_then(|mut c| {
-            let result = c.attach(move |event: MediaControlEvent| {
-                let cmd = match event {
-                    MediaControlEvent::Play => Command::Resume,
-                    MediaControlEvent::Pause => Command::Pause,
-                    MediaControlEvent::Toggle => Command::TogglePause,
-                    MediaControlEvent::Next => Command::Next,
-                    MediaControlEvent::Previous => Command::Previous,
-                    MediaControlEvent::Stop => Command::Pause,
-                    MediaControlEvent::Seek(dir) => Command::SeekRelative(match dir {
-                        SeekDirection::Forward => 10.0,
-                        SeekDirection::Backward => -10.0,
-                    }),
-                    MediaControlEvent::SeekBy(dir, by) => Command::SeekRelative(match dir {
-                        SeekDirection::Forward => by.as_secs_f64(),
-                        SeekDirection::Backward => -by.as_secs_f64(),
-                    }),
-                    MediaControlEvent::SetPosition(MediaPosition(pos)) => Command::Seek(pos.as_secs_f64()),
-                    MediaControlEvent::SetVolume(v) => Command::SetVolume((v * 100.0) as f32),
-                    MediaControlEvent::Raise => Command::Raise,
-                    MediaControlEvent::Quit => Command::Quit,
-                    MediaControlEvent::OpenUri(_) => return,
-                };
-                let _ = commands.send(cmd);
-            });
-            match result {
-                Ok(()) => Some(c),
-                Err(e) => {
-                    tracing::warn!("MPRIS unavailable: {e:?}");
-                    None
+                let result = c.attach(move |event: MediaControlEvent| {
+                    let cmd = match event {
+                        MediaControlEvent::Play => Command::Resume,
+                        MediaControlEvent::Pause => Command::Pause,
+                        MediaControlEvent::Toggle => Command::TogglePause,
+                        MediaControlEvent::Next => Command::Next,
+                        MediaControlEvent::Previous => Command::Previous,
+                        MediaControlEvent::Stop => Command::Pause,
+                        MediaControlEvent::Seek(dir) => Command::SeekRelative(match dir {
+                            SeekDirection::Forward => 10.0,
+                            SeekDirection::Backward => -10.0,
+                        }),
+                        MediaControlEvent::SeekBy(dir, by) => Command::SeekRelative(match dir {
+                            SeekDirection::Forward => by.as_secs_f64(),
+                            SeekDirection::Backward => -by.as_secs_f64(),
+                        }),
+                        MediaControlEvent::SetPosition(MediaPosition(pos)) => Command::Seek(pos.as_secs_f64()),
+                        MediaControlEvent::SetVolume(v) => Command::SetVolume((v * 100.0) as f32),
+                        MediaControlEvent::Raise => Command::Raise,
+                        MediaControlEvent::Quit => Command::Quit,
+                        MediaControlEvent::OpenUri(_) => return,
+                    };
+                    let _ = commands.send(cmd);
+                });
+                match result {
+                    Ok(()) => Some(c),
+                    Err(e) => {
+                        tracing::warn!("MPRIS unavailable: {e:?}");
+                        None
+                    }
                 }
-            }
-        });
+            });
         Mpris {
             controls,
             last_track: None,

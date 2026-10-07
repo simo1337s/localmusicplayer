@@ -150,9 +150,9 @@ impl Db {
     }
 
     pub fn load_playlists(&self) -> Result<Vec<Playlist>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, kind, remote_id, description, art FROM playlists ORDER BY position, rowid",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, kind, remote_id, description, art FROM playlists ORDER BY position, rowid")?;
         let mut playlists: Vec<Playlist> = stmt
             .query_map([], |r| {
                 let kind: String = r.get(2)?;
@@ -193,7 +193,15 @@ impl Db {
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
                 remote_id = excluded.remote_id, description = excluded.description,
                 art = excluded.art, position = excluded.position",
-            params![p.id, p.name, p.kind.as_str(), p.remote_id, p.description, p.art, position],
+            params![
+                p.id,
+                p.name,
+                p.kind.as_str(),
+                p.remote_id,
+                p.description,
+                p.art,
+                position
+            ],
         )?;
         tx.execute("DELETE FROM playlist_tracks WHERE playlist_id = ?1", [&p.id])?;
         {
@@ -225,9 +233,9 @@ impl Db {
 
     /// Most recently played distinct track ids, newest first.
     pub fn recent_plays(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track_id, MAX(played_at) AS t FROM plays GROUP BY track_id ORDER BY t DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT track_id, MAX(played_at) AS t FROM plays GROUP BY track_id ORDER BY t DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -235,9 +243,9 @@ impl Db {
     /// Track ids ordered by play count, most played first.
     #[cfg(test)]
     pub fn top_plays(&self, limit: usize) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT track_id, COUNT(*) AS c FROM plays GROUP BY track_id ORDER BY c DESC LIMIT ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT track_id, COUNT(*) AS c FROM plays GROUP BY track_id ORDER BY c DESC LIMIT ?1")?;
         let rows = stmt.query_map([limit as i64], |r| r.get::<_, String>(0))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
@@ -291,7 +299,10 @@ mod tests {
     #[test]
     fn tracks_and_playlists_roundtrip() {
         let mut db = Db::open_in_memory().unwrap();
-        let tracks = vec![track("local:/a.flac", Source::Local), track("spotify:track:x", Source::Spotify)];
+        let tracks = vec![
+            track("local:/a.flac", Source::Local),
+            track("spotify:track:x", Source::Spotify),
+        ];
         db.upsert_tracks(&tracks, &HashMap::new()).unwrap();
         let mut loaded = db.load_tracks().unwrap();
         loaded.sort_by(|a, b| a.id.cmp(&b.id));
@@ -311,7 +322,8 @@ mod tests {
         assert_eq!(db.load_playlists().unwrap(), vec![p.clone()]);
 
         // Orphan pruning keeps referenced and local tracks.
-        db.upsert_tracks(&[track("soundcloud:9", Source::SoundCloud)], &HashMap::new()).unwrap();
+        db.upsert_tracks(&[track("soundcloud:9", Source::SoundCloud)], &HashMap::new())
+            .unwrap();
         assert_eq!(db.prune_orphans().unwrap(), 1);
         db.delete_playlist("custom:1").unwrap();
         assert!(db.load_playlists().unwrap().is_empty());

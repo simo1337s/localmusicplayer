@@ -194,7 +194,16 @@ pub fn apply_style(ctx: &egui::Context, accent: Color32) {
 
 /// Font files looked up in the usual Arch locations. The first family found wins.
 const TEXT_FONTS: &[(&str, &[&str])] = &[
-    ("Inter", &["Inter-Regular.ttf", "Inter-Regular.otf", "InterVariable.ttf", "Inter.ttc", "Inter[opsz,wght].ttf"]),
+    (
+        "Inter",
+        &[
+            "Inter-Regular.ttf",
+            "Inter-Regular.otf",
+            "InterVariable.ttf",
+            "Inter.ttc",
+            "Inter[opsz,wght].ttf",
+        ],
+    ),
     ("Noto Sans", &["NotoSans-Regular.ttf"]),
     ("Cantarell", &["Cantarell-Regular.otf", "Cantarell-VF.otf"]),
     ("DejaVu Sans", &["DejaVuSans.ttf"]),
@@ -225,7 +234,10 @@ const CJK_FONTS: &[&str] = &[
 ];
 
 fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![PathBuf::from("/usr/share/fonts"), PathBuf::from("/usr/local/share/fonts")];
+    let mut dirs = vec![
+        PathBuf::from("/usr/share/fonts"),
+        PathBuf::from("/usr/local/share/fonts"),
+    ];
     if let Some(home) = directories::BaseDirs::new() {
         dirs.push(home.data_dir().join("fonts"));
         dirs.push(home.home_dir().join(".fonts"));
@@ -283,7 +295,11 @@ pub fn setup_fonts(ctx: &egui::Context, cjk: bool) {
             .or_default()
             .insert(0, name.clone());
     }
-    let mut bold_stack = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let mut bold_stack = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
     if let Some(data) = find_font(BOLD_FONTS).and_then(|p| load(&p)) {
         fonts.font_data.insert("bold".into(), data.into());
         bold_stack.insert(0, "bold".into());
@@ -298,7 +314,11 @@ pub fn setup_fonts(ctx: &egui::Context, cjk: bool) {
     fonts
         .font_data
         .insert("phosphor-fill".into(), egui_phosphor::Variant::Fill.font_data().into());
-    let text_stack = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let text_stack = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
     let mut icon_stack = vec!["phosphor".to_string()];
     icon_stack.extend(text_stack.iter().cloned());
     fonts.families.insert(icons(), icon_stack);

@@ -50,7 +50,9 @@ fn status(ui: &mut Ui, s: &AccountStatus) {
     let (text, color) = match s {
         AccountStatus::Off => ("Not connected".to_string(), TEXT_FAINT),
         AccountStatus::Working(m) => (m.clone(), TEXT_DIM),
-        AccountStatus::Connected(name) if name.is_empty() => ("Connected".to_string(), Color32::from_rgb(0x4a, 0xd6, 0x8a)),
+        AccountStatus::Connected(name) if name.is_empty() => {
+            ("Connected".to_string(), Color32::from_rgb(0x4a, 0xd6, 0x8a))
+        }
         AccountStatus::Connected(name) => (format!("Connected as {name}"), Color32::from_rgb(0x4a, 0xd6, 0x8a)),
         AccountStatus::Error(e) => (e.clone(), DANGER),
     };

@@ -167,9 +167,15 @@ impl SpotifyAuth {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpotifyEvent {
     Loading,
-    Playing { position_ms: u32 },
-    Paused { position_ms: u32 },
-    Seeked { position_ms: u32 },
+    Playing {
+        position_ms: u32,
+    },
+    Paused {
+        position_ms: u32,
+    },
+    Seeked {
+        position_ms: u32,
+    },
     /// Good moment to preload the next track for gapless playback.
     TimeToPreload,
     EndOfTrack,

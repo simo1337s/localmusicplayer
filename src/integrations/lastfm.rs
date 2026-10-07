@@ -95,7 +95,10 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
     }
     match err.downcast_ref::<LastfmError>() {
         Some(LastfmError::Api { code, .. }) => {
-            matches!(*code, ERR_OPERATION_FAILED | ERR_SERVICE_OFFLINE | ERR_TEMPORARY | ERR_RATE_LIMIT)
+            matches!(
+                *code,
+                ERR_OPERATION_FAILED | ERR_SERVICE_OFFLINE | ERR_TEMPORARY | ERR_RATE_LIMIT
+            )
         }
         Some(LastfmError::Http { status }) => *status >= 500 || *status == 429,
         None => false,
@@ -257,13 +260,7 @@ pub struct Lastfm {
 }
 
 impl Lastfm {
-    pub fn new(
-        http: reqwest::Client,
-        api_key: &str,
-        api_secret: &str,
-        session_key: &str,
-        queue_path: PathBuf,
-    ) -> Self {
+    pub fn new(http: reqwest::Client, api_key: &str, api_secret: &str, session_key: &str, queue_path: PathBuf) -> Self {
         let session_key = session_key.trim();
         Lastfm {
             http,
@@ -314,12 +311,7 @@ impl Lastfm {
         self.send(self.http.get(API_ROOT).query(&params)).await
     }
 
-    async fn post(
-        &self,
-        method: &str,
-        params: Vec<(String, String)>,
-        with_session: bool,
-    ) -> anyhow::Result<Value> {
+    async fn post(&self, method: &str, params: Vec<(String, String)>, with_session: bool) -> anyhow::Result<Value> {
         let params = self.signed(method, params, with_session)?;
         self.send(self.http.post(API_ROOT).form(&params)).await
     }
@@ -482,7 +474,10 @@ impl Lastfm {
         if artist.is_empty() || title.is_empty() {
             anyhow::bail!("track has no artist or title");
         }
-        let params = vec![("artist".into(), artist.to_string()), ("track".into(), title.to_string())];
+        let params = vec![
+            ("artist".into(), artist.to_string()),
+            ("track".into(), title.to_string()),
+        ];
         let method = if love { "track.love" } else { "track.unlove" };
         self.post(method, params, true).await?;
         Ok(())

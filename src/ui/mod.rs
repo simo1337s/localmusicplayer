@@ -235,10 +235,18 @@ impl App {
             self.send(Command::TogglePause);
         }
         if left {
-            self.send(if ctrl { Command::Previous } else { Command::SeekRelative(-5.0) });
+            self.send(if ctrl {
+                Command::Previous
+            } else {
+                Command::SeekRelative(-5.0)
+            });
         }
         if right {
-            self.send(if ctrl { Command::Next } else { Command::SeekRelative(5.0) });
+            self.send(if ctrl {
+                Command::Next
+            } else {
+                Command::SeekRelative(5.0)
+            });
         }
         if up || down {
             let v = player.volume + if up { 5.0 } else { -5.0 };
@@ -294,7 +302,11 @@ impl App {
             player
                 .current
                 .as_ref()
-                .and_then(|t| t.art.clone().or_else(|| player.via.as_ref().and_then(|v| v.art.clone())))
+                .and_then(|t| {
+                    t.art
+                        .clone()
+                        .or_else(|| player.via.as_ref().and_then(|v| v.art.clone()))
+                })
                 .and_then(|a| {
                     // Make sure the thumbnail is requested so its colour gets computed.
                     let _ = self.art.get(Some(&a), art::THUMB);
@@ -306,10 +318,16 @@ impl App {
         };
         // Animate the accent change.
         let anim = |id: &str, v: u8| ctx.animate_value_with_time(egui::Id::new(id), v as f32, 0.6).round() as u8;
-        self.accent = Color32::from_rgb(anim("acc-r", target.r()), anim("acc-g", target.g()), anim("acc-b", target.b()));
+        self.accent = Color32::from_rgb(
+            anim("acc-r", target.r()),
+            anim("acc-g", target.g()),
+            anim("acc-b", target.b()),
+        );
         let d = |a: u8, b: u8| (a as i16 - b as i16).unsigned_abs();
         let s = self.styled_accent;
-        if d(s.r(), self.accent.r()) + d(s.g(), self.accent.g()) + d(s.b(), self.accent.b()) > 6 || (self.accent == target && s != target) {
+        if d(s.r(), self.accent.r()) + d(s.g(), self.accent.g()) + d(s.b(), self.accent.b()) > 6
+            || (self.accent == target && s != target)
+        {
             theme::apply_style(ctx, self.accent);
             self.styled_accent = self.accent;
         }
@@ -356,7 +374,11 @@ impl App {
                 Dialog::NewPlaylist { name, tracks } => {
                     ui.label(egui::RichText::new("New playlist").font(theme::bold_font(18.0)));
                     ui.add_space(8.0);
-                    let r = ui.add(egui::TextEdit::singleline(name).hint_text("Playlist name").desired_width(f32::INFINITY));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(name)
+                            .hint_text("Playlist name")
+                            .desired_width(f32::INFINITY),
+                    );
                     r.request_focus();
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -398,7 +420,9 @@ impl App {
                 Dialog::Delete { id, name } => {
                     ui.label(egui::RichText::new("Delete playlist?").font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
-                    ui.label(format!("“{name}” will be removed from Medley. Songs stay in your library."));
+                    ui.label(format!(
+                        "“{name}” will be removed from Medley. Songs stay in your library."
+                    ));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
                         if widgets::pill(ui, "Delete", theme::DANGER, Color32::WHITE).clicked() {
@@ -467,7 +491,11 @@ impl App {
         self.mem_checked = Instant::now();
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
-                let kb: f32 = line.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                let kb: f32 = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0.0);
                 self.rss_mb = kb / 1024.0;
             }
         }
@@ -535,7 +563,12 @@ impl eframe::App for App {
                     egui::Frame::new()
                         .fill(theme::PANEL)
                         .corner_radius(egui::CornerRadius::same(theme::RADIUS))
-                        .outer_margin(egui::Margin { left: 0, right: if show_right { 0 } else { 8 }, top: 8, bottom: 0 }),
+                        .outer_margin(egui::Margin {
+                            left: 0,
+                            right: if show_right { 0 } else { 8 },
+                            top: 8,
+                            bottom: 0,
+                        }),
                 )
                 .show(ui, |ui| {
                     if self.view == View::Settings {
@@ -561,7 +594,8 @@ impl eframe::App for App {
 
         // Repaint pacing: only while something moves.
         if player.status == PlayStatus::Playing {
-            let fast = self.view == View::NowPlaying || (self.cfg.ui.show_right_panel && self.right_tab == RightTab::Lyrics);
+            let fast =
+                self.view == View::NowPlaying || (self.cfg.ui.show_right_panel && self.right_tab == RightTab::Lyrics);
             ctx.request_repaint_after(Duration::from_millis(if fast { 100 } else { 500 }));
         } else if player.status == PlayStatus::Loading || feed_guard.scan.is_some() {
             ctx.request_repaint_after(Duration::from_millis(250));

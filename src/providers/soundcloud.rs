@@ -181,7 +181,11 @@ impl SoundCloud {
     pub async fn playlists(&self, user_id: u64) -> Result<Vec<ImportedPlaylist>> {
         let params = [("limit", "50"), ("linked_partitioning", "1")];
         let own = match self
-            .paginate(&api(&format!("/users/{user_id}/playlists_without_albums")), &params, MAX_PLAYLISTS)
+            .paginate(
+                &api(&format!("/users/{user_id}/playlists_without_albums")),
+                &params,
+                MAX_PLAYLISTS,
+            )
             .await
         {
             Ok(v) => v,
@@ -193,7 +197,11 @@ impl SoundCloud {
             }
         };
         let liked: Vec<Value> = match self
-            .paginate(&api(&format!("/users/{user_id}/playlist_likes")), &params, MAX_PLAYLISTS)
+            .paginate(
+                &api(&format!("/users/{user_id}/playlist_likes")),
+                &params,
+                MAX_PLAYLISTS,
+            )
             .await
         {
             Ok(items) => items
@@ -233,7 +241,11 @@ impl SoundCloud {
         let items = self
             .paginate(
                 &api("/search/tracks"),
-                &[("q", query), ("limit", page_size.as_str()), ("linked_partitioning", "1")],
+                &[
+                    ("q", query),
+                    ("limit", page_size.as_str()),
+                    ("linked_partitioning", "1"),
+                ],
                 limit,
             )
             .await
@@ -274,8 +286,14 @@ impl SoundCloud {
             .and_then(Value::as_str)
             .context("transcoding without url")?;
         // (Computed outside the macro: tracing's macros shadow `Value`.)
-        let protocol = chosen.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("?");
-        let mime = chosen.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("?");
+        let protocol = chosen
+            .pointer("/format/protocol")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let mime = chosen
+            .pointer("/format/mime_type")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
         debug!("SoundCloud: streaming \"{title}\" as {protocol} {mime}");
 
         let mut params = Vec::new();
@@ -314,12 +332,15 @@ impl SoundCloud {
             None => None,
         };
         let Some(url) = permalink else {
-            return Err(by_id.unwrap_or_else(|| {
-                anyhow!("\"{}\" ({}) is not a SoundCloud track", track.title, track.id)
-            }));
+            return Err(
+                by_id.unwrap_or_else(|| anyhow!("\"{}\" ({}) is not a SoundCloud track", track.title, track.id))
+            );
         };
         if let Some(e) = &by_id {
-            debug!("SoundCloud: /tracks lookup for {} failed ({e:#}); resolving {url}", track.id);
+            debug!(
+                "SoundCloud: /tracks lookup for {} failed ({e:#}); resolving {url}",
+                track.id
+            );
         }
         match self.get_json(&api("/resolve"), &[("url", url)]).await {
             Ok(v) if v.get("kind").and_then(Value::as_str) == Some("track") => Ok(v),
@@ -330,11 +351,7 @@ impl SoundCloud {
     }
 
     /// Fills in a playlist's track list (fetching compact track stubs in bulk) and converts it.
-    async fn load_playlist(
-        &self,
-        mut pl: Value,
-        cache: &mut HashMap<u64, Track>,
-    ) -> Result<ImportedPlaylist> {
+    async fn load_playlist(&self, mut pl: Value, cache: &mut HashMap<u64, Track>) -> Result<ImportedPlaylist> {
         let id = json_id(&pl).context("playlist without id")?;
         let track_count = pl.get("track_count").and_then(Value::as_u64).unwrap_or(0);
         let has_tracks = pl
@@ -348,7 +365,11 @@ impl SoundCloud {
                 .context("couldn't fetch playlist")?;
         }
 
-        let entries = pl.get("tracks").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+        let entries = pl
+            .get("tracks")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
         let mut order = Vec::with_capacity(entries.len());
         let mut missing = Vec::new();
         for entry in entries {
@@ -373,12 +394,7 @@ impl SoundCloud {
 
     /// Fetches full track objects for `ids` (in batches) into `into`. Unavailable tracks are
     /// silently absent from SoundCloud's answer.
-    async fn fetch_tracks(
-        &self,
-        ids: &[u64],
-        extra: &[(&str, &str)],
-        into: &mut HashMap<u64, Track>,
-    ) -> Result<()> {
+    async fn fetch_tracks(&self, ids: &[u64], extra: &[(&str, &str)], into: &mut HashMap<u64, Track>) -> Result<()> {
         let mut unique: Vec<u64> = ids.to_vec();
         unique.sort_unstable();
         unique.dedup();
@@ -437,7 +453,10 @@ impl SoundCloud {
                 _ => return Ok(out),
             }
         }
-        warn!("SoundCloud: stopped paginating {} after {MAX_PAGES} pages", url_path(url));
+        warn!(
+            "SoundCloud: stopped paginating {} after {MAX_PAGES} pages",
+            url_path(url)
+        );
         Ok(out)
     }
 
@@ -447,12 +466,7 @@ impl SoundCloud {
 
     /// GET an api-v2 URL with `client_id` (+ OAuth header when available), handling client_id
     /// expiry (401/403 → re-scrape once), rejected OAuth tokens and rate limiting.
-    async fn request_json(
-        &self,
-        url: &str,
-        params: &[(&str, &str)],
-        require_auth: bool,
-    ) -> Result<Value> {
+    async fn request_json(&self, url: &str, params: &[(&str, &str)], require_auth: bool) -> Result<Value> {
         let what = url_path(url);
         let mut rescraped = false;
         loop {
@@ -500,11 +514,7 @@ impl SoundCloud {
     }
 
     /// Sends a request, waiting out 429 responses (Retry-After, default 2s) up to 3 times.
-    async fn send_throttled(
-        &self,
-        req: reqwest::RequestBuilder,
-        what: &str,
-    ) -> Result<reqwest::Response> {
+    async fn send_throttled(&self, req: reqwest::RequestBuilder, what: &str) -> Result<reqwest::Response> {
         let mut attempts = 0;
         loop {
             let attempt = req.try_clone().context("request can't be retried")?;
@@ -639,7 +649,12 @@ fn parse_user(v: &Value) -> Option<ScUser> {
         .map(str::to_owned)
         .or_else(|| non_empty(v.get("permalink")).map(|p| format!("https://soundcloud.com/{p}")))
         .unwrap_or_default();
-    Some(ScUser { id, username, avatar, permalink_url })
+    Some(ScUser {
+        id,
+        username,
+        avatar,
+        permalink_url,
+    })
 }
 
 /// Builds the playlist from its JSON and the (ordered) track ids, looking the tracks up in
@@ -713,13 +728,11 @@ fn pick_transcoding(transcodings: &[Value]) -> Option<&Value> {
 // client_id scraping
 // -------------------------------------------------------------------------------------------
 
-static SCRIPT_SRC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).expect("valid regex")
-});
+static SCRIPT_SRC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<script\b[^>]*?\bsrc\s*=\s*["']([^"']+)["']"#).expect("valid regex"));
 
 static CLIENT_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"client_id\s*[:=]\s*"([a-zA-Z0-9]{32})"|client_id=([a-zA-Z0-9]{32})\b"#)
-        .expect("valid regex")
+    Regex::new(r#"client_id\s*[:=]\s*"([a-zA-Z0-9]{32})"|client_id=([a-zA-Z0-9]{32})\b"#).expect("valid regex")
 });
 
 /// Asset bundle URLs (`https://a-v2.sndcdn.com/assets/*.js`) referenced by the homepage, in
@@ -826,8 +839,7 @@ fn normalize_profile_url(input: &str) -> Result<String> {
     } else {
         format!("https://soundcloud.com/{s}")
     };
-    let url = Url::parse(&with_scheme)
-        .with_context(|| format!("invalid SoundCloud profile URL: {input}"))?;
+    let url = Url::parse(&with_scheme).with_context(|| format!("invalid SoundCloud profile URL: {input}"))?;
     match url.host_str() {
         Some("soundcloud.com" | "www.soundcloud.com" | "m.soundcloud.com") => {
             let name = url
@@ -973,7 +985,10 @@ mod tests {
         assert_eq!(t.artist, "Some DJ");
         assert_eq!(t.album, "");
         assert_eq!(t.duration_ms, 184_000);
-        assert_eq!(t.art.as_deref(), Some("https://i1.sndcdn.com/avatars-abcDEF123-xyz-t500x500.png"));
+        assert_eq!(
+            t.art.as_deref(),
+            Some("https://i1.sndcdn.com/avatars-abcDEF123-xyz-t500x500.png")
+        );
         assert_eq!(t.uri, "https://soundcloud.com/some-dj/live-mix");
 
         // Default avatars are no cover art.
@@ -1008,13 +1023,23 @@ mod tests {
     #[test]
     fn extracts_client_id_from_js() {
         let js = r#"(window.webpackJsonp=window.webpackJsonp||[]).push([[49],{123:function(e,t,n){"use strict";var r=n(4);e.exports={env:"production",client_id:"a3e059563d7fd3372b49b37f00a00bcf",api_host:"https://api-v2.soundcloud.com"}}}]);"#;
-        assert_eq!(extract_client_id(js).as_deref(), Some("a3e059563d7fd3372b49b37f00a00bcf"));
+        assert_eq!(
+            extract_client_id(js).as_deref(),
+            Some("a3e059563d7fd3372b49b37f00a00bcf")
+        );
 
         let assign = r#"var o={};o.client_id = "Zx9YwVuTsRqPoNmLkJiHgFeDcBa98765";"#;
-        assert_eq!(extract_client_id(assign).as_deref(), Some("Zx9YwVuTsRqPoNmLkJiHgFeDcBa98765"));
+        assert_eq!(
+            extract_client_id(assign).as_deref(),
+            Some("Zx9YwVuTsRqPoNmLkJiHgFeDcBa98765")
+        );
 
-        let query = r#"fetch("https://api-v2.soundcloud.com/me?client_id=0123456789abcdefABCDEF0123456789&app_version=1")"#;
-        assert_eq!(extract_client_id(query).as_deref(), Some("0123456789abcdefABCDEF0123456789"));
+        let query =
+            r#"fetch("https://api-v2.soundcloud.com/me?client_id=0123456789abcdefABCDEF0123456789&app_version=1")"#;
+        assert_eq!(
+            extract_client_id(query).as_deref(),
+            Some("0123456789abcdefABCDEF0123456789")
+        );
 
         // Wrong lengths don't match.
         assert_eq!(extract_client_id(r#"client_id:"tooshort""#), None);
@@ -1072,7 +1097,13 @@ mod tests {
         let opus = transcoding("hls", r#"audio/ogg; codecs="opus""#, false, "sq");
         let drm = transcoding("ctr-encrypted-hls", r#"audio/mp4; codecs="mp4a.40.2""#, false, "hq");
 
-        let all = [drm.clone(), aac.clone(), hls_mp3.clone(), prog_mp3.clone(), opus.clone()];
+        let all = [
+            drm.clone(),
+            aac.clone(),
+            hls_mp3.clone(),
+            prog_mp3.clone(),
+            opus.clone(),
+        ];
         assert_eq!(picked(&all).unwrap().0, "progressive");
 
         let no_progressive = [aac.clone(), hls_mp3.clone(), opus.clone()];
@@ -1100,12 +1131,16 @@ mod tests {
         let snip_prog = transcoding("progressive", "audio/mpeg", true, "sq");
         let full_aac = transcoding("hls", "audio/mp4", false, "sq");
         assert!(!picked(&[snip_prog.clone(), full_aac]).unwrap().2);
-        assert_eq!(picked(&[snip_prog]).unwrap(), ("progressive".into(), "audio/mpeg".into(), true));
+        assert_eq!(
+            picked(&[snip_prog]).unwrap(),
+            ("progressive".into(), "audio/mpeg".into(), true)
+        );
     }
 
     #[test]
     fn build_url_replaces_client_id() {
-        let next = "https://api-v2.soundcloud.com/users/183/track_likes?offset=1709208000000%2C123&limit=200&client_id=OLD";
+        let next =
+            "https://api-v2.soundcloud.com/users/183/track_likes?offset=1709208000000%2C123&limit=200&client_id=OLD";
         let url = build_url(next, &[], "NEW").unwrap();
         assert_eq!(
             url.as_str(),
@@ -1131,7 +1166,11 @@ mod tests {
             "tracks": [ { "id": 2 }, { "id": 1 }, { "id": 3 } ]
         });
         let mut tracks = HashMap::new();
-        for (id, art) in [(1u64, None), (2, Some("https://i1.sndcdn.com/a-t500x500.jpg")), (3, None)] {
+        for (id, art) in [
+            (1u64, None),
+            (2, Some("https://i1.sndcdn.com/a-t500x500.jpg")),
+            (3, None),
+        ] {
             let mut v = full_track_fixture();
             v["id"] = json!(id);
             v["title"] = json!(format!("T{id}"));
@@ -1156,7 +1195,10 @@ mod tests {
         assert_eq!(n("forss"), "https://soundcloud.com/forss");
         assert_eq!(n("@forss"), "https://soundcloud.com/forss");
         assert_eq!(n("soundcloud.com/forss/"), "https://soundcloud.com/forss");
-        assert_eq!(n("https://m.soundcloud.com/forss/likes?ref=x#top"), "https://soundcloud.com/forss");
+        assert_eq!(
+            n("https://m.soundcloud.com/forss/likes?ref=x#top"),
+            "https://soundcloud.com/forss"
+        );
         assert_eq!(n(" https://soundcloud.com/forss "), "https://soundcloud.com/forss");
         assert_eq!(n("https://on.soundcloud.com/AbCdE"), "https://on.soundcloud.com/AbCdE");
         assert!(normalize_profile_url("").is_err());

@@ -16,8 +16,8 @@ use crate::integrations::lyrics::LyricsFetcher;
 use crate::integrations::mpris::Mpris;
 use crate::library::{self, liked_playlist, Db, Library, LIKED_ID};
 use crate::model::{
-    normalize_artist, normalize_title, now_unix, ImportedPlaylist, Lyrics, Playlist, PlaylistKind,
-    RepeatMode, Source, Track,
+    normalize_artist, normalize_title, now_unix, ImportedPlaylist, Lyrics, Playlist, PlaylistKind, RepeatMode, Source,
+    Track,
 };
 use crate::player::mpv::{Mpv, MpvEvent, MpvOptions};
 use crate::player::queue::Queue;
@@ -29,7 +29,11 @@ use crate::providers::spotify_api::{self, SpotifyApi, SpotifyPlaylistMeta};
 /// Requests from the UI (and MPRIS).
 #[derive(Debug, Clone)]
 pub enum Command {
-    Play { tracks: Vec<Track>, start: usize, context: String },
+    Play {
+        tracks: Vec<Track>,
+        start: usize,
+        context: String,
+    },
     TogglePause,
     Pause,
     Resume,
@@ -46,13 +50,28 @@ pub enum Command {
     RemoveUpcoming(usize),
     ClearUpcoming,
     ToggleLike(Track),
-    CreatePlaylist { name: String, tracks: Vec<Track> },
-    AddToPlaylist { playlist_id: String, tracks: Vec<Track> },
-    RemoveFromPlaylist { playlist_id: String, index: usize },
-    RenamePlaylist { playlist_id: String, name: String },
+    CreatePlaylist {
+        name: String,
+        tracks: Vec<Track>,
+    },
+    AddToPlaylist {
+        playlist_id: String,
+        tracks: Vec<Track>,
+    },
+    RemoveFromPlaylist {
+        playlist_id: String,
+        index: usize,
+    },
+    RenamePlaylist {
+        playlist_id: String,
+        name: String,
+    },
     DeletePlaylist(String),
     ImportM3u(PathBuf),
-    ExportM3u { playlist_id: String, path: PathBuf },
+    ExportM3u {
+        playlist_id: String,
+        path: PathBuf,
+    },
     ImportAppleXml(PathBuf),
     ImportAppleApi,
     Rescan,
@@ -228,17 +247,35 @@ impl Shared {
 
 /// Results of background jobs, sent back into the service loop.
 enum Internal {
-    StreamReady { seq: u64, track: Track, url: String },
-    Resolved { seq: u64, original: Track, resolved: Option<Track> },
-    LoadFailed { seq: u64, error: String },
+    StreamReady {
+        seq: u64,
+        track: Track,
+        url: String,
+    },
+    Resolved {
+        seq: u64,
+        original: Track,
+        resolved: Option<Track>,
+    },
+    LoadFailed {
+        seq: u64,
+        error: String,
+    },
     SpotifyReady(Result<SpotifyEngine>),
     SpotifySynced(Result<SpotifySync>),
     SoundCloudSynced(Result<SoundCloudSync>),
     AppleImported(Result<(Vec<Track>, Vec<ImportedPlaylist>)>),
     M3uImported(Result<ImportedPlaylist>),
     ScanDone(library::scanner::ScanResult),
-    Lyrics { track_id: String, lyrics: Option<Lyrics> },
-    Search { query: String, spotify: Result<Vec<Track>>, soundcloud: Result<Vec<Track>> },
+    Lyrics {
+        track_id: String,
+        lyrics: Option<Lyrics>,
+    },
+    Search {
+        query: String,
+        spotify: Result<Vec<Track>>,
+        soundcloud: Result<Vec<Track>>,
+    },
     LastfmSession(Result<(String, String)>),
 }
 
@@ -351,12 +388,7 @@ type Started = (
 );
 
 impl Service {
-    fn new(
-        shared: Arc<Shared>,
-        paths: Paths,
-        cfg: Config,
-        cmd_tx: UnboundedSender<Command>,
-    ) -> Result<Started> {
+    fn new(shared: Arc<Shared>, paths: Paths, cfg: Config, cmd_tx: UnboundedSender<Command>) -> Result<Started> {
         let db = Db::open(&paths.database())?;
         let lib = Library::load(&db)?;
         *shared.library.write().unwrap() = lib;
@@ -368,10 +400,22 @@ impl Service {
         let receivers: Receivers = (mpv_rx, sp_rx, int_rx);
 
         let spotify_auth = Arc::new(SpotifyAuth::new(&cfg.spotify, &paths.spotify_dir()));
-        let soundcloud = Arc::new(SoundCloud::new(http.clone(), &cfg.soundcloud.client_id, &cfg.soundcloud.oauth_token));
-        let lyrics = Arc::new(LyricsFetcher::new(http.clone(), paths.lyrics_cache(), cfg.lyrics.online));
+        let soundcloud = Arc::new(SoundCloud::new(
+            http.clone(),
+            &cfg.soundcloud.client_id,
+            &cfg.soundcloud.oauth_token,
+        ));
+        let lyrics = Arc::new(LyricsFetcher::new(
+            http.clone(),
+            paths.lyrics_cache(),
+            cfg.lyrics.online,
+        ));
         let lastfm = make_lastfm(&cfg, &http, &paths);
-        let discord = Discord::spawn(cfg.discord.enabled, &cfg.discord.app_id, cfg.discord.song_as_activity_name);
+        let discord = Discord::spawn(
+            cfg.discord.enabled,
+            &cfg.discord.app_id,
+            cfg.discord.song_as_activity_name,
+        );
         let mpris = Mpris::new(cmd_tx.clone());
 
         let svc = Service {
@@ -451,11 +495,18 @@ impl Service {
             self.start_spotify_sync();
         }
         if self.cfg.soundcloud.enabled && self.soundcloud_configured() {
-            let last: i64 = self.db.get_kv("soundcloud_synced_at").and_then(|s| s.parse().ok()).unwrap_or(0);
+            let last: i64 = self
+                .db
+                .get_kv("soundcloud_synced_at")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             if now_unix() - last > 6 * 3600 {
                 self.start_soundcloud_sync();
             } else {
-                self.set_account(|f| &mut f.soundcloud, AccountStatus::Connected(self.db.get_kv("soundcloud_user").unwrap_or_default()));
+                self.set_account(
+                    |f| &mut f.soundcloud,
+                    AccountStatus::Connected(self.db.get_kv("soundcloud_user").unwrap_or_default()),
+                );
             }
         }
         if let Some(lfm) = self.lastfm.clone() {
@@ -553,7 +604,8 @@ impl Service {
                 } else {
                     self.queue.enqueue(tracks);
                 }
-                self.shared.info(format!("Added {n} track{} to the queue", if n == 1 { "" } else { "s" }));
+                self.shared
+                    .info(format!("Added {n} track{} to the queue", if n == 1 { "" } else { "s" }));
                 self.after_queue_change().await;
             }
             Command::PlayNext(tracks) => {
@@ -654,10 +706,14 @@ impl Service {
             Command::ExportM3u { playlist_id, path } => {
                 let tracks = {
                     let lib = self.shared.library.read().unwrap();
-                    lib.playlist(&playlist_id).map(|p| lib.tracks_for(&p.track_ids)).unwrap_or_default()
+                    lib.playlist(&playlist_id)
+                        .map(|p| lib.tracks_for(&p.track_ids))
+                        .unwrap_or_default()
                 };
                 match library::m3u::export(&path, &tracks) {
-                    Ok(n) => self.shared.info(format!("Exported {n} local tracks to {}", path.display())),
+                    Ok(n) => self
+                        .shared
+                        .info(format!("Exported {n} local tracks to {}", path.display())),
                     Err(e) => self.shared.error(format!("Export failed: {e:#}")),
                 }
             }
@@ -761,7 +817,10 @@ impl Service {
                 tokio::spawn(async move {
                     let msg = match sc.stream_url(&track).await {
                         Ok(url) => Internal::StreamReady { seq, track, url },
-                        Err(e) => Internal::LoadFailed { seq, error: format!("SoundCloud: {e:#}") },
+                        Err(e) => Internal::LoadFailed {
+                            seq,
+                            error: format!("SoundCloud: {e:#}"),
+                        },
                     };
                     let _ = tx.send(msg);
                 });
@@ -787,7 +846,11 @@ impl Service {
                 let resolver = self.resolver();
                 tokio::spawn(async move {
                     let resolved = resolver.resolve(&track).await;
-                    let _ = tx.send(Internal::Resolved { seq, original: track, resolved });
+                    let _ = tx.send(Internal::Resolved {
+                        seq,
+                        original: track,
+                        resolved,
+                    });
                 });
             }
         }
@@ -796,7 +859,10 @@ impl Service {
     async fn dispatch_resolved(&mut self, original: Track, resolved: Option<Track>, start: f64) {
         match resolved {
             Some(t) if t.source != Source::AppleMusic => {
-                let _ = self.db.set_kv(&format!("resolve:{}", original.id), &serde_json::to_string(&t).unwrap_or_default());
+                let _ = self.db.set_kv(
+                    &format!("resolve:{}", original.id),
+                    &serde_json::to_string(&t).unwrap_or_default(),
+                );
                 {
                     let mut pv = self.shared.player.write().unwrap();
                     pv.via = Some(t.clone());
@@ -861,7 +927,8 @@ impl Service {
 
     async fn start_spotify(&mut self, track: Track, start: f64) {
         if !self.cfg.spotify.enabled || !self.spotify_auth.has_login() {
-            self.load_failed("Log in to Spotify in Settings to play Spotify tracks".into()).await;
+            self.load_failed("Log in to Spotify in Settings to play Spotify tracks".into())
+                .await;
             return;
         }
         if self.spotify.is_none() {
@@ -906,7 +973,10 @@ impl Service {
     }
 
     fn spotify_audio_cache(&self) -> Option<PathBuf> {
-        self.cfg.spotify.cache_audio.then(|| self.paths.cache_dir.join("spotify"))
+        self.cfg
+            .spotify
+            .cache_audio
+            .then(|| self.paths.cache_dir.join("spotify"))
     }
 
     async fn load_failed(&mut self, error: String) {
@@ -933,7 +1003,9 @@ impl Service {
         }
         self.started_reported = true;
         self.consecutive_failures = 0;
-        let Some(track) = self.queue.current().cloned() else { return };
+        let Some(track) = self.queue.current().cloned() else {
+            return;
+        };
         let now = now_unix();
         let _ = self.db.record_play(&track.id, now);
         {
@@ -1006,7 +1078,11 @@ impl Service {
     }
 
     async fn seek(&mut self, secs: f64) {
-        let secs = if self.duration > 0.0 { secs.clamp(0.0, self.duration - 0.5) } else { secs.max(0.0) };
+        let secs = if self.duration > 0.0 {
+            secs.clamp(0.0, self.duration - 0.5)
+        } else {
+            secs.max(0.0)
+        };
         match self.engine {
             Engine::Mpv => {
                 if let Some(mpv) = &self.mpv {
@@ -1060,7 +1136,10 @@ impl Service {
         }
         let Some(mpv) = &self.mpv else { return };
         let next = self.queue.peek_next().cloned();
-        let want = next.as_ref().filter(|t| t.source == Source::Local).map(|t| t.id.clone());
+        let want = next
+            .as_ref()
+            .filter(|t| t.source == Source::Local)
+            .map(|t| t.id.clone());
         if want == self.mpv_preloaded {
             return;
         }
@@ -1139,8 +1218,11 @@ impl Service {
                 }
                 "error" => {
                     let name = self.playing.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-                    self.load_failed(format!("Can't play “{name}”: {}", error.unwrap_or_else(|| "unknown error".into())))
-                        .await;
+                    self.load_failed(format!(
+                        "Can't play “{name}”: {}",
+                        error.unwrap_or_else(|| "unknown error".into())
+                    ))
+                    .await;
                 }
                 _ => {}
             },
@@ -1186,7 +1268,8 @@ impl Service {
             }
             SpotifyEvent::Unavailable => {
                 let name = self.playing.as_ref().map(|t| t.title.clone()).unwrap_or_default();
-                self.load_failed(format!("“{name}” is not available on Spotify in your region")).await;
+                self.load_failed(format!("“{name}” is not available on Spotify in your region"))
+                    .await;
             }
             SpotifyEvent::Stopped => {}
         }
@@ -1258,8 +1341,11 @@ impl Service {
             pv.repeat = self.queue.repeat;
             pv.context = self.queue.context_name.clone();
         }
-        self.mpris
-            .update(self.queue.current(), self.status == PlayStatus::Playing, self.current_position());
+        self.mpris.update(
+            self.queue.current(),
+            self.status == PlayStatus::Playing,
+            self.current_position(),
+        );
         self.shared.repaint();
     }
 
@@ -1273,18 +1359,22 @@ impl Service {
     }
 
     fn update_presence(&self) {
-        let presence = self.queue.current().filter(|_| self.status != PlayStatus::Stopped).map(|t| {
-            let mut track = t.clone();
-            // Resolved imports have no art of their own; borrow the playing version's cover.
-            if track.art.is_none() {
-                track.art = self.playing.as_ref().and_then(|p| p.art.clone());
-            }
-            Presence {
-                track,
-                position_secs: self.current_position(),
-                playing: self.status == PlayStatus::Playing,
-            }
-        });
+        let presence = self
+            .queue
+            .current()
+            .filter(|_| self.status != PlayStatus::Stopped)
+            .map(|t| {
+                let mut track = t.clone();
+                // Resolved imports have no art of their own; borrow the playing version's cover.
+                if track.art.is_none() {
+                    track.art = self.playing.as_ref().and_then(|p| p.art.clone());
+                }
+                Presence {
+                    track,
+                    position_secs: self.current_position(),
+                    playing: self.status == PlayStatus::Playing,
+                }
+            });
         self.discord.set(presence);
     }
 
@@ -1348,7 +1438,11 @@ impl Service {
     fn store_tracks(&mut self, tracks: &[Track]) {
         let new: Vec<Track> = {
             let lib = self.shared.library.read().unwrap();
-            tracks.iter().filter(|t| !lib.tracks.contains_key(&t.id)).cloned().collect()
+            tracks
+                .iter()
+                .filter(|t| !lib.tracks.contains_key(&t.id))
+                .cloned()
+                .collect()
         };
         if new.is_empty() {
             return;
@@ -1498,7 +1592,8 @@ impl Service {
                     let mut lib = self.shared.library.write().unwrap();
                     let referenced: HashSet<String> =
                         lib.playlists.iter().flat_map(|p| p.track_ids.iter().cloned()).collect();
-                    lib.tracks.retain(|id, t| t.source == Source::Local || referenced.contains(id));
+                    lib.tracks
+                        .retain(|id, t| t.source == Source::Local || referenced.contains(id));
                     lib.reindex();
                 }
             }
@@ -1511,7 +1606,10 @@ impl Service {
         let auth = self.spotify_auth.clone();
         let tx = self.cmd_tx.clone();
         let shared = self.shared.clone();
-        self.set_account(|f| &mut f.spotify, AccountStatus::Working("Waiting for browser login…".into()));
+        self.set_account(
+            |f| &mut f.spotify,
+            AccountStatus::Working("Waiting for browser login…".into()),
+        );
         tokio::spawn(async move {
             match auth.login().await {
                 Ok(_) => {
@@ -1576,7 +1674,10 @@ impl Service {
         let mut playlists = Vec::new();
         let existing: HashMap<String, Vec<String>> = {
             let lib = self.shared.library.read().unwrap();
-            lib.playlists.iter().map(|p| (p.id.clone(), p.track_ids.clone())).collect()
+            lib.playlists
+                .iter()
+                .map(|p| (p.id.clone(), p.track_ids.clone()))
+                .collect()
         };
         let liked_ids: Vec<String> = sync.liked.iter().map(|t| t.id.clone()).collect();
         tracks.extend(sync.liked);
@@ -1596,7 +1697,9 @@ impl Service {
                 Some(list) => {
                     let ids = list.iter().map(|t| t.id.clone()).collect();
                     tracks.extend(list);
-                    let _ = self.db.set_kv(&format!("spotify_snapshot:{}", meta.id), &meta.snapshot_id);
+                    let _ = self
+                        .db
+                        .set_kv(&format!("spotify_snapshot:{}", meta.id), &meta.snapshot_id);
                     ids
                 }
                 None => existing.get(&id).cloned().unwrap_or_default(),
@@ -1635,7 +1738,11 @@ impl Service {
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
             let r = async {
-                let user = if profile.is_empty() { sc.me().await? } else { sc.resolve_user(&profile).await? };
+                let user = if profile.is_empty() {
+                    sc.me().await?
+                } else {
+                    sc.resolve_user(&profile).await?
+                };
                 let likes = sc.likes(user.id).await?;
                 let playlists = sc.playlists(user.id).await.unwrap_or_else(|e| {
                     tracing::warn!("SoundCloud playlists: {e:#}");
@@ -1677,11 +1784,16 @@ impl Service {
             });
             tracks.extend(p.tracks);
         }
-        self.merge_imported(tracks, playlists, &[PlaylistKind::SoundCloud, PlaylistKind::SoundCloudLikes]);
+        self.merge_imported(
+            tracks,
+            playlists,
+            &[PlaylistKind::SoundCloud, PlaylistKind::SoundCloudLikes],
+        );
         let _ = self.db.set_kv("soundcloud_user", &sync.user);
         let _ = self.db.set_kv("soundcloud_synced_at", &now_unix().to_string());
         self.set_account(|f| &mut f.soundcloud, AccountStatus::Connected(sync.user));
-        self.shared.info(format!("SoundCloud synced: likes + {count} playlists"));
+        self.shared
+            .info(format!("SoundCloud synced: likes + {count} playlists"));
     }
 
     // ---------------------------------------------------------------- apple music
@@ -1703,7 +1815,11 @@ impl Service {
                 } else {
                     dev
                 };
-                let store = if store.trim().is_empty() { "us".to_string() } else { store };
+                let store = if store.trim().is_empty() {
+                    "us".to_string()
+                } else {
+                    store
+                };
                 let api = AppleMusicApi::new(http, dev.trim(), user.trim(), &store);
                 let songs = api.library_songs().await?;
                 let playlists = api.library_playlists().await?;
@@ -1742,7 +1858,10 @@ impl Service {
             tracks.extend(p.tracks);
         }
         self.merge_imported(tracks, playlists, &[]);
-        self.shared.info(format!("Apple Music imported: {} songs, {count} playlists", songs.len()));
+        self.shared.info(format!(
+            "Apple Music imported: {} songs, {count} playlists",
+            songs.len()
+        ));
     }
 
     // ---------------------------------------------------------------- search, last.fm
@@ -1792,7 +1911,10 @@ impl Service {
             self.shared.error("Enter your Last.fm API key and secret first");
             return;
         };
-        self.set_account(|f| &mut f.lastfm, AccountStatus::Working("Approve Medley in your browser…".into()));
+        self.set_account(
+            |f| &mut f.lastfm,
+            AccountStatus::Working("Approve Medley in your browser…".into()),
+        );
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
             let r = async {
@@ -1823,10 +1945,28 @@ impl Service {
         if old.playback != self.cfg.playback {
             if let Some(mpv) = &self.mpv {
                 let p = &self.cfg.playback;
-                let _ = mpv.command(serde_json::json!(["set_property", "replaygain", if p.replaygain { "track" } else { "no" }])).await;
-                let _ = mpv.command(serde_json::json!(["set_property", "gapless-audio", if p.gapless { "weak" } else { "no" }])).await;
-                let dev = if p.audio_device.is_empty() { "auto" } else { p.audio_device.as_str() };
-                let _ = mpv.command(serde_json::json!(["set_property", "audio-device", dev])).await;
+                let _ = mpv
+                    .command(serde_json::json!([
+                        "set_property",
+                        "replaygain",
+                        if p.replaygain { "track" } else { "no" }
+                    ]))
+                    .await;
+                let _ = mpv
+                    .command(serde_json::json!([
+                        "set_property",
+                        "gapless-audio",
+                        if p.gapless { "weak" } else { "no" }
+                    ]))
+                    .await;
+                let dev = if p.audio_device.is_empty() {
+                    "auto"
+                } else {
+                    p.audio_device.as_str()
+                };
+                let _ = mpv
+                    .command(serde_json::json!(["set_property", "audio-device", dev]))
+                    .await;
             }
             if old.playback.mpv_path != self.cfg.playback.mpv_path && self.engine != Engine::Mpv {
                 if let Some(mpv) = self.mpv.take() {
@@ -1850,10 +1990,16 @@ impl Service {
             ));
         }
         if old.lyrics != self.cfg.lyrics {
-            self.lyrics = Arc::new(LyricsFetcher::new(self.http.clone(), self.paths.lyrics_cache(), self.cfg.lyrics.online));
+            self.lyrics = Arc::new(LyricsFetcher::new(
+                self.http.clone(),
+                self.paths.lyrics_cache(),
+                self.cfg.lyrics.online,
+            ));
         }
         if old.spotify != self.cfg.spotify {
-            if old.spotify.client_id != self.cfg.spotify.client_id || old.spotify.redirect_port != self.cfg.spotify.redirect_port {
+            if old.spotify.client_id != self.cfg.spotify.client_id
+                || old.spotify.redirect_port != self.cfg.spotify.redirect_port
+            {
                 self.spotify_auth = Arc::new(SpotifyAuth::new(&self.cfg.spotify, &self.paths.spotify_dir()));
                 self.publish_accounts();
             }
@@ -1934,7 +2080,11 @@ impl Service {
                     self.start_mpv(track, &url, start).await;
                 }
             }
-            Internal::Resolved { seq, original, resolved } => {
+            Internal::Resolved {
+                seq,
+                original,
+                resolved,
+            } => {
                 if seq == self.load_seq {
                     let start = self.position;
                     self.dispatch_resolved(original, resolved, start).await;
@@ -2006,7 +2156,11 @@ impl Service {
                 drop(feed);
                 self.shared.repaint();
             }
-            Internal::Search { query, spotify, soundcloud } => {
+            Internal::Search {
+                query,
+                spotify,
+                soundcloud,
+            } => {
                 let mut feed = self.shared.feed.write().unwrap();
                 if feed.search.query == query {
                     feed.search.pending = 0;
@@ -2082,7 +2236,11 @@ async fn spotify_sync(auth: &SpotifyAuth, api: &SpotifyApi, known: &HashMap<Stri
     }
     let liked = api.liked_tracks(&auth.token().await?).await?;
     Ok(SpotifySync {
-        user: if user.display_name.is_empty() { user.id } else { user.display_name },
+        user: if user.display_name.is_empty() {
+            user.id
+        } else {
+            user.display_name
+        },
         playlists,
         liked,
     })
@@ -2170,7 +2328,12 @@ mod tests {
 
     #[test]
     fn best_match_prefers_exact_and_close_duration() {
-        let target = track(Source::AppleMusic, "Daft Punk", "Get Lucky (feat. Pharrell Williams)", 248_000);
+        let target = track(
+            Source::AppleMusic,
+            "Daft Punk",
+            "Get Lucky (feat. Pharrell Williams)",
+            248_000,
+        );
         let candidates = vec![
             track(Source::Spotify, "Daft Punk", "Get Lucky - Radio Edit", 250_000),
             track(Source::Spotify, "Daft Punk, Pharrell Williams", "Get Lucky", 248_500),

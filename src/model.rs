@@ -95,7 +95,17 @@ pub fn normalize_title(s: &str) -> String {
     let lower = s.to_lowercase();
     // Cut decorations that differ between services.
     let mut cut = lower.as_str();
-    for marker in [" (feat", " [feat", " feat.", " ft.", " - remaster", " (remaster", " [remaster", " - single", " - radio edit"] {
+    for marker in [
+        " (feat",
+        " [feat",
+        " feat.",
+        " ft.",
+        " - remaster",
+        " (remaster",
+        " [remaster",
+        " - single",
+        " - radio edit",
+    ] {
         if let Some(i) = cut.find(marker) {
             cut = &cut[..i];
         }
@@ -289,9 +299,18 @@ mod tests {
     fn lyric_line_lookup() {
         let l = Lyrics {
             synced: vec![
-                LyricLine { time_ms: 1000, text: "a".into() },
-                LyricLine { time_ms: 2000, text: "b".into() },
-                LyricLine { time_ms: 3000, text: "c".into() },
+                LyricLine {
+                    time_ms: 1000,
+                    text: "a".into(),
+                },
+                LyricLine {
+                    time_ms: 2000,
+                    text: "b".into(),
+                },
+                LyricLine {
+                    time_ms: 3000,
+                    text: "c".into(),
+                },
             ],
             ..Default::default()
         };

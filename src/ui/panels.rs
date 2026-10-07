@@ -1,6 +1,8 @@
 //! Window chrome: sidebar, player bar and the right panel (lyrics / queue).
 
-use egui::{vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Id, Layout, Margin, Pos2, Rect, Sense, Ui, UiBuilder};
+use egui::{
+    vec2, Align, Align2, Color32, CornerRadius, CursorIcon, Id, Layout, Margin, Pos2, Rect, Sense, Ui, UiBuilder,
+};
 use egui_phosphor::regular as icon;
 
 use super::theme::{self, *};
@@ -147,20 +149,34 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, view: &View) {
 }
 
 fn nav_item(ui: &mut Ui, cx: &mut Cx, glyph: &str, label: &str, target: View, current: &View) {
-    let active = *current == target
-        || (target == View::Albums && matches!(current, View::Album(_)));
+    let active = *current == target || (target == View::Albums && matches!(current, View::Album(_)));
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::click());
     let color = if active || resp.hovered() { TEXT } else { TEXT_DIM };
     if active {
-        ui.painter().rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 10));
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 10));
     }
-    let font = if active { theme::fill_icon_font(20.0) } else { theme::icon_font(20.0) };
-    ui.painter().text(rect.left_center() + vec2(14.0, 0.0), Align2::CENTER_CENTER, glyph, font, color);
+    let font = if active {
+        theme::fill_icon_font(20.0)
+    } else {
+        theme::icon_font(20.0)
+    };
+    ui.painter().text(
+        rect.left_center() + vec2(14.0, 0.0),
+        Align2::CENTER_CENTER,
+        glyph,
+        font,
+        color,
+    );
     ui.painter().text(
         rect.left_center() + vec2(36.0, 0.0),
         Align2::LEFT_CENTER,
         label,
-        if active { theme::bold_font(15.0) } else { theme::font(15.0) },
+        if active {
+            theme::bold_font(15.0)
+        } else {
+            theme::font(15.0)
+        },
         color,
     );
     if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
@@ -175,38 +191,73 @@ pub fn player_bar(ui: &mut Ui, cx: &mut Cx, right: Option<RightTab>) {
         .exact_size(92.0)
         .resizable(false)
         .show_separator_line(false)
-        .frame(egui::Frame::new().fill(WINDOW_BG).inner_margin(Margin::symmetric(16, 10)))
+        .frame(
+            egui::Frame::new()
+                .fill(WINDOW_BG)
+                .inner_margin(Margin::symmetric(16, 10)),
+        )
         .show(ui, |ui| {
             let full = ui.max_rect();
             let side_w = (full.width() * 0.3).clamp(220.0, 420.0);
             let left = Rect::from_min_size(full.min, vec2(side_w, full.height()));
             let right_r = Rect::from_min_max(Pos2::new(full.right() - side_w, full.top()), full.max);
-            let center = Rect::from_min_max(Pos2::new(left.right() + 16.0, full.top()), Pos2::new(right_r.left() - 16.0, full.bottom()));
+            let center = Rect::from_min_max(
+                Pos2::new(left.right() + 16.0, full.top()),
+                Pos2::new(right_r.left() - 16.0, full.bottom()),
+            );
 
             now_playing_info(ui, cx, left);
             ui.scope_builder(UiBuilder::new().max_rect(center), |ui| transport(ui, cx));
-            ui.scope_builder(UiBuilder::new().max_rect(right_r).layout(Layout::right_to_left(Align::Center)), |ui| {
-                extras(ui, cx, right)
-            });
+            ui.scope_builder(
+                UiBuilder::new()
+                    .max_rect(right_r)
+                    .layout(Layout::right_to_left(Align::Center)),
+                |ui| extras(ui, cx, right),
+            );
         });
 }
 
 fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
     let Some(t) = cx.player.current.clone() else {
-        ui.painter().text(rect.left_center(), Align2::LEFT_CENTER, "Nothing playing", theme::font(13.0), TEXT_FAINT);
+        ui.painter().text(
+            rect.left_center(),
+            Align2::LEFT_CENTER,
+            "Nothing playing",
+            theme::font(13.0),
+            TEXT_FAINT,
+        );
         return;
     };
     let art_rect = Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - 32.0), vec2(64.0, 64.0));
-    let art_src = t.art.clone().or_else(|| cx.player.via.as_ref().and_then(|v| v.art.clone()));
+    let art_src = t
+        .art
+        .clone()
+        .or_else(|| cx.player.via.as_ref().and_then(|v| v.art.clone()));
     widgets::cover(ui, cx.art, art_src.as_deref(), art_rect, 8, widgets::track_fallback(&t));
-    let art_resp = ui.interact(art_rect, Id::new("np-art"), Sense::click()).on_hover_text("Now playing view (L)");
+    let art_resp = ui
+        .interact(art_rect, Id::new("np-art"), Sense::click())
+        .on_hover_text("Now playing view (L)");
     if art_resp.clicked() {
         cx.actions.push(Action::Go(View::NowPlaying));
     }
     let x = art_rect.right() + 14.0;
     let w = rect.right() - x - 40.0;
-    let tr = text_trunc(ui, Pos2::new(x, rect.center().y - 22.0), &t.title, theme::bold_font(14.5), TEXT, w);
-    let ar = text_trunc(ui, Pos2::new(x, rect.center().y - 2.0), &t.artist, theme::font(12.5), TEXT_DIM, w);
+    let tr = text_trunc(
+        ui,
+        Pos2::new(x, rect.center().y - 22.0),
+        &t.title,
+        theme::bold_font(14.5),
+        TEXT,
+        w,
+    );
+    let ar = text_trunc(
+        ui,
+        Pos2::new(x, rect.center().y - 2.0),
+        &t.artist,
+        theme::font(12.5),
+        TEXT_DIM,
+        w,
+    );
     let title_resp = ui.interact(tr.union(ar), Id::new("np-title"), Sense::click());
     if title_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
         cx.actions.push(Action::Go(View::NowPlaying));
@@ -217,8 +268,21 @@ fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
     };
     let src_color = theme::with_alpha(source_color(src), 210);
     let y = rect.center().y + 16.0;
-    ui.painter().text(Pos2::new(x, y), Align2::LEFT_TOP, theme::source_icon(src), theme::icon_font(12.5), src_color);
-    text_trunc(ui, Pos2::new(x + 17.0, y), &format!("{prefix}{}", src.label()), theme::font(11.5), src_color, w - 17.0);
+    ui.painter().text(
+        Pos2::new(x, y),
+        Align2::LEFT_TOP,
+        theme::source_icon(src),
+        theme::icon_font(12.5),
+        src_color,
+    );
+    text_trunc(
+        ui,
+        Pos2::new(x + 17.0, y),
+        &format!("{prefix}{}", src.label()),
+        theme::font(11.5),
+        src_color,
+        w - 17.0,
+    );
 
     // Like button.
     let liked = cx.lib.is_liked(&t.id);
@@ -227,10 +291,22 @@ fn now_playing_info(ui: &mut Ui, cx: &mut Cx, rect: Rect) {
     let (glyph, font, color) = if liked {
         (egui_phosphor::fill::HEART, theme::fill_icon_font(18.0), cx.accent)
     } else {
-        (icon::HEART, theme::icon_font(18.0), if resp.hovered() { TEXT } else { TEXT_DIM })
+        (
+            icon::HEART,
+            theme::icon_font(18.0),
+            if resp.hovered() { TEXT } else { TEXT_DIM },
+        )
     };
-    ui.painter().text(heart.center(), Align2::CENTER_CENTER, glyph, font, color);
-    if resp.on_hover_text(if liked { "Remove from Liked Songs" } else { "Save to Liked Songs" }).clicked() {
+    ui.painter()
+        .text(heart.center(), Align2::CENTER_CENTER, glyph, font, color);
+    if resp
+        .on_hover_text(if liked {
+            "Remove from Liked Songs"
+        } else {
+            "Save to Liked Songs"
+        })
+        .clicked()
+    {
         cx.actions.push(Action::Cmd(Command::ToggleLike(t)));
     }
 }
@@ -278,7 +354,10 @@ fn transport(ui: &mut Ui, cx: &mut Cx) {
             // While dragging, show the dragged position instead of the playing one.
             let drag: Option<f32> = ui.data(|d| d.get_temp(id));
             let shown = drag.map(|f| f as f64 * dur).unwrap_or(pos);
-            ui.add_sized(vec2(time_w, 16.0), egui::Label::new(egui::RichText::new(theme::fmt_time(shown)).size(11.5).color(TEXT_DIM)));
+            ui.add_sized(
+                vec2(time_w, 16.0),
+                egui::Label::new(egui::RichText::new(theme::fmt_time(shown)).size(11.5).color(TEXT_DIM)),
+            );
             let frac = if dur > 0.0 { (shown / dur) as f32 } else { 0.0 };
             let (resp, changed) = widgets::bar(ui, id, bar_w, frac, cx.accent);
             if let Some(f) = changed {
@@ -290,8 +369,15 @@ fn transport(ui: &mut Ui, cx: &mut Cx) {
                 }
                 ui.data_mut(|d| d.remove::<f32>(id));
             }
-            let total = if dur > 0.0 { theme::fmt_time(dur) } else { "–:––".into() };
-            ui.add_sized(vec2(time_w, 16.0), egui::Label::new(egui::RichText::new(total).size(11.5).color(TEXT_DIM)));
+            let total = if dur > 0.0 {
+                theme::fmt_time(dur)
+            } else {
+                "–:––".into()
+            };
+            ui.add_sized(
+                vec2(time_w, 16.0),
+                egui::Label::new(egui::RichText::new(total).size(11.5).color(TEXT_DIM)),
+            );
         });
     });
 }
@@ -325,11 +411,19 @@ fn extras(ui: &mut Ui, cx: &mut Cx, right: Option<RightTab>) {
     if widgets::icon_button(ui, icon::CORNERS_OUT, 18.0, TEXT_DIM, "Now playing view (L)").clicked() {
         cx.actions.push(Action::Go(View::NowPlaying));
     }
-    let q_c = if right == Some(RightTab::Queue) { cx.accent } else { TEXT_DIM };
+    let q_c = if right == Some(RightTab::Queue) {
+        cx.accent
+    } else {
+        TEXT_DIM
+    };
     if widgets::icon_button(ui, icon::QUEUE, 18.0, q_c, "Queue").clicked() {
         cx.actions.push(Action::RightTab(RightTab::Queue));
     }
-    let l_c = if right == Some(RightTab::Lyrics) { cx.accent } else { TEXT_DIM };
+    let l_c = if right == Some(RightTab::Lyrics) {
+        cx.accent
+    } else {
+        TEXT_DIM
+    };
     if widgets::icon_button(ui, icon::MICROPHONE_STAGE, 18.0, l_c, "Lyrics").clicked() {
         cx.actions.push(Action::RightTab(RightTab::Lyrics));
     }
@@ -342,7 +436,12 @@ pub fn right_panel(ui: &mut Ui, cx: &mut Cx, tab: RightTab) {
         .exact_size(340.0)
         .resizable(false)
         .show_separator_line(false)
-        .frame(egui::Frame::new().inner_margin(Margin { left: 8, right: 8, top: 8, bottom: 0 }))
+        .frame(egui::Frame::new().inner_margin(Margin {
+            left: 8,
+            right: 8,
+            top: 8,
+            bottom: 0,
+        }))
         .show(ui, |ui| {
             card().inner_margin(Margin::same(14)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -412,12 +511,19 @@ pub fn lyrics(ui: &mut Ui, cx: &mut Cx, big: bool) {
     let pos_ms = (cx.player.position_now() * 1000.0) as u64;
     let id = Id::new(("lyrics-scroll", big));
     if lyrics.synced.is_empty() {
-        egui::ScrollArea::vertical().id_salt(id).auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(egui::RichText::new("Unsynced lyrics").small().color(TEXT_FAINT));
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new(&lyrics.plain).font(theme::bold_font(size * 0.8)).color(TEXT_DIM));
-            provider(ui, &lyrics.provider);
-        });
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Unsynced lyrics").small().color(TEXT_FAINT));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(&lyrics.plain)
+                        .font(theme::bold_font(size * 0.8))
+                        .color(TEXT_DIM),
+                );
+                provider(ui, &lyrics.provider);
+            });
         return;
     }
     let current = lyrics.line_at(pos_ms);
@@ -449,7 +555,11 @@ pub fn lyrics(ui: &mut Ui, cx: &mut Cx, big: bool) {
                     -1 => theme::with_alpha(TEXT_DIM, if big { 150 } else { 170 }),
                     _ => theme::with_alpha(TEXT_FAINT, if big { 200 } else { 255 }),
                 };
-                let text = if line.text.trim().is_empty() { "♪" } else { line.text.as_str() };
+                let text = if line.text.trim().is_empty() {
+                    "♪"
+                } else {
+                    line.text.as_str()
+                };
                 let resp = ui.add(
                     egui::Label::new(egui::RichText::new(text).font(theme::bold_font(size)).color(color))
                         .wrap()
@@ -468,7 +578,8 @@ pub fn lyrics(ui: &mut Ui, cx: &mut Cx, big: bool) {
                     ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                 }
                 if resp.clicked() {
-                    cx.actions.push(Action::Cmd(Command::Seek(line.time_ms as f64 / 1000.0)));
+                    cx.actions
+                        .push(Action::Cmd(Command::Seek(line.time_ms as f64 / 1000.0)));
                 }
                 if state == 0 && changed && !held {
                     resp.scroll_to_me(Some(Align::Center));
@@ -486,14 +597,23 @@ pub fn lyrics(ui: &mut Ui, cx: &mut Cx, big: bool) {
 fn provider(ui: &mut Ui, name: &str) {
     if !name.is_empty() {
         ui.add_space(16.0);
-        ui.label(egui::RichText::new(format!("Lyrics from {name}")).size(11.0).color(TEXT_FAINT));
+        ui.label(
+            egui::RichText::new(format!("Lyrics from {name}"))
+                .size(11.0)
+                .color(TEXT_FAINT),
+        );
     }
 }
 
 pub fn empty_state(ui: &mut Ui, glyph: &str, text: &str) {
     ui.add_space(40.0);
     ui.vertical_centered(|ui| {
-        ui.label(egui::RichText::new(glyph).family(theme::icons()).size(42.0).color(TEXT_FAINT));
+        ui.label(
+            egui::RichText::new(glyph)
+                .family(theme::icons())
+                .size(42.0)
+                .color(TEXT_FAINT),
+        );
         ui.add_space(8.0);
         ui.label(egui::RichText::new(text).color(TEXT_DIM));
     });
@@ -501,7 +621,11 @@ pub fn empty_state(ui: &mut Ui, glyph: &str, text: &str) {
 
 fn queue(ui: &mut Ui, cx: &mut Cx) {
     if let Some(t) = cx.player.current.clone() {
-        ui.label(egui::RichText::new("Now playing").font(theme::bold_font(13.0)).color(TEXT_DIM));
+        ui.label(
+            egui::RichText::new("Now playing")
+                .font(theme::bold_font(13.0))
+                .color(TEXT_DIM),
+        );
         ui.add_space(4.0);
         queue_row(ui, cx, &t, None, true);
         ui.add_space(10.0);
@@ -519,19 +643,24 @@ fn queue(ui: &mut Ui, cx: &mut Cx) {
         };
         ui.label(egui::RichText::new(label).font(theme::bold_font(13.0)).color(TEXT_DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(egui::Label::new(egui::RichText::new("Clear").small().color(TEXT_FAINT)).sense(Sense::click())).clicked() {
+            if ui
+                .add(egui::Label::new(egui::RichText::new("Clear").small().color(TEXT_FAINT)).sense(Sense::click()))
+                .clicked()
+            {
                 cx.actions.push(Action::Cmd(Command::ClearUpcoming));
             }
         });
     });
     ui.add_space(4.0);
     let n = upcoming.len();
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show_rows(ui, 52.0, n, |ui, range| {
-        for i in range {
-            let t = cx.player.upcoming[i].clone();
-            queue_row(ui, cx, &t, Some(i), false);
-        }
-    });
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show_rows(ui, 52.0, n, |ui, range| {
+            for i in range {
+                let t = cx.player.upcoming[i].clone();
+                queue_row(ui, cx, &t, Some(i), false);
+            }
+        });
 }
 
 fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<usize>, current: bool) {
@@ -540,17 +669,43 @@ fn queue_row(ui: &mut Ui, cx: &mut Cx, t: &crate::model::Track, index: Option<us
         ui.painter().rect_filled(rect, CornerRadius::same(8), HOVER);
     }
     let art = Rect::from_min_size(rect.min + vec2(4.0, 6.0), vec2(40.0, 40.0));
-    let src = t.art.clone().or_else(|| if current { cx.player.via.as_ref().and_then(|v| v.art.clone()) } else { None });
+    let src = t.art.clone().or_else(|| {
+        if current {
+            cx.player.via.as_ref().and_then(|v| v.art.clone())
+        } else {
+            None
+        }
+    });
     widgets::cover(ui, cx.art, src.as_deref(), art, 5, widgets::track_fallback(t));
     let x = art.right() + 10.0;
     let w = rect.right() - x - 34.0;
-    text_trunc(ui, Pos2::new(x, rect.top() + 8.0), &t.title, theme::font(14.0), if current { cx.accent } else { TEXT }, w);
-    text_trunc(ui, Pos2::new(x, rect.top() + 28.0), &t.artist, theme::font(12.0), TEXT_DIM, w);
+    text_trunc(
+        ui,
+        Pos2::new(x, rect.top() + 8.0),
+        &t.title,
+        theme::font(14.0),
+        if current { cx.accent } else { TEXT },
+        w,
+    );
+    text_trunc(
+        ui,
+        Pos2::new(x, rect.top() + 28.0),
+        &t.artist,
+        theme::font(12.0),
+        TEXT_DIM,
+        w,
+    );
     if let Some(i) = index {
         let x_rect = Rect::from_center_size(Pos2::new(rect.right() - 16.0, rect.center().y), vec2(24.0, 24.0));
         let xr = ui.interact(x_rect, Id::new(("q-remove", i)), Sense::click());
         if resp.hovered() || xr.hovered() {
-            ui.painter().text(x_rect.center(), Align2::CENTER_CENTER, icon::X, theme::icon_font(14.0), if xr.hovered() { TEXT } else { TEXT_DIM });
+            ui.painter().text(
+                x_rect.center(),
+                Align2::CENTER_CENTER,
+                icon::X,
+                theme::icon_font(14.0),
+                if xr.hovered() { TEXT } else { TEXT_DIM },
+            );
         }
         if xr.clicked() {
             cx.actions.push(Action::Cmd(Command::RemoveUpcoming(i)));

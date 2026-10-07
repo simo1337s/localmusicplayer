@@ -21,9 +21,14 @@ use tokio::sync::{mpsc, oneshot};
 #[derive(Debug, Clone, PartialEq)]
 pub enum MpvEvent {
     /// A new file started (playlist advanced, possibly gaplessly).
-    StartFile { playlist_entry_id: i64 },
+    StartFile {
+        playlist_entry_id: i64,
+    },
     FileLoaded,
-    EndFile { reason: String, error: Option<String> },
+    EndFile {
+        reason: String,
+        error: Option<String>,
+    },
     Pause(bool),
     Duration(f64),
     /// The mpv process exited or the socket closed.
@@ -183,7 +188,11 @@ impl Mpv {
         if start > 0.5 {
             let opt = format!("start={start:.1}");
             // mpv >= 0.38 takes an insertion index before the per-file options; older versions don't.
-            if self.command(json!(["loadfile", url, "replace", -1, opt])).await.is_err() {
+            if self
+                .command(json!(["loadfile", url, "replace", -1, opt]))
+                .await
+                .is_err()
+            {
                 self.command(json!(["loadfile", url, "replace", opt])).await?;
             }
         } else {
@@ -207,7 +216,9 @@ impl Mpv {
     }
 
     pub async fn seek(&self, secs: f64) -> Result<()> {
-        self.command(json!(["seek", secs.max(0.0), "absolute"])).await.map(|_| ())
+        self.command(json!(["seek", secs.max(0.0), "absolute"]))
+            .await
+            .map(|_| ())
     }
 
     pub async fn set_volume(&self, volume: f32) -> Result<()> {
@@ -265,19 +276,31 @@ mod tests {
         let ev = |s: &str| parse_event(&serde_json::from_str(s).unwrap());
         assert_eq!(
             ev(r#"{"event":"end-file","reason":"eof","playlist_entry_id":1}"#),
-            Some(MpvEvent::EndFile { reason: "eof".into(), error: None })
+            Some(MpvEvent::EndFile {
+                reason: "eof".into(),
+                error: None
+            })
         );
         assert_eq!(
             ev(r#"{"event":"end-file","reason":"error","file_error":"unrecognized file format"}"#),
-            Some(MpvEvent::EndFile { reason: "error".into(), error: Some("unrecognized file format".into()) })
+            Some(MpvEvent::EndFile {
+                reason: "error".into(),
+                error: Some("unrecognized file format".into())
+            })
         );
-        assert_eq!(ev(r#"{"event":"property-change","id":1,"name":"pause","data":true}"#), Some(MpvEvent::Pause(true)));
+        assert_eq!(
+            ev(r#"{"event":"property-change","id":1,"name":"pause","data":true}"#),
+            Some(MpvEvent::Pause(true))
+        );
         assert_eq!(
             ev(r#"{"event":"property-change","id":2,"name":"duration","data":201.5}"#),
             Some(MpvEvent::Duration(201.5))
         );
         assert_eq!(ev(r#"{"event":"property-change","id":2,"name":"duration"}"#), None);
-        assert_eq!(ev(r#"{"event":"start-file","playlist_entry_id":3}"#), Some(MpvEvent::StartFile { playlist_entry_id: 3 }));
+        assert_eq!(
+            ev(r#"{"event":"start-file","playlist_entry_id":3}"#),
+            Some(MpvEvent::StartFile { playlist_entry_id: 3 })
+        );
     }
 
     /// Talks to a real mpv if one is installed: plays a generated WAV file.

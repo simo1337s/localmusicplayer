@@ -192,7 +192,6 @@ impl Queue {
     pub fn is_empty(&self) -> bool {
         self.current.is_none()
     }
-
 }
 
 #[cfg(test)]

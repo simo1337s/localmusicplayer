@@ -3,9 +3,7 @@
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
-use discord_rich_presence::activity::{
-    Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps,
-};
+use discord_rich_presence::activity::{Activity, ActivityType, Assets, Button, StatusDisplayType, Timestamps};
 use discord_rich_presence::{DiscordIpc, DiscordIpcClient};
 
 use crate::model::{Source, Track};
@@ -18,7 +16,11 @@ pub struct Presence {
 }
 
 enum Msg {
-    Configure { enabled: bool, app_id: String, song_as_name: bool },
+    Configure {
+        enabled: bool,
+        app_id: String,
+        song_as_name: bool,
+    },
     Set(Option<Presence>),
     Shutdown,
 }
@@ -74,7 +76,11 @@ fn run(rx: mpsc::Receiver<Msg>) {
     loop {
         // Discord rate limits presence updates (~5 per 20s); coalesce bursts.
         match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Msg::Configure { enabled: e, app_id: id, song_as_name: s }) => {
+            Ok(Msg::Configure {
+                enabled: e,
+                app_id: id,
+                song_as_name: s,
+            }) => {
                 if id != app_id || !e {
                     if let Some(mut c) = client.take() {
                         let _ = c.clear_activity();
@@ -105,7 +111,11 @@ fn run(rx: mpsc::Receiver<Msg>) {
                         dirty = true;
                     }
                 }
-                Msg::Configure { enabled: e, app_id: id, song_as_name: s } => {
+                Msg::Configure {
+                    enabled: e,
+                    app_id: id,
+                    song_as_name: s,
+                } => {
                     enabled = e;
                     app_id = id;
                     song_as_name = s;
@@ -196,7 +206,10 @@ fn build_activity(p: &Presence, song_as_name: bool) -> Activity<'_> {
     }
 
     let link = match t.source {
-        Source::Spotify => t.id.strip_prefix("spotify:track:").map(|id| format!("https://open.spotify.com/track/{id}")),
+        Source::Spotify => {
+            t.id.strip_prefix("spotify:track:")
+                .map(|id| format!("https://open.spotify.com/track/{id}"))
+        }
         Source::SoundCloud if t.uri.starts_with("https://") => Some(t.uri.clone()),
         _ => None,
     };

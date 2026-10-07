@@ -84,7 +84,11 @@ impl Library {
             albums[idx].track_ids.push(t.id.clone());
         }
         self.local = local.iter().map(|t| t.id.clone()).collect();
-        albums.sort_by(|a, b| sort_key(&a.artist).cmp(&sort_key(&b.artist)).then_with(|| a.name.cmp(&b.name)));
+        albums.sort_by(|a, b| {
+            sort_key(&a.artist)
+                .cmp(&sort_key(&b.artist))
+                .then_with(|| a.name.cmp(&b.name))
+        });
         self.albums = albums;
 
         self.liked = self
@@ -171,7 +175,6 @@ impl Library {
         hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.title.cmp(&b.0.title)));
         hits.into_iter().take(limit).map(|(t, _)| t.clone()).collect()
     }
-
 }
 
 pub fn liked_playlist() -> Playlist {
@@ -199,7 +202,11 @@ mod tests {
     fn t(id: &str, artist: &str, album: &str, title: &str, no: u32) -> Track {
         Track {
             id: id.into(),
-            source: if id.starts_with("local:") { Source::Local } else { Source::Spotify },
+            source: if id.starts_with("local:") {
+                Source::Local
+            } else {
+                Source::Spotify
+            },
             title: title.into(),
             artist: artist.into(),
             album: album.into(),

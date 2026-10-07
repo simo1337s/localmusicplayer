@@ -2,8 +2,7 @@
 
 use egui::text::{LayoutJob, TextWrapping};
 use egui::{
-    vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Mesh, Pos2, Rect, Response, Sense, Shape,
-    Stroke, Ui,
+    vec2, Align2, Color32, CornerRadius, CursorIcon, FontId, Id, Mesh, Pos2, Rect, Response, Sense, Shape, Stroke, Ui,
 };
 use egui_phosphor::regular as icon;
 
@@ -43,8 +42,16 @@ pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) 
     let inner = rect;
     // Rounded gradient: approximate by painting the gradient inset by the radius.
     gradient(ui, inner.shrink2(vec2(0.0, radius as f32)), top, bottom);
-    ui.painter()
-        .rect_filled(Rect::from_min_size(rect.min, vec2(rect.width(), radius as f32)), CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 }, top);
+    ui.painter().rect_filled(
+        Rect::from_min_size(rect.min, vec2(rect.width(), radius as f32)),
+        CornerRadius {
+            nw: radius,
+            ne: radius,
+            sw: 0,
+            se: 0,
+        },
+        top,
+    );
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -56,7 +63,13 @@ pub fn placeholder(ui: &Ui, rect: Rect, base: Color32, glyph: &str, radius: u8) 
 
 /// Cover art (or a placeholder) in `rect`.
 pub fn cover(ui: &Ui, art: &mut ArtCache, src: Option<&str>, rect: Rect, radius: u8, fallback: (Color32, &str)) {
-    let size = if rect.width() <= 64.0 { THUMB } else if rect.width() <= 260.0 { MEDIUM } else { super::art::LARGE };
+    let size = if rect.width() <= 64.0 {
+        THUMB
+    } else if rect.width() <= 260.0 {
+        MEDIUM
+    } else {
+        super::art::LARGE
+    };
     match art.get(src, size) {
         Some(tex) => {
             egui::Image::from_texture(egui::load::SizedTexture::new(tex.id(), rect.size()))
@@ -77,7 +90,9 @@ pub fn playlist_fallback(p: &Playlist) -> (Color32, &'static str) {
         PlaylistKind::SpotifyLiked => (source_color(Source::Spotify), icon::HEART),
         PlaylistKind::SoundCloudLikes => (source_color(Source::SoundCloud), icon::HEART),
         k => (
-            k.source().map(source_color).unwrap_or(Color32::from_rgb(0x55, 0x5a, 0x78)),
+            k.source()
+                .map(source_color)
+                .unwrap_or(Color32::from_rgb(0x55, 0x5a, 0x78)),
             icon::MUSIC_NOTES,
         ),
     }
@@ -85,11 +100,20 @@ pub fn playlist_fallback(p: &Playlist) -> (Color32, &'static str) {
 
 /// Art shown for a playlist: Liked playlists get a gradient heart tile.
 pub fn playlist_cover(ui: &Ui, art: &mut ArtCache, p: &Playlist, rect: Rect, radius: u8) {
-    if matches!(p.kind, PlaylistKind::Liked | PlaylistKind::SpotifyLiked | PlaylistKind::SoundCloudLikes) {
+    if matches!(
+        p.kind,
+        PlaylistKind::Liked | PlaylistKind::SpotifyLiked | PlaylistKind::SoundCloudLikes
+    ) {
         let (base, glyph) = playlist_fallback(p);
-        ui.painter().rect_filled(rect, CornerRadius::same(radius), theme::mix(base, Color32::WHITE, 0.1));
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(radius), theme::mix(base, Color32::WHITE, 0.1));
         let bottom = theme::with_alpha(theme::mix(base, Color32::BLACK, 0.5), 255);
-        gradient(ui, rect.shrink2(vec2(0.0, radius as f32)).with_min_y(rect.center().y), theme::with_alpha(bottom, 0), bottom);
+        gradient(
+            ui,
+            rect.shrink2(vec2(0.0, radius as f32)).with_min_y(rect.center().y),
+            theme::with_alpha(bottom, 0),
+            bottom,
+        );
         ui.painter().text(
             rect.center(),
             Align2::CENTER_CENTER,
@@ -107,10 +131,16 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip:
     let (rect, resp) = ui.allocate_exact_size(vec2(size + 12.0, size + 12.0), Sense::click());
     let hovered = resp.hovered();
     if hovered {
-        ui.painter().rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 14));
+        ui.painter()
+            .rect_filled(rect, CornerRadius::same(8), theme::with_alpha(Color32::WHITE, 14));
     }
-    let c = if hovered { theme::mix(color, Color32::WHITE, 0.35) } else { color };
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, glyph, theme::icon_font(size), c);
+    let c = if hovered {
+        theme::mix(color, Color32::WHITE, 0.35)
+    } else {
+        color
+    };
+    ui.painter()
+        .text(rect.center(), Align2::CENTER_CENTER, glyph, theme::icon_font(size), c);
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     if tooltip.is_empty() {
         resp
@@ -123,9 +153,17 @@ pub fn icon_button(ui: &mut Ui, glyph: &str, size: f32, color: Color32, tooltip:
 pub fn play_circle(ui: &mut Ui, size: f32, accent: Color32, playing: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::click());
     let scale = if resp.hovered() { 1.05 } else { 1.0 };
-    let fill = if resp.hovered() { theme::mix(accent, Color32::WHITE, 0.15) } else { accent };
+    let fill = if resp.hovered() {
+        theme::mix(accent, Color32::WHITE, 0.15)
+    } else {
+        accent
+    };
     ui.painter().circle_filled(rect.center(), size * 0.5 * scale, fill);
-    let glyph = if playing { egui_phosphor::fill::PAUSE } else { egui_phosphor::fill::PLAY };
+    let glyph = if playing {
+        egui_phosphor::fill::PAUSE
+    } else {
+        egui_phosphor::fill::PLAY
+    };
     // The play triangle looks centred when nudged right a bit.
     let offset = if playing { 0.0 } else { size * 0.04 };
     ui.painter().text(
@@ -144,7 +182,11 @@ pub fn pill(ui: &mut Ui, text: &str, fill: Color32, fg: Color32) -> Response {
     let galley = ui.painter().layout_no_wrap(text.to_string(), font, fg);
     let size = vec2(galley.size().x + 28.0, 34.0);
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if resp.hovered() { theme::mix(fill, Color32::WHITE, 0.12) } else { fill };
+    let fill = if resp.hovered() {
+        theme::mix(fill, Color32::WHITE, 0.12)
+    } else {
+        fill
+    };
     ui.painter().rect_filled(rect, CornerRadius::same(17), fill);
     ui.painter().galley(rect.center() - galley.size() / 2.0, galley, fg);
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -178,7 +220,12 @@ pub fn bar(ui: &mut Ui, id: Id, width: f32, fraction: f32, accent: Color32) -> (
 pub fn heading_icon(ui: &mut Ui, glyph: &str, color: Color32, text: &str) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(glyph).family(theme::icons()).size(20.0).color(color));
+        ui.label(
+            egui::RichText::new(glyph)
+                .family(theme::icons())
+                .size(20.0)
+                .color(color),
+        );
         ui.label(egui::RichText::new(text).font(theme::bold_font(20.0)).color(TEXT));
     });
     ui.add_space(4.0);
@@ -204,12 +251,27 @@ pub fn tile(
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let hovered = resp.hovered();
     if hovered {
-        ui.painter().rect_filled(rect.expand(6.0), CornerRadius::same(12), HOVER);
+        ui.painter()
+            .rect_filled(rect.expand(6.0), CornerRadius::same(12), HOVER);
     }
     let art_rect = Rect::from_min_size(rect.min, vec2(width, width));
     draw_art(ui, art_rect);
-    text_trunc(ui, art_rect.left_bottom() + vec2(0.0, 8.0), title, theme::bold_font(14.0), TEXT, width);
-    text_trunc(ui, art_rect.left_bottom() + vec2(0.0, 28.0), subtitle, theme::font(12.5), TEXT_DIM, width);
+    text_trunc(
+        ui,
+        art_rect.left_bottom() + vec2(0.0, 8.0),
+        title,
+        theme::bold_font(14.0),
+        TEXT,
+        width,
+    );
+    text_trunc(
+        ui,
+        art_rect.left_bottom() + vec2(0.0, 28.0),
+        subtitle,
+        theme::font(12.5),
+        TEXT_DIM,
+        width,
+    );
 
     let mut play = false;
     let t = ui.ctx().animate_bool_with_time(resp.id.with("play"), hovered, 0.15);
@@ -218,8 +280,20 @@ pub fn tile(
         let r = 22.0;
         let btn = Rect::from_center_size(c, vec2(r * 2.0, r * 2.0));
         let over = ui.rect_contains_pointer(btn);
-        ui.painter().circle_filled(c + vec2(0.0, 3.0), r, Color32::from_black_alpha((90.0 * t) as u8));
-        ui.painter().circle_filled(c, r, theme::with_alpha(if over { theme::mix(accent, Color32::WHITE, 0.15) } else { accent }, (255.0 * t) as u8));
+        ui.painter()
+            .circle_filled(c + vec2(0.0, 3.0), r, Color32::from_black_alpha((90.0 * t) as u8));
+        ui.painter().circle_filled(
+            c,
+            r,
+            theme::with_alpha(
+                if over {
+                    theme::mix(accent, Color32::WHITE, 0.15)
+                } else {
+                    accent
+                },
+                (255.0 * t) as u8,
+            ),
+        );
         ui.painter().text(
             c + vec2(1.5, 0.0),
             Align2::CENTER_CENTER,
@@ -284,14 +358,41 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         let (hrect, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         let f = theme::font(12.0);
         let p = ui.painter();
-        p.text(hrect.left_center() + vec2(num_w * 0.5, 0.0), Align2::CENTER_CENTER, "#", f.clone(), TEXT_FAINT);
-        p.text(hrect.left_center() + vec2(num_w + 8.0, 0.0), Align2::LEFT_CENTER, "TITLE", f.clone(), TEXT_FAINT);
+        p.text(
+            hrect.left_center() + vec2(num_w * 0.5, 0.0),
+            Align2::CENTER_CENTER,
+            "#",
+            f.clone(),
+            TEXT_FAINT,
+        );
+        p.text(
+            hrect.left_center() + vec2(num_w + 8.0, 0.0),
+            Align2::LEFT_CENTER,
+            "TITLE",
+            f.clone(),
+            TEXT_FAINT,
+        );
         if show_album {
-            p.text(hrect.left_center() + vec2(album_x, 0.0), Align2::LEFT_CENTER, "ALBUM", f.clone(), TEXT_FAINT);
+            p.text(
+                hrect.left_center() + vec2(album_x, 0.0),
+                Align2::LEFT_CENTER,
+                "ALBUM",
+                f.clone(),
+                TEXT_FAINT,
+            );
         }
-        p.text(hrect.right_center() - vec2(20.0, 0.0), Align2::RIGHT_CENTER, icon::CLOCK, theme::icon_font(13.0), TEXT_FAINT);
+        p.text(
+            hrect.right_center() - vec2(20.0, 0.0),
+            Align2::RIGHT_CENTER,
+            icon::CLOCK,
+            theme::icon_font(13.0),
+            TEXT_FAINT,
+        );
         p.line_segment(
-            [hrect.left_bottom() + vec2(0.0, -1.0), hrect.right_bottom() + vec2(0.0, -1.0)],
+            [
+                hrect.left_bottom() + vec2(0.0, -1.0),
+                hrect.right_bottom() + vec2(0.0, -1.0),
+            ],
             Stroke::new(1.0, theme::with_alpha(Color32::WHITE, 18)),
         );
         ui.add_space(6.0);
@@ -326,15 +427,24 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             ui.painter().text(
                 num_center,
                 Align2::CENTER_CENTER,
-                if is_current && playing { egui_phosphor::fill::PAUSE } else { egui_phosphor::fill::PLAY },
+                if is_current && playing {
+                    egui_phosphor::fill::PAUSE
+                } else {
+                    egui_phosphor::fill::PLAY
+                },
                 theme::fill_icon_font(15.0),
                 TEXT,
             );
         } else if is_current {
             draw_eq(ui, num_center, cx.accent, playing);
         } else {
-            ui.painter()
-                .text(num_center, Align2::CENTER_CENTER, (i + 1).to_string(), theme::font(13.0), TEXT_DIM);
+            ui.painter().text(
+                num_center,
+                Align2::CENTER_CENTER,
+                (i + 1).to_string(),
+                theme::font(13.0),
+                TEXT_DIM,
+            );
         }
 
         // Art + title + artist.
@@ -343,8 +453,22 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         let tx = art_rect.right() + 12.0;
         let tw = title_w - 60.0;
         let title_color = if is_current { cx.accent } else { TEXT };
-        text_trunc(ui, Pos2::new(tx, row.top() + 9.0), &t.title, theme::font(14.5), title_color, tw);
-        text_trunc(ui, Pos2::new(tx, row.top() + 30.0), &t.artist, theme::font(12.5), TEXT_DIM, tw);
+        text_trunc(
+            ui,
+            Pos2::new(tx, row.top() + 9.0),
+            &t.title,
+            theme::font(14.5),
+            title_color,
+            tw,
+        );
+        text_trunc(
+            ui,
+            Pos2::new(tx, row.top() + 30.0),
+            &t.artist,
+            theme::font(12.5),
+            TEXT_DIM,
+            tw,
+        );
         if show_album {
             text_trunc(
                 ui,
@@ -366,20 +490,30 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
             theme::with_alpha(source_color(t.source), if hovered { 255 } else { 170 }),
         );
         let liked = cx.lib.is_liked(&t.id);
-        let heart_rect = Rect::from_center_size(Pos2::new(row.right() - dur_w - 18.0, row.center().y), vec2(26.0, 26.0));
+        let heart_rect =
+            Rect::from_center_size(Pos2::new(row.right() - dur_w - 18.0, row.center().y), vec2(26.0, 26.0));
         let heart = ui.interact(heart_rect, Id::new((opts.id, i, "like")), Sense::click());
         if liked || hovered {
             let (glyph, f, c) = if liked {
                 (egui_phosphor::fill::HEART, theme::fill_icon_font(16.0), cx.accent)
             } else {
-                (icon::HEART, theme::icon_font(16.0), if heart.hovered() { TEXT } else { TEXT_DIM })
+                (
+                    icon::HEART,
+                    theme::icon_font(16.0),
+                    if heart.hovered() { TEXT } else { TEXT_DIM },
+                )
             };
-            ui.painter().text(heart_rect.center(), Align2::CENTER_CENTER, glyph, f, c);
+            ui.painter()
+                .text(heart_rect.center(), Align2::CENTER_CENTER, glyph, f, c);
         }
         if heart.clicked() {
             cx.actions.push(Action::Cmd(Command::ToggleLike(t.clone())));
         }
-        let dur = if t.duration_ms > 0 { theme::fmt_time(t.duration_secs()) } else { "–".into() };
+        let dur = if t.duration_ms > 0 {
+            theme::fmt_time(t.duration_secs())
+        } else {
+            "–".into()
+        };
         ui.painter().text(
             Pos2::new(row.right() - 18.0, row.center().y),
             Align2::RIGHT_CENTER,
@@ -426,7 +560,10 @@ fn draw_eq(ui: &Ui, center: Pos2, color: Color32, animate: bool) {
             4.0 + k as f32 * 2.0
         };
         let x = center.x - 5.0 + k as f32 * 5.0;
-        let r = Rect::from_min_max(Pos2::new(x - 1.5, center.y + 6.0 - h), Pos2::new(x + 1.5, center.y + 6.0));
+        let r = Rect::from_min_max(
+            Pos2::new(x - 1.5, center.y + 6.0 - h),
+            Pos2::new(x + 1.5, center.y + 6.0),
+        );
         ui.painter().rect_filled(r, CornerRadius::same(1), color);
     }
     if animate {
@@ -446,7 +583,11 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
         ui.close();
     }
     let liked = cx.lib.is_liked(&t.id);
-    let like_label = if liked { "Remove from Liked Songs" } else { "Save to Liked Songs" };
+    let like_label = if liked {
+        "Remove from Liked Songs"
+    } else {
+        "Save to Liked Songs"
+    };
     if ui.button(theme::ic(icon::HEART, like_label)).clicked() {
         cx.actions.push(Action::Cmd(Command::ToggleLike(t.clone())));
         ui.close();
@@ -458,7 +599,12 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             ui.close();
         }
         ui.separator();
-        for p in cx.lib.playlists.iter().filter(|p| p.kind.is_editable() && p.kind != PlaylistKind::Liked) {
+        for p in cx
+            .lib
+            .playlists
+            .iter()
+            .filter(|p| p.kind.is_editable() && p.kind != PlaylistKind::Liked)
+        {
             if ui.button(&p.name).clicked() {
                 cx.actions.push(Action::Cmd(Command::AddToPlaylist {
                     playlist_id: p.id.clone(),
@@ -469,7 +615,10 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
         }
     });
     if let Some((Some(p), idx)) = in_playlist {
-        if p.kind.is_editable() && p.kind != PlaylistKind::Liked && ui.button(theme::ic(icon::TRASH, "Remove from this playlist")).clicked() {
+        if p.kind.is_editable()
+            && p.kind != PlaylistKind::Liked
+            && ui.button(theme::ic(icon::TRASH, "Remove from this playlist")).clicked()
+        {
             cx.actions.push(Action::Cmd(Command::RemoveFromPlaylist {
                 playlist_id: p.id.clone(),
                 index: idx,
@@ -481,14 +630,22 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
     match t.source {
         Source::Spotify => {
             if let Some(id) = t.id.strip_prefix("spotify:track:") {
-                if ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Open in Spotify")).clicked() {
-                    cx.actions.push(Action::OpenUrl(format!("https://open.spotify.com/track/{id}")));
+                if ui
+                    .button(theme::ic(icon::ARROW_SQUARE_OUT, "Open in Spotify"))
+                    .clicked()
+                {
+                    cx.actions
+                        .push(Action::OpenUrl(format!("https://open.spotify.com/track/{id}")));
                     ui.close();
                 }
             }
         }
         Source::SoundCloud => {
-            if t.uri.starts_with("http") && ui.button(theme::ic(icon::ARROW_SQUARE_OUT, "Open on SoundCloud")).clicked() {
+            if t.uri.starts_with("http")
+                && ui
+                    .button(theme::ic(icon::ARROW_SQUARE_OUT, "Open on SoundCloud"))
+                    .clicked()
+            {
                 cx.actions.push(Action::OpenUrl(t.uri.clone()));
                 ui.close();
             }
@@ -502,7 +659,11 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             }
         }
         Source::AppleMusic => {
-            ui.label(egui::RichText::new("Plays via a local / Spotify / SoundCloud match").small().color(TEXT_FAINT));
+            ui.label(
+                egui::RichText::new("Plays via a local / Spotify / SoundCloud match")
+                    .small()
+                    .color(TEXT_FAINT),
+            );
         }
     }
 }
@@ -511,8 +672,17 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
 pub fn source_badge(ui: &mut Ui, source: Source) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
-        ui.label(egui::RichText::new(theme::source_icon(source)).family(theme::icons()).size(13.0).color(source_color(source)));
-        ui.label(egui::RichText::new(source.label()).size(12.0).color(source_color(source)));
+        ui.label(
+            egui::RichText::new(theme::source_icon(source))
+                .family(theme::icons())
+                .size(13.0)
+                .color(source_color(source)),
+        );
+        ui.label(
+            egui::RichText::new(source.label())
+                .size(12.0)
+                .color(source_color(source)),
+        );
     });
 }
 
@@ -522,4 +692,3 @@ pub fn card_frame() -> egui::Frame {
         .corner_radius(CornerRadius::same(12))
         .inner_margin(egui::Margin::same(16))
 }
-

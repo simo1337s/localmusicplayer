@@ -26,7 +26,10 @@ pub fn parse(text: &str, base_dir: &Path) -> Vec<M3uEntry> {
         }
         if let Some(info) = line.strip_prefix("#EXTINF:") {
             let (dur, title) = match info.split_once(',') {
-                Some((d, t)) => (d.split_whitespace().next().and_then(|d| d.parse().ok()), Some(t.trim().to_string())),
+                Some((d, t)) => (
+                    d.split_whitespace().next().and_then(|d| d.parse().ok()),
+                    Some(t.trim().to_string()),
+                ),
                 None => (info.trim().parse().ok(), None),
             };
             pending = Some((dur, title));
@@ -41,7 +44,9 @@ pub fn parse(text: &str, base_dir: &Path) -> Vec<M3uEntry> {
             continue;
         }
         let raw = line.strip_prefix("file://").unwrap_or(line);
-        let decoded = urlencoding::decode(raw).map(|c| c.into_owned()).unwrap_or_else(|_| raw.to_string());
+        let decoded = urlencoding::decode(raw)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw.to_string());
         let normalized = decoded.replace('\\', "/");
         let p = PathBuf::from(&normalized);
         let path = if p.is_absolute() { p } else { base_dir.join(p) };

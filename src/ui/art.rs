@@ -142,7 +142,6 @@ impl ArtCache {
     pub fn accent(&self, src: &str) -> Option<Color32> {
         self.accents.get(src).copied()
     }
-
 }
 
 async fn load_bytes(http: &reqwest::Client, disk: &Path, src: &str) -> Option<Vec<u8>> {
@@ -163,7 +162,10 @@ async fn load_bytes(http: &reqwest::Client, disk: &Path, src: &str) -> Option<Ve
         return tokio::fs::read(&path).await.ok();
     }
     // An audio file: read its embedded front cover.
-    tokio::task::spawn_blocking(move || embedded_picture(&path)).await.ok().flatten()
+    tokio::task::spawn_blocking(move || embedded_picture(&path))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn embedded_picture(path: &Path) -> Option<Vec<u8>> {
@@ -236,7 +238,11 @@ pub fn dominant_color(img: &image::RgbaImage) -> Option<Color32> {
     // Keep it vivid enough and readable on a dark background.
     let (s, l) = (s.clamp(0.35, 0.85), l.clamp(0.55, 0.68));
     let (r, g, b) = hsl_to_rgb(h, s, l);
-    Some(Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8))
+    Some(Color32::from_rgb(
+        (r * 255.0) as u8,
+        (g * 255.0) as u8,
+        (b * 255.0) as u8,
+    ))
 }
 
 fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
@@ -247,7 +253,11 @@ fn rgb_to_hsl(r: f64, g: f64, b: f64) -> (f64, f64, f64) {
         return (0.0, 0.0, l);
     }
     let d = max - min;
-    let s = if l > 0.5 { d / (2.0 - max - min) } else { d / (max + min) };
+    let s = if l > 0.5 {
+        d / (2.0 - max - min)
+    } else {
+        d / (max + min)
+    };
     let h = if max == r {
         (g - b) / d + if g < b { 6.0 } else { 0.0 }
     } else if max == g {
@@ -292,7 +302,11 @@ mod tests {
     fn dominant_color_prefers_saturated_pixels() {
         let mut img = image::RgbaImage::new(10, 10);
         for (i, p) in img.pixels_mut().enumerate() {
-            *p = if i % 4 == 0 { image::Rgba([220, 30, 30, 255]) } else { image::Rgba([90, 90, 90, 255]) };
+            *p = if i % 4 == 0 {
+                image::Rgba([220, 30, 30, 255])
+            } else {
+                image::Rgba([90, 90, 90, 255])
+            };
         }
         let c = dominant_color(&img).unwrap();
         assert!(c.r() > c.g() && c.r() > c.b(), "{c:?}");

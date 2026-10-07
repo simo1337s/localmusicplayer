@@ -12,11 +12,19 @@ use lofty::probe::Probe;
 use crate::model::{now_unix, Source, Track};
 
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mp4", "aac", "alac", "wav", "wave", "aif",
-    "aiff", "aifc", "ape", "wv", "mpc", "wma", "mka", "dsf", "dff", "spx", "tta",
+    "mp3", "flac", "ogg", "oga", "opus", "m4a", "m4b", "mp4", "aac", "alac", "wav", "wave", "aif", "aiff", "aifc",
+    "ape", "wv", "mpc", "wma", "mka", "dsf", "dff", "spx", "tta",
 ];
 
-const COVER_NAMES: &[&str] = &["cover", "folder", "front", "album", "albumart", "albumartsmall", "artwork"];
+const COVER_NAMES: &[&str] = &[
+    "cover",
+    "folder",
+    "front",
+    "album",
+    "albumart",
+    "albumartsmall",
+    "artwork",
+];
 const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp"];
 
 pub fn is_audio_file(path: &Path) -> bool {
@@ -47,11 +55,7 @@ fn mtime_of(path: &Path) -> i64 {
 
 /// Scans `folders` and returns what changed compared to `known` (track id -> mtime).
 /// `progress(done, total)` is called periodically from worker threads.
-pub fn scan(
-    folders: &[PathBuf],
-    known: &HashMap<String, i64>,
-    progress: &(dyn Fn(usize, usize) + Sync),
-) -> ScanResult {
+pub fn scan(folders: &[PathBuf], known: &HashMap<String, i64>, progress: &(dyn Fn(usize, usize) + Sync)) -> ScanResult {
     let mut files = Vec::new();
     for folder in folders {
         for entry in walkdir::WalkDir::new(folder).follow_links(true).into_iter().flatten() {
@@ -77,7 +81,10 @@ pub fn scan(
     // Tag parsing is IO + CPU bound, spread it over a few threads.
     let done = AtomicUsize::new(total - todo.len());
     progress(done.load(Ordering::Relaxed), total);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).clamp(1, 4);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2)
+        .clamp(1, 4);
     let chunk = todo.len().div_ceil(threads).max(1);
     let cover_cache = std::sync::Mutex::new(HashMap::<PathBuf, Option<String>>::new());
     let now = now_unix();

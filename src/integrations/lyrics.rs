@@ -35,8 +35,7 @@ const METADATA_TAGS: &[&str] = &[
 ];
 
 /// Enhanced (word level) LRC timing tags: `<mm:ss.xx>`.
-static WORD_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<\d+:\d+(?:[.:,]\d+)?>").expect("valid regex"));
+static WORD_TAG_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<\d+:\d+(?:[.:,]\d+)?>").expect("valid regex"));
 
 static WHITESPACE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").expect("valid regex"));
 
@@ -435,7 +434,13 @@ fn decode_text(bytes: &[u8]) -> String {
     let utf16 = |rest: &[u8], le: bool| {
         let units: Vec<u16> = rest
             .chunks_exact(2)
-            .map(|c| if le { u16::from_le_bytes([c[0], c[1]]) } else { u16::from_be_bytes([c[0], c[1]]) })
+            .map(|c| {
+                if le {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                }
+            })
             .collect();
         String::from_utf16_lossy(&units)
     };
@@ -596,7 +601,11 @@ impl LyricsFetcher {
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             tracing::warn!("lyrics: can't create cache dir {}: {e}", cache_dir.display());
         }
-        LyricsFetcher { http, cache_dir, online }
+        LyricsFetcher {
+            http,
+            cache_dir,
+            online,
+        }
     }
 
     pub fn cache_path(&self, track: &Track) -> PathBuf {
@@ -671,7 +680,11 @@ impl LyricsFetcher {
                 found
             }
             Err(e) => {
-                tracing::warn!("lyrics: LRCLIB lookup for {} - {} failed: {e:#}", track.artist, track.title);
+                tracing::warn!(
+                    "lyrics: LRCLIB lookup for {} - {} failed: {e:#}",
+                    track.artist,
+                    track.title
+                );
                 None
             }
         }
@@ -727,10 +740,8 @@ impl LyricsFetcher {
         album: &str,
         duration: f64,
     ) -> anyhow::Result<Option<Lyrics>> {
-        let mut query: Vec<(&str, String)> = vec![
-            ("artist_name", artist.to_string()),
-            ("track_name", title.to_string()),
-        ];
+        let mut query: Vec<(&str, String)> =
+            vec![("artist_name", artist.to_string()), ("track_name", title.to_string())];
         if !album.trim().is_empty() {
             query.push(("album_name", album.trim().to_string()));
         }
@@ -872,7 +883,10 @@ mod tests {
 
     #[test]
     fn lyrics_from_lrc_text() {
-        let l = lyrics_from_text("[ar:X]\n[00:01.00]One\n[00:02.00]\n[00:03.00]\n[00:04.00]Two", "Sidecar file");
+        let l = lyrics_from_text(
+            "[ar:X]\n[00:01.00]One\n[00:02.00]\n[00:03.00]\n[00:04.00]Two",
+            "Sidecar file",
+        );
         assert_eq!(l.synced.len(), 4);
         assert_eq!(l.plain, "One\n\nTwo");
         assert_eq!(l.provider, "Sidecar file");
@@ -985,7 +999,13 @@ mod tests {
         let entry = fetcher.load_cached(&t).await.unwrap();
         assert_eq!(entry.found.as_ref(), Some(&lyrics));
         assert_eq!(entry.fetched_at, 1234);
-        assert!(fetcher.cache_path(&t).file_name().unwrap().to_str().unwrap().ends_with(".json"));
+        assert!(fetcher
+            .cache_path(&t)
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with(".json"));
         // Offline fetch is served from the cache.
         assert_eq!(fetcher.fetch(&t).await, Some(lyrics));
 

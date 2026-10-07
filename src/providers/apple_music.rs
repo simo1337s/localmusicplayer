@@ -36,46 +36,25 @@ pub struct AppleLibrary {
 // ---------------------------------------------------------------------------------------------
 
 /// Track flags that mark non-music items we don't import.
-const SKIPPED_TRACK_FLAGS: [&str; 6] = [
-    "Podcast",
-    "Movie",
-    "TV Show",
-    "Music Video",
-    "Has Video",
-    "iTunesU",
-];
+const SKIPPED_TRACK_FLAGS: [&str; 6] = ["Podcast", "Movie", "TV Show", "Music Video", "Has Video", "iTunesU"];
 
 /// Import an iTunes / Apple Music "Library.xml" export (File > Library > Export Library on macOS/Windows).
 pub fn import_library_xml(path: &Path) -> Result<AppleLibrary> {
-    let root = plist::Value::from_file(path).with_context(|| {
-        format!(
-            "failed to read Apple Music library export {}",
-            path.display()
-        )
-    })?;
-    let library = parse_library_plist(&root).with_context(|| {
-        format!(
-            "{} is not an iTunes / Apple Music library export",
-            path.display()
-        )
-    })?;
+    let root = plist::Value::from_file(path)
+        .with_context(|| format!("failed to read Apple Music library export {}", path.display()))?;
+    let library = parse_library_plist(&root)
+        .with_context(|| format!("{} is not an iTunes / Apple Music library export", path.display()))?;
     tracing::info!(
         tracks = library.tracks.len(),
         playlists = library.playlists.len(),
-        local = library
-            .tracks
-            .iter()
-            .filter(|t| t.source == Source::Local)
-            .count(),
+        local = library.tracks.iter().filter(|t| t.source == Source::Local).count(),
         "imported Apple Music library export"
     );
     Ok(library)
 }
 
 fn parse_library_plist(root: &plist::Value) -> Result<AppleLibrary> {
-    let root = root
-        .as_dictionary()
-        .context("the root element is not a dictionary")?;
+    let root = root.as_dictionary().context("the root element is not a dictionary")?;
     let tracks_dict = root
         .get("Tracks")
         .and_then(plist::Value::as_dictionary)
@@ -159,11 +138,7 @@ fn xml_track(d: &plist::Dictionary, track_id: i64) -> Option<Track> {
             let pid = non_empty(string(d, "Persistent ID"))
                 .map(str::to_owned)
                 .unwrap_or_else(|| track_id.to_string());
-            (
-                Track::applemusic_id(&pid),
-                Source::AppleMusic,
-                String::new(),
-            )
+            (Track::applemusic_id(&pid), Source::AppleMusic, String::new())
         }
     };
 
@@ -182,11 +157,7 @@ fn xml_track(d: &plist::Dictionary, track_id: i64) -> Option<Track> {
 }
 
 /// Convert one entry of the "Playlists" array. `None` for built-in, folder and empty playlists.
-fn xml_playlist(
-    d: &plist::Dictionary,
-    index: &HashMap<i64, usize>,
-    tracks: &[Track],
-) -> Option<ImportedPlaylist> {
+fn xml_playlist(d: &plist::Dictionary, index: &HashMap<i64, usize>, tracks: &[Track]) -> Option<ImportedPlaylist> {
     let hidden = d.get("Visible").and_then(plist::Value::as_boolean) == Some(false);
     if flag(d, "Master") || flag(d, "Folder") || hidden || d.contains_key("Distinguished Kind") {
         return None;
@@ -211,12 +182,8 @@ fn xml_playlist(
 
     Some(ImportedPlaylist {
         remote_id,
-        name: non_empty(string(d, "Name"))
-            .unwrap_or("Untitled Playlist")
-            .to_owned(),
-        description: non_empty(string(d, "Description"))
-            .unwrap_or_default()
-            .to_owned(),
+        name: non_empty(string(d, "Name")).unwrap_or("Untitled Playlist").to_owned(),
+        description: non_empty(string(d, "Description")).unwrap_or_default().to_owned(),
         art: None,
         tracks: items,
     })
@@ -257,9 +224,7 @@ pub fn file_url_to_path(url: &str) -> Option<String> {
 }
 
 fn flag(d: &plist::Dictionary, key: &str) -> bool {
-    d.get(key)
-        .and_then(plist::Value::as_boolean)
-        .unwrap_or(false)
+    d.get(key).and_then(plist::Value::as_boolean).unwrap_or(false)
 }
 
 fn string<'a>(d: &'a plist::Dictionary, key: &str) -> Option<&'a str> {
@@ -269,10 +234,7 @@ fn string<'a>(d: &'a plist::Dictionary, key: &str) -> Option<&'a str> {
 fn int(d: &plist::Dictionary, key: &str) -> Option<i64> {
     let v = d.get(key)?;
     v.as_signed_integer()
-        .or_else(|| {
-            v.as_unsigned_integer()
-                .map(|u| i64::try_from(u).unwrap_or(i64::MAX))
-        })
+        .or_else(|| v.as_unsigned_integer().map(|u| i64::try_from(u).unwrap_or(i64::MAX)))
         .or_else(|| v.as_string().and_then(|s| s.trim().parse().ok()))
 }
 
@@ -341,20 +303,11 @@ impl fmt::Debug for AppleMusicApi {
 }
 
 impl AppleMusicApi {
-    pub fn new(
-        http: reqwest::Client,
-        developer_token: &str,
-        user_token: &str,
-        storefront: &str,
-    ) -> Self {
+    pub fn new(http: reqwest::Client, developer_token: &str, user_token: &str, storefront: &str) -> Self {
         let storefront = storefront.trim();
         Self {
             http,
-            developer_token: developer_token
-                .trim()
-                .trim_start_matches("Bearer ")
-                .trim()
-                .to_owned(),
+            developer_token: developer_token.trim().trim_start_matches("Bearer ").trim().to_owned(),
             user_token: user_token.trim().to_owned(),
             storefront: if storefront.is_empty() {
                 "us".to_owned()
@@ -403,10 +356,7 @@ impl AppleMusicApi {
             }
             playlists.push(playlist);
         }
-        tracing::info!(
-            playlists = playlists.len(),
-            "fetched Apple Music library playlists"
-        );
+        tracing::info!(playlists = playlists.len(), "fetched Apple Music library playlists");
         Ok(playlists)
     }
 
@@ -454,10 +404,7 @@ impl AppleMusicApi {
             let resp = self
                 .http
                 .get(&url)
-                .header(
-                    header::AUTHORIZATION,
-                    format!("Bearer {}", self.developer_token),
-                )
+                .header(header::AUTHORIZATION, format!("Bearer {}", self.developer_token))
                 .header("Music-User-Token", &self.user_token)
                 .header(header::ORIGIN, WEB_PLAYER)
                 .header(header::REFERER, format!("{WEB_PLAYER}/"))
@@ -468,23 +415,18 @@ impl AppleMusicApi {
             let status = resp.status();
 
             if status.is_success() {
-                let body = resp
-                    .text()
-                    .await
-                    .with_context(|| format!("failed to read {url}"))?;
+                let body = resp.text().await.with_context(|| format!("failed to read {url}"))?;
                 if body.trim().is_empty() {
                     return Ok(None);
                 }
-                let json = serde_json::from_str(&body)
-                    .with_context(|| format!("invalid JSON from Apple Music ({url})"))?;
+                let json =
+                    serde_json::from_str(&body).with_context(|| format!("invalid JSON from Apple Music ({url})"))?;
                 return Ok(Some(json));
             }
 
             match status {
                 StatusCode::NOT_FOUND => return Ok(None),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
-                    return Err(AuthError(status).into())
-                }
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => return Err(AuthError(status).into()),
                 StatusCode::TOO_MANY_REQUESTS
                 | StatusCode::INTERNAL_SERVER_ERROR
                 | StatusCode::BAD_GATEWAY
@@ -543,13 +485,7 @@ pub fn parse_library_song(v: &Json) -> Option<Track> {
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let attrs = v.get("attributes")?;
-    let text = |key: &str| {
-        attrs
-            .get(key)
-            .and_then(Json::as_str)
-            .map(str::trim)
-            .unwrap_or_default()
-    };
+    let text = |key: &str| attrs.get(key).and_then(Json::as_str).map(str::trim).unwrap_or_default();
 
     let title = text("name");
     if title.is_empty() {
@@ -561,10 +497,7 @@ pub fn parse_library_song(v: &Json) -> Option<Track> {
         title: title.to_owned(),
         artist: text("artistName").to_owned(),
         album: text("albumName").to_owned(),
-        duration_ms: attrs
-            .get("durationInMillis")
-            .and_then(Json::as_u64)
-            .unwrap_or(0),
+        duration_ms: attrs.get("durationInMillis").and_then(Json::as_u64).unwrap_or(0),
         track_no: attrs
             .get("trackNumber")
             .and_then(Json::as_u64)
@@ -698,14 +631,11 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 // Developer token scraping
 // ---------------------------------------------------------------------------------------------
 
-static BUNDLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"(?:https://music\.apple\.com)?/assets/[A-Za-z0-9._~-]+\.js"#)
-        .expect("valid regex")
-});
+static BUNDLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?:https://music\.apple\.com)?/assets/[A-Za-z0-9._~-]+\.js"#).expect("valid regex"));
 
-static JWT_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"eyJh[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").expect("valid regex")
-});
+static JWT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"eyJh[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+").expect("valid regex"));
 
 /// How many non-`index` bundles to try before giving up.
 const MAX_FALLBACK_BUNDLES: usize = 8;
@@ -748,9 +678,7 @@ async fn fetch_text(http: &reqwest::Client, url: &str) -> Result<String> {
     if !status.is_success() {
         bail!("{url} returned {status}");
     }
-    resp.text()
-        .await
-        .with_context(|| format!("failed to read {url}"))
+    resp.text().await.with_context(|| format!("failed to read {url}"))
 }
 
 /// Absolute URLs of the web player's JS bundles referenced by `html`, `index` bundles first
@@ -1040,10 +968,7 @@ mod tests {
         std::fs::write(&audio, b"not really audio").unwrap();
         let audio_str = audio.to_str().unwrap().to_owned();
         let location = file_url(&audio);
-        assert!(
-            location.contains("%20") && location.contains("%23"),
-            "{location}"
-        );
+        assert!(location.contains("%20") && location.contains("%23"), "{location}");
 
         let xml_path = dir.0.join("Library.xml");
         std::fs::write(&xml_path, library_xml(&location)).unwrap();
@@ -1066,10 +991,7 @@ mod tests {
         assert_eq!(local.source, Source::Local);
         assert_eq!(local.uri, audio_str);
         assert_eq!(local.title, "Local Song");
-        assert_eq!(
-            local.artist, "Album Guy",
-            "artist falls back to album artist"
-        );
+        assert_eq!(local.artist, "Album Guy", "artist falls back to album artist");
         assert_eq!(local.album, "Home Recordings");
         assert_eq!(local.duration_ms, 215_000);
         assert_eq!(local.track_no, Some(3));
@@ -1148,10 +1070,7 @@ mod tests {
             Some("/C:/Users/bob/Music/Win Song.mp3")
         );
         // '+' is a literal plus in file URLs, not a space.
-        assert_eq!(
-            file_url_to_path("FILE:///a+b.mp3").as_deref(),
-            Some("/a+b.mp3")
-        );
+        assert_eq!(file_url_to_path("FILE:///a+b.mp3").as_deref(), Some("/a+b.mp3"));
         assert_eq!(
             file_url_to_path("file://nas/share/Music/a.mp3").as_deref(),
             Some("//nas/share/Music/a.mp3")
@@ -1219,13 +1138,7 @@ mod tests {
         let minimal = serde_json::json!({ "id": "i.abc", "type": "library-songs", "attributes": { "name": "X" } });
         let t = parse_library_song(&minimal).unwrap();
         assert_eq!(
-            (
-                t.artist.as_str(),
-                t.duration_ms,
-                t.track_no,
-                t.art,
-                t.added_at
-            ),
+            (t.artist.as_str(), t.duration_ms, t.track_no, t.art, t.added_at),
             ("", 0, None, None, 0)
         );
 
@@ -1234,13 +1147,8 @@ mod tests {
         video["type"] = "library-music-videos".into();
         assert!(parse_library_song(&video).is_none());
         assert!(parse_library_song(&serde_json::json!({ "id": "i.x" })).is_none());
-        assert!(
-            parse_library_song(&serde_json::json!({ "attributes": { "name": "x" } })).is_none()
-        );
-        assert!(parse_library_song(
-            &serde_json::json!({ "id": "i.x", "attributes": { "name": "" } })
-        )
-        .is_none());
+        assert!(parse_library_song(&serde_json::json!({ "attributes": { "name": "x" } })).is_none());
+        assert!(parse_library_song(&serde_json::json!({ "id": "i.x", "attributes": { "name": "" } })).is_none());
     }
 
     #[test]
@@ -1288,18 +1196,9 @@ mod tests {
     fn parses_iso8601() {
         assert_eq!(parse_iso8601("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(parse_iso8601("2021-03-04T05:06:07Z"), Some(1_614_834_367));
-        assert_eq!(
-            parse_iso8601("2021-03-04T05:06:07.123Z"),
-            Some(1_614_834_367)
-        );
-        assert_eq!(
-            parse_iso8601("2021-03-04T06:06:07+01:00"),
-            Some(1_614_834_367)
-        );
-        assert_eq!(
-            parse_iso8601("2021-03-04T00:06:07-0500"),
-            Some(1_614_834_367)
-        );
+        assert_eq!(parse_iso8601("2021-03-04T05:06:07.123Z"), Some(1_614_834_367));
+        assert_eq!(parse_iso8601("2021-03-04T06:06:07+01:00"), Some(1_614_834_367));
+        assert_eq!(parse_iso8601("2021-03-04T00:06:07-0500"), Some(1_614_834_367));
         assert_eq!(parse_iso8601("2024-02-29"), Some(1_709_164_800));
         assert_eq!(parse_iso8601("garbage"), None);
         assert_eq!(parse_iso8601("2021-13-01"), None);
@@ -1336,21 +1235,14 @@ mod tests {
         );
 
         let jwt = "eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IldlYlBsYXlLaWQifQ.eyJpc3MiOiJBTVBXZWJQbGF5IiwiaWF0IjoxNzAwMDAwMDAwfQ.c2lnbmF0dXJlX2hlcmU-_x";
-        let js = format!(
-            r#"const a="eyJx.not.it";const cfg={{token:"{jwt}",other:"eyJhbGciOiJub25lIn0.e30.sig2"}};"#
-        );
+        let js = format!(r#"const a="eyJx.not.it";const cfg={{token:"{jwt}",other:"eyJhbGciOiJub25lIn0.e30.sig2"}};"#);
         assert_eq!(find_jwt(&js).as_deref(), Some(jwt));
         assert_eq!(find_jwt("no token here"), None);
     }
 
     #[test]
     fn api_debug_hides_tokens() {
-        let api = AppleMusicApi::new(
-            reqwest::Client::new(),
-            "Bearer dev-secret ",
-            " user-secret",
-            "",
-        );
+        let api = AppleMusicApi::new(reqwest::Client::new(), "Bearer dev-secret ", " user-secret", "");
         assert_eq!(api.developer_token, "dev-secret");
         assert_eq!(api.user_token, "user-secret");
         assert_eq!(api.storefront(), "us");
