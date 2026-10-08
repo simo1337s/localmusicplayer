@@ -101,6 +101,13 @@ pub enum Command {
     },
     ImportAppleXml(PathBuf),
     ImportAppleApi,
+    /// Saves the settings (and optionally keys, logins and your playlists) to a file.
+    ExportSettings {
+        path: PathBuf,
+        include: crate::backup::Include,
+    },
+    /// Takes over the settings in a file, then restarts the app.
+    ImportSettings(PathBuf),
     Rescan,
     /// Ask mpv which output devices exist (for the device picker).
     ListAudioDevices,
@@ -321,6 +328,10 @@ pub struct Feed {
     pub audio_devices: Vec<(String, String)>,
     pub raise: bool,
     pub quit: bool,
+    /// Settings were imported: the UI takes these over and the app restarts.
+    pub imported_settings: Option<Box<Config>>,
+    /// The settings file last exported.
+    pub exported_settings: Option<PathBuf>,
 }
 
 /// State shared between the service and the UI.
@@ -990,6 +1001,8 @@ impl Service {
                 });
             }
             Command::ImportAppleApi => self.import_apple_api(),
+            Command::ExportSettings { path, include } => self.export_settings(&path, include),
+            Command::ImportSettings(path) => self.import_settings(&path),
             Command::Rescan => self.start_scan(),
             Command::ListAudioDevices => {
                 let binary = self.cfg.playback.mpv_path.clone();
@@ -2683,6 +2696,73 @@ impl Service {
                 }
             }
         });
+    }
+
+    // ---------------------------------------------------------------- settings files
+
+    fn export_settings(&mut self, path: &Path, include: crate::backup::Include) {
+        let file = {
+            let lib = self.shared.library.read().unwrap();
+            crate::backup::build(&self.cfg, &self.paths.spotify_dir(), &lib, include)
+        };
+        match crate::backup::write(path, &file) {
+            Ok(()) => {
+                self.shared.feed.write().unwrap().exported_settings = Some(path.to_path_buf());
+                let keys = if include.keys {
+                    ". It holds your keys and logins: keep it private"
+                } else {
+                    ""
+                };
+                self.shared
+                    .info(format!("Saved your settings to {}{keys}", path.display()));
+            }
+            Err(e) => self.shared.error(format!("Couldn't save your settings: {e:#}")),
+        }
+    }
+
+    fn import_settings(&mut self, path: &Path) {
+        let file = match crate::backup::read(path) {
+            Ok(file) => file,
+            Err(e) => {
+                self.shared.error(format!("Couldn't import settings: {e:#}"));
+                return;
+            }
+        };
+        let cfg = crate::backup::merge_config(&self.cfg, &file);
+        if file.has_keys {
+            let dir = self.paths.spotify_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            for (name, text) in &file.logins {
+                if !crate::backup::LOGIN_FILES.contains(&name.as_str()) {
+                    continue;
+                }
+                let target = dir.join(name);
+                if let Err(e) = std::fs::write(&target, text) {
+                    self.shared.error(format!("Couldn't restore the Spotify login: {e}"));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
+                }
+            }
+        }
+        if !file.playlists.is_empty() {
+            let (playlists, tracks) = {
+                let lib = self.shared.library.read().unwrap();
+                crate::backup::merge_playlists(&lib, &file)
+            };
+            self.store_tracks(&tracks);
+            self.save_playlists(playlists, &[]);
+        }
+        self.cfg = cfg.clone();
+        if let Err(e) = self.cfg.save(&self.paths) {
+            self.shared.error(format!("Couldn't save the imported settings: {e:#}"));
+            return;
+        }
+        // Logins and connections are set up from scratch on the next start.
+        self.shared.feed.write().unwrap().imported_settings = Some(Box::new(cfg));
+        self.shared.repaint();
     }
 
     // ---------------------------------------------------------------- playlists

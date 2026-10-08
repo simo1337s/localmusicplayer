@@ -89,6 +89,10 @@ Everything is under **Settings** (bottom of the sidebar).
   Then run `systemctl --user restart pipewire`.
 - **Spotify lossless isn't possible.** Spotify only streams its FLAC files to the official Spotify apps, so librespot-based players (including MultiMusic) get 320 kbps Ogg Vorbis at most.
 
+## Back up or move your settings
+
+*Settings → Back up or move your settings* saves everything on the Settings page to one file (`MultiMusic settings <date>.json` in your Documents folder), optionally with your **keys and logins** (Last.fm, SoundCloud, Apple Music, Discord, your Spotify app keys, the Spotify login itself and the GitHub token for updates) and **your own playlists and Liked Songs**. On another computer (Linux, Windows or macOS) import it from the same section, or drop the file onto the window: MultiMusic takes the settings over, adds the playlists and restarts. Library and download folders that don't exist on the new computer, the mpv / yt-dlp programs and the audio device are left as they are there. A file with keys holds your passwords and tokens, so keep it private.
+
 ## Keyboard shortcuts
 
 | Key | Action |

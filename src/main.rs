@@ -1,5 +1,6 @@
 //! MultiMusic: a lightweight native music player for local files, Spotify and SoundCloud.
 
+mod backup;
 mod config;
 mod downloader;
 mod http;
@@ -64,10 +65,11 @@ fn main() -> anyhow::Result<()> {
     };
     let handle = rt.handle().clone();
     let ui_cmd = cmd.clone();
+    let ui_shared = shared.clone();
     let result = eframe::run_native(
         "MultiMusic",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, shared, ui_cmd, cfg, paths, handle)))),
+        Box::new(move |cc| Ok(Box::new(ui::App::new(cc, ui_shared, ui_cmd, cfg, paths, handle)))),
     );
 
     // Let the service stop mpv, clear Discord and save the session.
@@ -77,6 +79,19 @@ fn main() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     rt.shutdown_timeout(Duration::from_millis(500));
+    // Imported settings take effect in a fresh start.
+    if shared
+        .feed
+        .read()
+        .map(|f| f.imported_settings.is_some())
+        .unwrap_or(false)
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .spawn();
+        }
+    }
     result.map_err(|e| anyhow!("{e}"))
 }
 

@@ -14,6 +14,13 @@ use crate::service::{AccountStatus, Command};
 pub struct SettingsState {
     new_folder: String,
     import_path: String,
+    /// Settings export: where to, and what to leave out.
+    export_to: String,
+    export_no_keys: bool,
+    export_no_playlists: bool,
+    /// The settings file to import (the newest one found, to begin with).
+    settings_file: String,
+    settings_file_looked: bool,
     show_spotify_advanced: bool,
     devices_requested: bool,
 }
@@ -512,6 +519,86 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.add(egui::DragValue::new(&mut cfg.ui.art_cache_size).range(32..=2000));
                 });
                 hint(ui, "Fewer cached covers = less RAM. Takes effect after a restart.");
+            });
+
+            // ---------------------------------------------------------- backup
+            section(ui, icon::ARCHIVE, TEXT, "Back up or move your settings", |ui| {
+                hint(
+                    ui,
+                    "Saves everything on this page to one file, with your keys and logins and your own playlists if \
+                     you like. Import it on another computer (Linux, Windows or macOS) to carry on where you left off.",
+                );
+                ui.add_space(4.0);
+                let mut keys = !st.export_no_keys;
+                ui.checkbox(
+                    &mut keys,
+                    "Include keys and logins (Spotify, Last.fm, SoundCloud, Apple Music, Discord, GitHub)",
+                );
+                st.export_no_keys = !keys;
+                let mut playlists = !st.export_no_playlists;
+                ui.checkbox(&mut playlists, "Include your playlists and Liked Songs");
+                st.export_no_playlists = !playlists;
+                if st.export_to.is_empty() {
+                    st.export_to = crate::backup::default_export_path().to_string_lossy().into_owned();
+                }
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut st.export_to).desired_width(ui.available_width() - 90.0));
+                    if ui.button(theme::ic(icon::UPLOAD_SIMPLE, "Export")).clicked() && !st.export_to.trim().is_empty() {
+                        cx.actions.push(Action::Cmd(Command::ExportSettings {
+                            path: expand_home(&st.export_to),
+                            include: crate::backup::Include { keys, playlists },
+                        }));
+                    }
+                });
+                if keys {
+                    hint(ui, "The file then holds your passwords and tokens: keep it private.");
+                }
+                if let Some(saved) = &cx.feed.exported_settings {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Show in folder").clicked() {
+                            if let Some(dir) = saved.parent() {
+                                cx.actions.push(Action::OpenUrl(dir.to_string_lossy().into_owned()));
+                            }
+                        }
+                        let name = saved.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                        ui.add(
+                            egui::Label::new(RichText::new(format!("Saved as {name}")).small().color(TEXT_DIM))
+                                .truncate(),
+                        )
+                        .on_hover_text(saved.display().to_string());
+                    });
+                }
+                ui.add_space(8.0);
+                if !st.settings_file_looked {
+                    st.settings_file_looked = true;
+                    if let Some(found) = crate::backup::find_settings_files().first() {
+                        st.settings_file = found.to_string_lossy().into_owned();
+                    }
+                }
+                if st.settings_file.is_empty() {
+                    if let Some(saved) = &cx.feed.exported_settings {
+                        st.settings_file = saved.to_string_lossy().into_owned();
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut st.settings_file)
+                            .hint_text("Settings file to import (or drop it onto the window)")
+                            .desired_width(ui.available_width() - 90.0),
+                    );
+                    let file = expand_home(&st.settings_file);
+                    if ui
+                        .add_enabled(file.is_file(), egui::Button::new(theme::ic(icon::DOWNLOAD_SIMPLE, "Import…")))
+                        .clicked()
+                    {
+                        cx.actions.push(Action::ImportSettings(file));
+                    }
+                });
+                hint(
+                    ui,
+                    "Importing replaces your settings (folders and programs that aren't on this computer stay as they \
+                     are), adds the playlists, and restarts MultiMusic.",
+                );
             });
 
             // ---------------------------------------------------------- about
