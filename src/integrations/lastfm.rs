@@ -189,6 +189,8 @@ pub fn scrobble_names(track: &Track) -> (String, String) {
     if track.source != Source::SoundCloud {
         return (artist, title);
     }
+    // "(+Yung Lean)" is how uploads credit a guest.
+    let title = plus_features(&title);
     // Official releases on SoundCloud come with proper titles (and an album); only the
     // collaboration credit ("Bladee x Uli K") needs to become the main artist.
     if !track.album.trim().is_empty() {
@@ -235,8 +237,20 @@ const VERSION_WORDS: &[&str] = &[
     "version",
 ];
 
-/// "A ft. B" / "A feat. B" -> "A".
+/// "Song (+Guest)" -> "Song (feat. Guest)", the way Last.fm and Spotify name features.
+fn plus_features(title: &str) -> String {
+    static PLUS_RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[(\[]\s*\+\s*([^)\]+][^)\]]*?)\s*[)\]]").expect("valid regex"));
+    PLUS_RE.replace_all(title, "(feat. $1)").into_owned()
+}
+
+/// "A ft. B" / "A feat. B" / "A x B" / "A+B" -> "A".
 fn main_credit(artist: &str) -> &str {
+    // "a+b" (no spaces) is a collaboration; "Florence + the Machine" is a band.
+    let bytes = artist.as_bytes();
+    let plus = (1..bytes.len().saturating_sub(1))
+        .find(|&i| bytes[i] == b'+' && bytes[i - 1].is_ascii_alphanumeric() && bytes[i + 1].is_ascii_alphanumeric());
+    let artist = plus.map_or(artist, |i| artist[..i].trim());
     // ASCII lowercase keeps byte positions the same as in `artist`.
     let lower = artist.to_ascii_lowercase();
     // "A x B" is how SoundCloud credits collaborations.
@@ -1063,6 +1077,28 @@ mod tests {
             ("Yung Lean".into(), "Rat Race".into())
         );
         assert_eq!(names(&upload("Song", "Malcolm X")), ("Malcolm X".into(), "Song".into()));
+        // "a+b" credits and "(+Guest)" features.
+        assert_eq!(
+            names(&upload("bladee+Thaiboy Digital - X o n u (+Yung Lean)", "drain gang")),
+            ("bladee".into(), "X o n u (feat. Yung Lean)".into())
+        );
+        assert_eq!(
+            names(&upload("Song [+ Ecco2k]", "bladee+ecco2k")),
+            ("bladee".into(), "Song (feat. Ecco2k)".into())
+        );
+        assert_eq!(
+            names(&upload("Dog Days", "Florence + the Machine")),
+            ("Florence + the Machine".into(), "Dog Days".into())
+        );
+        assert_eq!(names(&upload("Song", "C++")), ("C++".into(), "Song".into()));
+        // Lookups (Spotify, Genius, lyrics) search without the feature.
+        assert_eq!(
+            crate::integrations::lyrics::song_names(&upload(
+                "bladee+Thaiboy Digital - X o n u (+Yung Lean)",
+                "drain gang"
+            )),
+            ("bladee".into(), "X o n u".into())
+        );
         assert_eq!(names(&track("A, B", "X - Y")), ("A".into(), "X - Y".into()));
     }
 
