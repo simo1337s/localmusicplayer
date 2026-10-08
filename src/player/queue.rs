@@ -127,6 +127,18 @@ impl Queue {
         self.current.clone()
     }
 
+    /// Swaps in new versions of songs (after their tags were edited, say).
+    pub fn refresh(&mut self, updated: &std::collections::HashMap<String, Track>) {
+        let swap = |t: &mut Track| {
+            if let Some(new) = updated.get(&t.id) {
+                *t = new.clone();
+            }
+        };
+        self.tracks.iter_mut().for_each(swap);
+        self.up_next.iter_mut().for_each(swap);
+        self.current.iter_mut().for_each(swap);
+    }
+
     pub fn enqueue(&mut self, tracks: Vec<Track>) {
         self.up_next.extend(tracks);
     }

@@ -81,6 +81,19 @@ pub enum Command {
     DeletePlaylist(String),
     /// Shows a message (for things the UI does on its own, like copying songs).
     Notify(String),
+    /// Writes changed details into local files: each field gets the text given (empty removes
+    /// it), and the cover is replaced or removed.
+    EditTags {
+        paths: Vec<PathBuf>,
+        changes: Vec<(library::tags::Field, String)>,
+        cover: Option<CoverChange>,
+    },
+    /// Looks a song up on Spotify for the tag editor; the answer lands in `Feed::tag_lookup`
+    /// under `request`.
+    LookUpTags {
+        request: u64,
+        track: Track,
+    },
     ImportM3u(PathBuf),
     ExportM3u {
         playlist_id: String,
@@ -285,6 +298,11 @@ pub struct Feed {
     pub search: SearchState,
     pub page: PageState,
     pub lyrics: LyricsState,
+    /// Spotify's details of a song, for the tag editor's request with this number.
+    pub tag_lookup: Option<(u64, Result<library::tags::Metadata, String>)>,
+    /// Covers that changed: the UI drops these images (it compares the number to the last
+    /// one it handled).
+    pub art_changed: (u64, Vec<String>),
     /// Downloads started this session, oldest first.
     pub downloads: Vec<DownloadItem>,
     /// Downloaded songs: track id → file.
@@ -374,6 +392,16 @@ enum Internal {
         playlist_id: String,
         tracks: Vec<Track>,
         failed: usize,
+    },
+    TagsEdited {
+        /// The files read again, with their new modification times.
+        tracks: Vec<(Track, i64)>,
+        errors: Vec<String>,
+        cover_changed: bool,
+    },
+    TagLookup {
+        request: u64,
+        result: Result<library::tags::Metadata, String>,
     },
     ScanDone(library::scanner::ScanResult),
     Lyrics {
@@ -924,6 +952,8 @@ impl Service {
                 }
             }
             Command::Notify(text) => self.shared.info(text),
+            Command::EditTags { paths, changes, cover } => self.edit_tags(paths, changes, cover),
+            Command::LookUpTags { request, track } => self.look_up_tags(request, track),
             Command::DeletePlaylist(id) => {
                 if id != LIKED_ID {
                     self.save_playlists(vec![], &[id]);
@@ -2666,12 +2696,8 @@ impl Service {
             })
         };
         if let Some(p) = updated {
-            let songs = if tracks.len() == 1 {
-                "1 song".to_string()
-            } else {
-                format!("{} songs", tracks.len())
-            };
-            self.shared.info(format!("Added {songs} to “{}”", p.name));
+            self.shared
+                .info(format!("Added {} to “{}”", songs_text(tracks.len()), p.name));
             self.save_playlists(vec![p], &[]);
         }
     }
@@ -2704,6 +2730,142 @@ impl Service {
                 tracks,
                 failed,
             });
+        });
+    }
+
+    // ---------------------------------------------------------------- tag editor
+
+    fn edit_tags(
+        &mut self,
+        paths: Vec<PathBuf>,
+        changes: Vec<(library::tags::Field, String)>,
+        cover: Option<CoverChange>,
+    ) {
+        use library::tags::{self, CoverEdit};
+        let http = self.http.clone();
+        let folders = self.cfg.library.folders.clone();
+        let tx = self.internal_tx.clone();
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let cover = match cover {
+                Some(CoverChange::Remove) => Some(CoverEdit::Remove),
+                Some(CoverChange::From(src)) => match load_cover(&http, &src).await {
+                    Ok(data) => Some(CoverEdit::Set(data)),
+                    Err(e) => {
+                        shared.error(format!("Couldn't use that cover: {e:#}"));
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let cover_changed = cover.is_some();
+            let edited = tokio::task::spawn_blocking(move || {
+                let mut tracks = Vec::new();
+                let mut errors = Vec::new();
+                for path in paths {
+                    if let Err(e) = tags::edit(&path, &changes, cover.as_ref()) {
+                        errors.push(format!("{e:#}"));
+                        continue;
+                    }
+                    let root = folders.iter().find(|f| path.starts_with(f)).map(PathBuf::as_path);
+                    let folder_cover = path.parent().and_then(library::scanner::find_cover);
+                    let mut track = library::scanner::read_track_in(&path, root, folder_cover, now_unix());
+                    if matches!(cover, Some(CoverEdit::Set(_))) {
+                        // Its own new cover, not the folder's picture.
+                        track.art = Some(track.uri.clone());
+                    }
+                    tracks.push((track, library::scanner::mtime_of(&path)));
+                }
+                (tracks, errors)
+            })
+            .await;
+            let Ok((tracks, errors)) = edited else { return };
+            let _ = tx.send(Internal::TagsEdited {
+                tracks,
+                errors,
+                cover_changed,
+            });
+        });
+    }
+
+    fn tags_edited(&mut self, edited: Vec<(Track, i64)>, errors: Vec<String>, cover_changed: bool) {
+        let mut mtimes = HashMap::new();
+        let mut tracks = Vec::with_capacity(edited.len());
+        let mut covers = Vec::new();
+        {
+            let lib = self.shared.library.read().unwrap();
+            for (mut t, mtime) in edited {
+                if let Some(old) = lib.tracks.get(&t.id) {
+                    if old.added_at != 0 {
+                        t.added_at = old.added_at;
+                    }
+                    if cover_changed {
+                        covers.extend(old.art.clone());
+                    } else {
+                        t.art = old.art.clone();
+                    }
+                }
+                if cover_changed {
+                    covers.extend(t.art.clone());
+                }
+                mtimes.insert(t.id.clone(), mtime);
+                tracks.push(t);
+            }
+        }
+        if let Err(e) = self.db.upsert_tracks(&tracks, &mtimes) {
+            self.shared.error(format!("Database error: {e:#}"));
+        }
+        let updated: HashMap<String, Track> = tracks.into_iter().map(|t| (t.id.clone(), t)).collect();
+        {
+            let mut lib = self.shared.library.write().unwrap();
+            for t in updated.values() {
+                lib.tracks.insert(t.id.clone(), t.clone());
+            }
+            lib.reindex();
+        }
+        self.queue.refresh(&updated);
+        if let Some(new) = self.playing.as_ref().and_then(|p| updated.get(&p.id)) {
+            self.playing = Some(new.clone());
+        }
+        self.publish_player();
+        self.publish_queue();
+        if cover_changed {
+            let mut feed = self.shared.feed.write().unwrap();
+            feed.art_changed.0 += 1;
+            feed.art_changed.1 = covers;
+        }
+        // The playing song's lyrics may have changed (they come from its file first).
+        if let Some(current) = self.queue.current().filter(|t| updated.contains_key(&t.id)).cloned() {
+            self.shared.feed.write().unwrap().lyrics.track_id.clear();
+            self.request_lyrics(&current);
+            self.update_presence();
+        }
+        if !updated.is_empty() {
+            self.shared
+                .info(format!("Saved the details of {}", songs_text(updated.len())));
+        }
+        if let Some(first) = errors.first() {
+            let more = match errors.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            self.shared.error(format!("{first}{more}"));
+        }
+    }
+
+    fn look_up_tags(&mut self, request: u64, track: Track) {
+        let tx = self.internal_tx.clone();
+        let Some((auth, api)) = self.spotify_search() else {
+            let _ = tx.send(Internal::TagLookup {
+                request,
+                result: Err("Log in to Spotify in Settings to look songs up".into()),
+            });
+            return;
+        };
+        let session = self.spotify.as_ref().and_then(|e| e.session());
+        tokio::spawn(async move {
+            let result = spotify_tags(&auth, &api, session.as_ref(), &track).await;
+            let _ = tx.send(Internal::TagLookup { request, result });
         });
     }
 
@@ -3494,6 +3656,15 @@ impl Service {
                 Ok((songs, playlists)) => self.merge_apple(songs, playlists),
                 Err(e) => self.shared.error(format!("Apple Music import failed: {e:#}")),
             },
+            Internal::TagsEdited {
+                tracks,
+                errors,
+                cover_changed,
+            } => self.tags_edited(tracks, errors, cover_changed),
+            Internal::TagLookup { request, result } => {
+                self.shared.feed.write().unwrap().tag_lookup = Some((request, result));
+                self.shared.repaint();
+            }
             Internal::LinksResolved {
                 playlist_id,
                 tracks,
@@ -3932,6 +4103,90 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
         external_url: links::web_url(&format!("spotify:{}:{id}", links::kind_name(kind))),
         ..Default::default()
     })
+}
+
+/// Where the tag editor's new cover comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CoverChange {
+    /// An image file or a link to one.
+    From(String),
+    Remove,
+}
+
+/// "1 song" / "3 songs".
+fn songs_text(n: usize) -> String {
+    if n == 1 {
+        "1 song".into()
+    } else {
+        format!("{n} songs")
+    }
+}
+
+/// Cover data for a file's tags from an image file or link.
+async fn load_cover(http: &reqwest::Client, src: &str) -> Result<Vec<u8>> {
+    let src = src.trim();
+    let bytes = if src.starts_with("http://") || src.starts_with("https://") {
+        let resp = http.get(src).send().await?.error_for_status()?;
+        resp.bytes().await?.to_vec()
+    } else {
+        let path = match src.strip_prefix("file://") {
+            Some(rest) => urlencoding::decode(rest).map_or_else(|_| rest.to_string(), |p| p.into_owned()),
+            None => src.to_string(),
+        };
+        tokio::fs::read(&path)
+            .await
+            .map_err(|e| anyhow!("couldn't read {path}: {e}"))?
+    };
+    tokio::task::spawn_blocking(move || library::tags::cover_data(bytes)).await?
+}
+
+/// What Spotify knows about a song, for the tag editor: the full details when the playback
+/// session is up, else what its search result says.
+async fn spotify_tags(
+    auth: &SpotifyAuth,
+    api: &SpotifyApi,
+    session: Option<&librespot_core::session::Session>,
+    track: &Track,
+) -> Result<library::tags::Metadata, String> {
+    let (artist, title) = crate::integrations::lyrics::song_names(track);
+    let unknown = artist.is_empty() || artist == library::scanner::UNKNOWN_ARTIST;
+    let query = if unknown {
+        title.clone()
+    } else {
+        format!("{artist} {title}")
+    };
+    let token = auth.token().await.map_err(|e| format!("Spotify: {e:#}"))?;
+    let results = api
+        .search(&token, &query, 10)
+        .await
+        .map_err(|e| format!("Spotify search failed: {e:#}"))?;
+    let wanted = Track {
+        artist: if unknown { String::new() } else { artist.clone() },
+        title: title.clone(),
+        ..track.clone()
+    };
+    let found = if unknown {
+        same_title_and_length(&wanted, &results)
+    } else {
+        best_match(&wanted, &results)
+    };
+    let Some(found) = found else {
+        let by = if unknown {
+            String::new()
+        } else {
+            format!(" by {artist}")
+        };
+        return Err(format!("Spotify has no song called “{title}”{by}"));
+    };
+    if let Some(session) = session {
+        let details = crate::providers::spotify_internal::track_details(session, &found.id);
+        if let Ok(Ok(meta)) = tokio::time::timeout(Duration::from_secs(20), details).await {
+            if !meta.title.is_empty() {
+                return Ok(meta);
+            }
+        }
+    }
+    Ok(downloader::basic_metadata(&found))
 }
 
 /// The songs a pasted line stands for: a Spotify or SoundCloud song, album or playlist link, or
@@ -4643,6 +4898,25 @@ mod tests {
             .await
             .is_none());
         assert!(paste("hello".into()).await.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn covers_load_from_files_and_links() {
+        let dir = std::env::temp_dir().join(format!("multimusic-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("my cover.png");
+        image::RgbImage::new(4, 4).save(&path).unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let data = load_cover(&http, &path.to_string_lossy()).await.unwrap();
+        assert!(data.starts_with(b"\x89PNG"));
+        let link = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(load_cover(&http, &link).await.unwrap(), data);
+        std::fs::write(dir.join("notes.txt"), b"not an image").unwrap();
+        assert!(load_cover(&http, &dir.join("notes.txt").to_string_lossy())
+            .await
+            .is_err());
+        assert!(load_cover(&http, "/nowhere/cover.jpg").await.is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

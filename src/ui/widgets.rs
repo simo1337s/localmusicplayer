@@ -1094,6 +1094,14 @@ fn selection_menu(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], rows: &[usize], p
         copy_songs(ui.ctx(), cx, picked());
         ui.close();
     }
+    let local = rows.iter().filter(|i| tracks[**i].source == Source::Local).count();
+    if local > 0 {
+        let label = format!("Edit details of {}…", songs(local));
+        if ui.button(theme::ic(icon::PENCIL_SIMPLE, label)).clicked() {
+            cx.actions.push(Action::EditTags(picked()));
+            ui.close();
+        }
+    }
     if let Some(p) = playlist.filter(|p| takes_songs(p)) {
         if ui
             .button(theme::ic(icon::TRASH, "Remove from this playlist  (Delete)"))
@@ -1228,6 +1236,10 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
     });
     if ui.button(theme::ic(icon::COPY, "Copy  (Ctrl+C)")).clicked() {
         copy_songs(ui.ctx(), cx, vec![t.clone()]);
+        ui.close();
+    }
+    if t.source == Source::Local && ui.button(theme::ic(icon::PENCIL_SIMPLE, "Edit details…")).clicked() {
+        cx.actions.push(Action::EditTags(vec![t.clone()]));
         ui.close();
     }
     if let Some((Some(p), idx)) = in_playlist {

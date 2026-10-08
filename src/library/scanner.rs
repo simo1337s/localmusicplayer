@@ -179,7 +179,7 @@ pub fn read_track_in(path: &Path, root: Option<&Path>, cover: Option<String>, ad
             if let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) {
                 let names = tag_names(tag);
                 (track.title, track.artist, track.album) = (names.title, names.artist, names.album);
-                track.track_no = tag.track();
+                track.track_no = names.track_no;
             }
         }
         Err(e) => tracing::debug!("could not read tags of {}: {e}", path.display()),
@@ -217,7 +217,7 @@ fn tag_names(tag: &lofty::tag::Tag) -> Guess {
         title: text(tag.title().as_deref()),
         artist,
         album: text(tag.album().as_deref()),
-        track_no: tag.track(),
+        track_no: tag.track().filter(|n| *n > 0),
     }
 }
 

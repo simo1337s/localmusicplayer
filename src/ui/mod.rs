@@ -3,6 +3,7 @@
 mod art;
 mod panels;
 mod settings;
+mod tag_editor;
 pub mod theme;
 mod views;
 mod widgets;
@@ -65,6 +66,8 @@ pub enum Action {
     RightTab(RightTab),
     ToggleRightPanel,
     ToggleLibrary,
+    /// Opens the tag editor for these songs (the local ones).
+    EditTags(Vec<Track>),
 }
 
 /// Per-frame context handed to every view.
@@ -120,6 +123,10 @@ pub struct App {
     shown_view: View,
     view_changed_at: Instant,
     dialog: Option<Dialog>,
+    tag_editor: Option<tag_editor::TagEditor>,
+    /// The last `Feed::art_changed` number handled.
+    art_changed_seen: u64,
+    rt: tokio::runtime::Handle,
     settings: settings::SettingsState,
     cjk_loaded: bool,
     cjk_checked_version: u64,
@@ -143,7 +150,7 @@ impl App {
         theme::setup_fonts(&ctx, false);
         theme::apply_style(&ctx, accent);
         ctx.set_zoom_factor(cfg.ui.scale.clamp(0.6, 2.5));
-        let art = ArtCache::new(rt, paths.art_cache(), cfg.ui.art_cache_size);
+        let art = ArtCache::new(rt.clone(), paths.art_cache(), cfg.ui.art_cache_size);
         let logo = theme::load_logo(&ctx);
         App {
             shared,
@@ -171,6 +178,9 @@ impl App {
             shown_view: View::Home,
             view_changed_at: Instant::now() - Duration::from_secs(1),
             dialog: None,
+            tag_editor: None,
+            art_changed_seen: 0,
+            rt,
             settings: settings::SettingsState::default(),
             cjk_loaded: false,
             cjk_checked_version: u64::MAX,
@@ -296,6 +306,9 @@ impl App {
                 Action::ToggleRightPanel => {
                     self.cfg.ui.show_right_panel = !self.cfg.ui.show_right_panel;
                     self.cfg_changed_at = Some(Instant::now());
+                }
+                Action::EditTags(tracks) => {
+                    self.tag_editor = tag_editor::TagEditor::open(tracks, &self.rt);
                 }
                 Action::ToggleLibrary => {
                     self.cfg.ui.collapse_library = !self.cfg.ui.collapse_library;
@@ -606,6 +619,28 @@ impl App {
         }
     }
 
+    fn tag_editor(&mut self, ctx: &egui::Context) {
+        let shared = self.shared.clone();
+        let feed = shared.feed.read().unwrap();
+        // Covers that were just changed are loaded again.
+        if feed.art_changed.0 != self.art_changed_seen {
+            self.art_changed_seen = feed.art_changed.0;
+            for src in &feed.art_changed.1 {
+                self.art.forget(src);
+            }
+        }
+        let Some(editor) = self.tag_editor.as_mut() else { return };
+        let mut commands = Vec::new();
+        let open = editor.show(ctx, &mut self.art, &feed, self.accent, &mut commands);
+        drop(feed);
+        for c in commands {
+            self.send(c);
+        }
+        if !open {
+            self.tag_editor = None;
+        }
+    }
+
     fn toasts(&self, ctx: &egui::Context, feed: &Feed) {
         if feed.toasts.is_empty() {
             return;
@@ -861,6 +896,7 @@ impl eframe::App for App {
 
         self.apply(&ctx, actions);
         self.dialogs(&ctx);
+        self.tag_editor(&ctx);
         self.sync_config(&ctx);
         self.check_memory(&ctx);
 

@@ -138,6 +138,15 @@ impl ArtCache {
         None
     }
 
+    /// Drops an image (all sizes), so it is loaded again next time (it changed).
+    pub fn forget(&mut self, src: &str) {
+        let gone = |key: &Key| key.0 == src;
+        self.textures.retain(|k, _| !gone(k));
+        self.failed.retain(|k| !gone(k));
+        self.lru.retain(|k| !gone(k));
+        self.accents.remove(src);
+    }
+
     pub fn len(&self) -> usize {
         self.textures.len()
     }
