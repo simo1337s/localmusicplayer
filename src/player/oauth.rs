@@ -119,8 +119,19 @@ pub fn pkce_pair() -> (String, String) {
 }
 
 pub fn authorize_url(client_id: &str, redirect: &str, scopes: &[&str], challenge: &str, state: &str) -> String {
+    authorize_url_at(AUTHORIZE_URL, client_id, redirect, scopes, challenge, state)
+}
+
+fn authorize_url_at(
+    base: &str,
+    client_id: &str,
+    redirect: &str,
+    scopes: &[&str],
+    challenge: &str,
+    state: &str,
+) -> String {
     format!(
-        "{AUTHORIZE_URL}?response_type=code&client_id={}&redirect_uri={}&code_challenge_method=S256&code_challenge={}&state={}&scope={}",
+        "{base}?response_type=code&client_id={}&redirect_uri={}&code_challenge_method=S256&code_challenge={}&state={}&scope={}",
         urlencoding::encode(client_id),
         urlencoding::encode(redirect),
         challenge,
@@ -129,10 +140,125 @@ pub fn authorize_url(client_id: &str, redirect: &str, scopes: &[&str], challenge
     )
 }
 
+/// What Spotify's authorize page says about a client ID and redirect URI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+    /// It would show the login (or consent) page.
+    Accepted,
+    /// "redirect_uri: Not matching configuration" / "Invalid redirect URI".
+    BadRedirect,
+    /// "Invalid client": no app with this client ID.
+    BadClient,
+    /// Couldn't tell (offline, or an answer we don't recognise).
+    Unknown,
+}
+
+/// Reads Spotify's answer to an authorize request. Only clear error texts count as a "no", so
+/// a working login is never blocked by a misread page.
+pub fn judge(status: u16, location: Option<&str>, body: &str) -> Check {
+    let body = body.to_lowercase();
+    let says_redirect = body.contains("not matching configuration") || body.contains("invalid redirect uri");
+    let says_client = body.contains("invalid client") || body.contains("invalid_client");
+    match status {
+        300..=399 if location.is_some_and(|l| l.contains("error")) => Check::Unknown,
+        300..=399 => Check::Accepted,
+        200 if says_redirect => Check::BadRedirect,
+        200 => Check::Accepted,
+        400..=499 if says_redirect || body.contains("redirect_uri") || body.contains("redirect uri") => {
+            Check::BadRedirect
+        }
+        400..=499 if says_client => Check::BadClient,
+        _ => Check::Unknown,
+    }
+}
+
+/// Asks Spotify (without a browser) whether it would accept this client ID and redirect URI.
+async fn check_at(base: &str, client_id: &str, redirect: &str, scopes: &[&str]) -> Check {
+    let (_, challenge) = pkce_pair();
+    let url = authorize_url_at(base, client_id, redirect, scopes, &challenge, "check");
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .user_agent(crate::http::USER_AGENT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Check::Unknown,
+    };
+    let Ok(resp) = client.get(&url).send().await else {
+        return Check::Unknown;
+    };
+    let status = resp.status().as_u16();
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|l| l.to_str().ok())
+        .map(str::to_string);
+    let body = resp.text().await.unwrap_or_default();
+    let body: String = body.chars().take(20_000).collect();
+    let verdict = judge(status, location.as_deref(), &body);
+    tracing::debug!("spotify: authorize check for {redirect}: HTTP {status} → {verdict:?}");
+    verdict
+}
+
+/// Close relatives of a redirect URI on the same port, in case the app has it saved slightly
+/// differently (a trailing slash, or the usual /callback or /login path).
+pub fn redirect_variants(uri: &str) -> Vec<String> {
+    let Ok(r) = parse_redirect(uri) else {
+        return Vec::new();
+    };
+    let base = match r.host {
+        "::1" => format!("http://[::1]:{}", r.port),
+        host => format!("http://{host}:{}", r.port),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let trimmed = r.uri.trim_end_matches('/');
+    for candidate in [
+        trimmed.to_string(),
+        format!("{trimmed}/"),
+        format!("{base}/callback"),
+        format!("{base}/login"),
+        format!("{base}/callback/"),
+        format!("{base}/login/"),
+    ] {
+        if candidate != r.uri && !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// The redirect URI to use: the one given when Spotify accepts it (or can't be asked), else
+/// the variant of it Spotify does accept. Fails with what to fix when Spotify accepts none.
+async fn usable_redirect_at(base: &str, client_id: &str, uri: &str, scopes: &[&str]) -> Result<String> {
+    match check_at(base, client_id, uri, scopes).await {
+        Check::Accepted | Check::Unknown => return Ok(uri.to_string()),
+        Check::BadClient => bail!(
+            "Spotify doesn't know the client ID {client_id}. Copy the Client ID from your app's page on \
+             developer.spotify.com"
+        ),
+        Check::BadRedirect => {}
+    }
+    for variant in redirect_variants(uri) {
+        if check_at(base, client_id, &variant, scopes).await == Check::Accepted {
+            tracing::info!("spotify: {uri} isn't registered for {client_id}, but {variant} is; using that");
+            return Ok(variant);
+        }
+    }
+    bail!(
+        "Spotify won't accept the Redirect URI {uri} for the app {client_id}: the app doesn't have it saved. On \
+         developer.spotify.com open the app → Settings → Edit, add exactly {uri} under Redirect URIs, click Add, \
+         then scroll to the bottom and click Save (it doesn't count until saved), and try again"
+    )
+}
+
 /// Runs the whole browser login and returns the token. `redirect_uri` must be registered
-/// for `client_id` exactly as given.
+/// for `client_id` (Spotify is asked first, and a slightly different registered form of it
+/// is found and used).
 pub async fn login(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Result<Token> {
-    let target = parse_redirect(redirect_uri)?;
+    parse_redirect(redirect_uri)?;
+    let redirect_uri = usable_redirect_at(AUTHORIZE_URL, client_id, redirect_uri, scopes).await?;
+    let target = parse_redirect(&redirect_uri)?;
     let redirect = target.uri.clone();
     let (host, port) = (target.host, target.port);
     let listener = TcpListener::bind((host, port)).await.map_err(|e| {
@@ -313,6 +439,113 @@ pub fn parse_query(q: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_spotify_answers() {
+        assert_eq!(
+            judge(303, Some("https://accounts.spotify.com/login?continue=x"), ""),
+            Check::Accepted
+        );
+        assert_eq!(judge(200, None, "<html>Log in to Spotify</html>"), Check::Accepted);
+        assert_eq!(
+            judge(400, None, "redirect_uri: Not matching configuration"),
+            Check::BadRedirect
+        );
+        assert_eq!(
+            judge(400, None, "INVALID_CLIENT: Invalid redirect URI"),
+            Check::BadRedirect
+        );
+        assert_eq!(judge(400, None, "INVALID_CLIENT: Invalid client"), Check::BadClient);
+        assert_eq!(
+            judge(200, None, "<p>redirect_uri: Not matching configuration</p>"),
+            Check::BadRedirect
+        );
+        // The login page mentions the redirect URI in its links: still a yes.
+        assert_eq!(
+            judge(200, None, "<a href='/login?continue=...redirect_uri%3D...'>"),
+            Check::Accepted
+        );
+        assert_eq!(judge(500, None, ""), Check::Unknown);
+        assert_eq!(
+            judge(302, Some("https://accounts.spotify.com/authorize/error"), ""),
+            Check::Unknown
+        );
+    }
+
+    #[test]
+    fn redirect_variants_keep_the_port() {
+        assert_eq!(
+            redirect_variants("http://127.0.0.1:1337"),
+            vec![
+                "http://127.0.0.1:1337/",
+                "http://127.0.0.1:1337/callback",
+                "http://127.0.0.1:1337/login",
+                "http://127.0.0.1:1337/callback/",
+                "http://127.0.0.1:1337/login/"
+            ]
+        );
+        let v = redirect_variants("http://127.0.0.1:8899/login");
+        assert_eq!(v[0], "http://127.0.0.1:8899/login/");
+        assert!(!v.contains(&"http://127.0.0.1:8899/login".to_string()));
+        assert!(redirect_variants("https://example.com/cb").is_empty());
+    }
+
+    /// Against a stand-in for accounts.spotify.com that only has "http://127.0.0.1:1337/" saved.
+    #[tokio::test]
+    async fn finds_the_registered_form_of_the_redirect_uri() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/authorize", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let head = String::from_utf8_lossy(&buf[..n]).to_string();
+                let line = head.lines().next().unwrap_or("").to_string();
+                let resp = if !line.contains("client_id=good") {
+                    {
+                        let body = "INVALID_CLIENT: Invalid client";
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                } else if line.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A1337%2F&") {
+                    "HTTP/1.1 303 See Other\r\nLocation: https://accounts.spotify.com/login\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    let body = "redirect_uri: Not matching configuration";
+                    format!(
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let scopes = ["user-library-read"];
+        assert_eq!(
+            usable_redirect_at(&base, "good", "http://127.0.0.1:1337", &scopes)
+                .await
+                .unwrap(),
+            "http://127.0.0.1:1337/"
+        );
+        let err = usable_redirect_at(&base, "good", "http://127.0.0.1:9999/cb", &scopes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Save"), "{err}");
+        let err = usable_redirect_at(&base, "bad", "http://127.0.0.1:1337", &scopes)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("client ID"), "{err}");
+        // No answer at all: go ahead as configured.
+        assert_eq!(
+            usable_redirect_at("http://127.0.0.1:1/authorize", "good", "http://127.0.0.1:1337", &scopes)
+                .await
+                .unwrap(),
+            "http://127.0.0.1:1337"
+        );
+    }
 
     #[test]
     fn pkce_challenge_matches_rfc7636_example() {
