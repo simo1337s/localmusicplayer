@@ -84,8 +84,24 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          stage\tools\mpv.exe --no-config --version
-          if ($LASTEXITCODE -ne 0) { throw "mpv doesn't run" }
+          # mpv's --version exits non-zero on Windows, so look at what it says.
+          $version = (& stage\tools\mpv.exe --no-config --version 2>&1 | Out-String)
+          if ($version -notmatch 'mpv v?\d') { $version; throw "mpv doesn't run" }
+          ($version -split "`n")[0]
+          # Talk to mpv the way MultiMusic does: over a named pipe.
+          $mpv = Start-Process stage\tools\mpv.exe -ArgumentList '--no-config','--idle=yes','--no-terminal','--video=no','--input-ipc-server=\\.\pipe\multimusic-ci' -PassThru
+          $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'multimusic-ci', [System.IO.Pipes.PipeDirection]::InOut)
+          $pipe.Connect(10000)
+          $writer = New-Object System.IO.StreamWriter($pipe); $writer.AutoFlush = $true
+          $reader = New-Object System.IO.StreamReader($pipe)
+          $writer.WriteLine('{"command":["get_property","mpv-version"],"request_id":1}')
+          # Events may come first; the answer carries the request id.
+          $answer = ''
+          for ($i = 0; $i -lt 20 -and $answer -notmatch '"request_id":1'; $i++) { $answer = $reader.ReadLine() }
+          Write-Host "mpv over the pipe: $answer"
+          if ($answer -notmatch '"error":"success"') { throw "mpv's IPC pipe doesn't answer" }
+          $writer.WriteLine('{"command":["quit"]}')
+          $mpv.WaitForExit(5000) | Out-Null
           stage\tools\ffmpeg.exe -hide_banner -version | Select-Object -First 1
           if ($LASTEXITCODE -ne 0) { throw "ffmpeg doesn't run" }
           stage\tools\yt-dlp.exe --version
