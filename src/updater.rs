@@ -28,7 +28,7 @@ pub struct Release {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Asset {
     pub name: String,
-    /// API URL (works for private repositories with a token).
+    /// The public download link (GitHub's API link when there is none).
     pub url: String,
     pub size: u64,
 }
@@ -65,31 +65,24 @@ pub fn client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn get(http: &reqwest::Client, url: &str, token: &str, accept: &str) -> reqwest::RequestBuilder {
-    let req = http
-        .get(url)
+fn get(http: &reqwest::Client, url: &str, accept: &str) -> reqwest::RequestBuilder {
+    http.get(url)
         .header("Accept", accept)
-        .header("X-GitHub-Api-Version", "2022-11-28");
-    match token.trim() {
-        "" => req,
-        token => req.bearer_auth(token),
-    }
+        .header("X-GitHub-Api-Version", "2022-11-28")
 }
 
-/// The newest release of `repo` ("owner/name").
-pub async fn latest(http: &reqwest::Client, api: &str, repo: &str, token: &str) -> Result<Release> {
+/// The newest release of `repo` ("owner/name"), which is public: no login needed.
+pub async fn latest(http: &reqwest::Client, api: &str, repo: &str) -> Result<Release> {
     let url = format!("{api}/repos/{repo}/releases/latest");
-    let resp = get(http, &url, token, "application/vnd.github+json")
+    let resp = get(http, &url, "application/vnd.github+json")
         .send()
         .await
         .context("couldn't reach GitHub")?;
     match resp.status().as_u16() {
         200 => {}
-        404 if token.trim().is_empty() => {
-            bail!("no releases found (while the repository is private, add a GitHub token in Settings → Updates)")
-        }
         404 => bail!("no releases found"),
-        401 | 403 => bail!("GitHub refused the request ({}): check the token", resp.status()),
+        // GitHub allows 60 checks an hour per address without a login.
+        403 | 429 => bail!("GitHub is busy ({}); trying again later", resp.status()),
         _ => bail!("GitHub answered {}", resp.status()),
     }
     let json: Value = resp.json().await.context("unexpected answer from GitHub")?;
@@ -105,9 +98,12 @@ pub fn parse_release(json: &Value) -> Option<Release> {
         .map(|list| {
             list.iter()
                 .filter_map(|a| {
+                    // Public download links come from GitHub's file servers, which don't count
+                    // against the API's hourly limit.
+                    let url = a.get("browser_download_url").or_else(|| a.get("url"))?;
                     Some(Asset {
                         name: a.get("name")?.as_str()?.to_string(),
-                        url: a.get("url")?.as_str()?.to_string(),
+                        url: url.as_str()?.to_string(),
                         size: a.get("size").and_then(Value::as_u64).unwrap_or(0),
                     })
                 })
@@ -152,15 +148,9 @@ pub fn is_newer(candidate: &str, current: &str) -> bool {
 }
 
 /// Downloads an asset to `dest`, reporting progress (0.0..=1.0).
-pub async fn download(
-    http: &reqwest::Client,
-    asset: &Asset,
-    token: &str,
-    dest: &Path,
-    progress: impl Fn(f32),
-) -> Result<()> {
+pub async fn download(http: &reqwest::Client, asset: &Asset, dest: &Path, progress: impl Fn(f32)) -> Result<()> {
     use tokio::io::AsyncWriteExt;
-    let mut resp = get(http, &asset.url, token, "application/octet-stream")
+    let mut resp = get(http, &asset.url, "application/octet-stream")
         .send()
         .await
         .context("couldn't start the download")?
@@ -322,13 +312,18 @@ mod tests {
                 {"name": "MultiMusic-Setup-0.3.0-x64.exe", "url": "https://api.github.com/a/1", "size": 10},
                 {"name": "MultiMusic-0.3.0-macos-arm64.zip", "url": "https://api.github.com/a/2", "size": 20},
                 {"name": "MultiMusic-0.3.0-macos-intel.zip", "url": "https://api.github.com/a/4", "size": 20},
-                {"name": "SHA256SUMS.txt", "url": "https://api.github.com/a/3", "size": 1}
+                {"name": "SHA256SUMS.txt", "url": "https://api.github.com/a/3", "size": 1,
+                 "browser_download_url": "https://github.com/o/r/releases/download/v0.3.0/SHA256SUMS.txt"}
             ]
         });
         let r = parse_release(&json).unwrap();
         assert_eq!(r.version, "0.3.0");
         assert_eq!(r.notes, "Fixes");
-        assert_eq!(r.sums.unwrap().url, "https://api.github.com/a/3");
+        // The public link when there is one.
+        assert_eq!(
+            r.sums.unwrap().url,
+            "https://github.com/o/r/releases/download/v0.3.0/SHA256SUMS.txt"
+        );
         match asset_name("0.3.0") {
             Some(name) => assert_eq!(r.asset.unwrap().name, name),
             None => assert!(r.asset.is_none()),
@@ -350,7 +345,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// The whole check against a stand-in for GitHub's API, with and without a token.
+    /// The whole check against a stand-in for GitHub's API, which needs no login.
     #[tokio::test]
     async fn latest_release_from_github() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -361,10 +356,12 @@ mod tests {
                 let mut buf = vec![0u8; 4096];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 let head = String::from_utf8_lossy(&buf[..n]).to_lowercase();
-                let (status, body) = if !head.starts_with("get /repos/o/r/releases/latest ") {
-                    ("404 Not Found", "{}".to_string())
-                } else if head.contains("authorization: bearer good") {
+                let (status, body) = if head.contains("authorization:") {
+                    ("401 Unauthorized", "{}".to_string())
+                } else if head.starts_with("get /repos/o/r/releases/latest ") {
                     ("200 OK", r#"{"tag_name":"v9.9.9","assets":[]}"#.to_string())
+                } else if head.starts_with("get /repos/o/busy/releases/latest ") {
+                    ("403 Forbidden", r#"{"message":"API rate limit exceeded"}"#.to_string())
                 } else {
                     ("404 Not Found", r#"{"message":"Not Found"}"#.to_string())
                 };
@@ -376,9 +373,11 @@ mod tests {
             }
         });
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let release = latest(&http, &api, "o/r", "good").await.unwrap();
+        let release = latest(&http, &api, "o/r").await.unwrap();
         assert_eq!(release.version, "9.9.9");
-        let err = latest(&http, &api, "o/r", "").await.unwrap_err().to_string();
-        assert!(err.contains("token"), "{err}");
+        let err = latest(&http, &api, "o/none").await.unwrap_err().to_string();
+        assert_eq!(err, "no releases found");
+        let err = latest(&http, &api, "o/busy").await.unwrap_err().to_string();
+        assert!(err.contains("busy"), "{err}");
     }
 }

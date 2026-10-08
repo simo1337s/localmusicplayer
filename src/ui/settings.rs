@@ -579,19 +579,6 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 if !crate::updater::can_install() {
                     hint(ui, "On Linux, update the way you installed: git pull && makepkg -sif");
                 }
-                ui.add_space(4.0);
-                text_field(
-                    ui,
-                    "GitHub token (only while the repository is private)",
-                    &mut cfg.updates.github_token,
-                    "github_pat_…",
-                    true,
-                );
-                hint(
-                    ui,
-                    "A fine-grained token with read-only access to the repository's contents. Not needed once \
-                     the repository is public.",
-                );
             });
 
             // ---------------------------------------------------------- backup

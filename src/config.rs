@@ -342,8 +342,6 @@ pub struct UpdatesConfig {
     pub check: bool,
     /// `owner/name` of the GitHub repository releases come from.
     pub repo: String,
-    /// Optional GitHub token with read access, needed while the repository is private.
-    pub github_token: String,
     /// A version the user chose to skip.
     pub skipped: String,
 }
@@ -353,7 +351,6 @@ impl Default for UpdatesConfig {
         UpdatesConfig {
             check: true,
             repo: "simo1337s/localmusicplayer".into(),
-            github_token: String::new(),
             skipped: String::new(),
         }
     }

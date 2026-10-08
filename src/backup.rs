@@ -50,7 +50,7 @@ pub struct Include {
 }
 
 /// Every key, token and account name in the settings.
-fn key_fields(c: &mut Config) -> [&mut String; 11] {
+fn key_fields(c: &mut Config) -> [&mut String; 10] {
     [
         &mut c.spotify.web_api_client_id,
         &mut c.spotify.web_api_client_secret,
@@ -62,7 +62,6 @@ fn key_fields(c: &mut Config) -> [&mut String; 11] {
         &mut c.lastfm.session_key,
         &mut c.lastfm.username,
         &mut c.discord.app_id,
-        &mut c.updates.github_token,
     ]
 }
 
@@ -317,7 +316,6 @@ mod tests {
         cfg.lastfm.username = "simo".into();
         cfg.spotify.web_api_client_secret = "sp-secret".into();
         cfg.soundcloud.oauth_token = "2-123".into();
-        cfg.updates.github_token = "ghp_x".into();
         cfg.ui.accent = [1, 2, 3];
         cfg
     }
@@ -394,7 +392,6 @@ mod tests {
         );
         assert!(bare.logins.is_empty() && bare.playlists.is_empty());
         assert_eq!(bare.config.lastfm.session_key, "");
-        assert_eq!(bare.config.updates.github_token, "");
         assert_eq!(bare.config.ui.accent, [1, 2, 3]);
 
         // Round trip through a file.

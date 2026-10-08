@@ -2814,13 +2814,13 @@ impl Service {
             }
         }
         self.shared.repaint();
-        let (repo, token) = (self.cfg.updates.repo.clone(), self.cfg.updates.github_token.clone());
+        let repo = self.cfg.updates.repo.clone();
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
             let http = crate::updater::client();
             // Tests point this at a stand-in for GitHub.
             let api = std::env::var("MULTIMUSIC_UPDATE_API").unwrap_or_else(|_| GITHUB_API.to_string());
-            let result = crate::updater::latest(&http, &api, &repo, &token)
+            let result = crate::updater::latest(&http, &api, &repo)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Internal::UpdateChecked { manual, result });
@@ -2841,7 +2841,6 @@ impl Service {
         };
         self.shared.feed.write().unwrap().update.status = UpdateStatus::Downloading(0.0);
         self.shared.repaint();
-        let token = self.cfg.updates.github_token.clone();
         let shared = self.shared.clone();
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -2851,7 +2850,7 @@ impl Service {
                 tokio::fs::create_dir_all(&dir).await?;
                 let file = dir.join(&asset.name);
                 let last = std::sync::atomic::AtomicU32::new(0);
-                crate::updater::download(&http, &asset, &token, &file, |done| {
+                crate::updater::download(&http, &asset, &file, |done| {
                     let percent = (done * 100.0) as u32;
                     if last.swap(percent, std::sync::atomic::Ordering::Relaxed) != percent {
                         shared.feed.write().unwrap().update.status = UpdateStatus::Downloading(done);
@@ -2864,7 +2863,7 @@ impl Service {
                     .as_ref()
                     .ok_or_else(|| anyhow!("the release has no checksums, so it can't be checked"))?;
                 let sums_file = dir.join(crate::updater::SUMS_FILE);
-                crate::updater::download(&http, sums, &token, &sums_file, |_| {}).await?;
+                crate::updater::download(&http, sums, &sums_file, |_| {}).await?;
                 let sums_text = tokio::fs::read_to_string(&sums_file).await?;
                 let name = asset.name.clone();
                 let installed = tokio::task::spawn_blocking(move || {
