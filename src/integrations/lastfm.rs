@@ -186,9 +186,13 @@ pub fn ignored_reasons(v: &serde_json::Value) -> Vec<String> {
 pub fn scrobble_names(track: &Track) -> (String, String) {
     let artist = scrobble_artist(&track.artist).to_string();
     let title = track.title.trim().to_string();
-    // Official releases on SoundCloud come with proper credits (and an album).
-    if track.source != Source::SoundCloud || !track.album.trim().is_empty() {
+    if track.source != Source::SoundCloud {
         return (artist, title);
+    }
+    // Official releases on SoundCloud come with proper titles (and an album); only the
+    // collaboration credit ("Bladee x Uli K") needs to become the main artist.
+    if !track.album.trim().is_empty() {
+        return (main_credit(&artist).to_string(), title);
     }
     let title = strip_upload_tags(&title);
     if let Some((left, right)) = title.split_once(" - ") {
@@ -202,7 +206,7 @@ pub fn scrobble_names(track: &Track) -> (String, String) {
             return (main_credit(left).to_string(), right.to_string());
         }
     }
-    (artist, title)
+    (main_credit(&artist).to_string(), title)
 }
 
 const VERSION_WORDS: &[&str] = &[
@@ -229,12 +233,23 @@ const VERSION_WORDS: &[&str] = &[
 
 /// "A ft. B" / "A feat. B" -> "A".
 fn main_credit(artist: &str) -> &str {
-    let lower = artist.to_lowercase();
-    [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " (feat", " (ft"]
-        .iter()
-        .filter_map(|sep| lower.find(sep))
-        .min()
-        .map_or(artist, |i| artist[..i].trim())
+    // ASCII lowercase keeps byte positions the same as in `artist`.
+    let lower = artist.to_ascii_lowercase();
+    // "A x B" is how SoundCloud credits collaborations.
+    [
+        " feat. ",
+        " feat ",
+        " ft. ",
+        " ft ",
+        " featuring ",
+        " (feat",
+        " (ft",
+        " x ",
+    ]
+    .iter()
+    .filter_map(|sep| lower.find(sep))
+    .min()
+    .map_or(artist, |i| artist[..i].trim())
 }
 
 /// Drops "[Free DL]", "(Official Audio)", "(prod. X)" and similar from an upload's title.
@@ -1031,10 +1046,19 @@ mod tests {
             names(&upload("Waster (Remix)", "bladee")),
             ("bladee".into(), "Waster (Remix)".into())
         );
-        // Official releases (with an album) and other sources are left alone.
+        // Official releases (with an album) keep their titles; collaborations go under the main
+        // artist like Spotify's do. Other sources are left alone.
         let mut official = upload("Artist - Song", "Label");
         official.album = "Album".into();
         assert_eq!(names(&official), ("Label".into(), "Artist - Song".into()));
+        let mut collab = upload("Kiss of Death", "Bladee x Uli K");
+        collab.album = "Kiss of Death".into();
+        assert_eq!(names(&collab), ("Bladee".into(), "Kiss of Death".into()));
+        assert_eq!(
+            names(&upload("Rat Race", "Yung Lean X Bladee")),
+            ("Yung Lean".into(), "Rat Race".into())
+        );
+        assert_eq!(names(&upload("Song", "Malcolm X")), ("Malcolm X".into(), "Song".into()));
         assert_eq!(names(&track("A, B", "X - Y")), ("A".into(), "X - Y".into()));
     }
 

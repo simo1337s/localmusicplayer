@@ -3840,7 +3840,9 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
 /// where Last.fm and apps like .fmbot take the cover from. Remembered per song.
 async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, track: Track) -> Track {
     static RELEASES: OnceLock<std::sync::Mutex<HashMap<String, Option<Track>>>> = OnceLock::new();
-    if track.source != Source::SoundCloud || !track.album.trim().is_empty() {
+    // Every SoundCloud song: even uploads with an album often credit "A x B" or a label, where
+    // Spotify has the names Last.fm knows.
+    if track.source != Source::SoundCloud {
         return track;
     }
     let Some((auth, api)) = spotify else { return track };
