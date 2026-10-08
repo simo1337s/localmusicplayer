@@ -414,8 +414,8 @@ fn play_ids(cx: &mut Cx, ids: &[String], context: &str) {
     let tracks = cx.lib.tracks_for(ids);
     if !tracks.is_empty() {
         cx.actions.push(Action::Cmd(Command::Play {
+            start: widgets::first_song(cx, tracks.len()),
             tracks,
-            start: 0,
             context: context.to_string(),
         }));
     }

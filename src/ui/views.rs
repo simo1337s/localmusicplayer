@@ -170,7 +170,7 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
                 if play {
                     cx.actions.push(Action::Cmd(Command::Play {
                         tracks: cx.lib.tracks_for(&a.track_ids),
-                        start: 0,
+                        start: widgets::first_song(cx, a.track_ids.len()),
                         context: a.name.clone(),
                     }));
                 } else if resp.clicked() {
@@ -341,7 +341,7 @@ fn album_grid(ui: &mut Ui, cx: &mut Cx, albums: &[&Album]) {
         if play {
             cx.actions.push(Action::Cmd(Command::Play {
                 tracks: cx.lib.tracks_for(&a.track_ids),
-                start: 0,
+                start: widgets::first_song(cx, a.track_ids.len()),
                 context: a.name.clone(),
             }));
         } else if resp.clicked() {
@@ -360,11 +360,14 @@ fn play_list(cx: &mut Cx, tracks: &[&Track], shuffle: bool, context: &str) {
     if tracks.is_empty() {
         return;
     }
-    cx.actions.push(Action::Cmd(Command::SetShuffle(shuffle)));
+    // The Shuffle button turns shuffle on; Play keeps it the way the player has it.
+    if shuffle && !cx.player.shuffle {
+        cx.actions.push(Action::Cmd(Command::SetShuffle(true)));
+    }
     let start = if shuffle {
         rand::random_range(0..tracks.len())
     } else {
-        0
+        widgets::first_song(cx, tracks.len())
     };
     cx.actions.push(Action::Cmd(Command::Play {
         tracks: tracks.iter().map(|t| (*t).clone()).collect(),
@@ -642,7 +645,7 @@ fn artists(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             if play {
                 cx.actions.push(Action::Cmd(Command::Play {
                     tracks: cx.lib.tracks_for(&a.track_ids),
-                    start: 0,
+                    start: widgets::first_song(cx, a.track_ids.len()),
                     context: a.name.clone(),
                 }));
             } else if resp.clicked() {
@@ -1223,7 +1226,7 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                 match (play, library_artist) {
                     (true, Some(artist)) => cx.actions.push(Action::Cmd(Command::Play {
                         tracks: cx.lib.tracks_for(&artist.track_ids),
-                        start: 0,
+                        start: widgets::first_song(cx, artist.track_ids.len()),
                         context: artist.name.clone(),
                     })),
                     _ if resp.clicked() => cx.actions.push(Action::Open(a.key.clone())),
@@ -1425,7 +1428,7 @@ fn top_artist_card(ui: &mut Ui, cx: &mut Cx, a: &ArtistHit, width: f32) {
         if let Some(artist) = a.key.strip_prefix("local:artist:").and_then(|k| cx.lib.artist(k)) {
             cx.actions.push(Action::Cmd(Command::Play {
                 tracks: cx.lib.tracks_for(&artist.track_ids),
-                start: 0,
+                start: widgets::first_song(cx, artist.track_ids.len()),
                 context: artist.name.clone(),
             }));
             return;

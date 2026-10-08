@@ -1149,6 +1149,16 @@ pub fn artist_action(lib: &crate::library::Library, artist: &str) -> Action {
     Action::Search(first.to_string())
 }
 
+/// Where playing a whole list starts: a random song while shuffle is on (it stays on from
+/// list to list), else the first.
+pub fn first_song(cx: &Cx, len: usize) -> usize {
+    if cx.player.shuffle && len > 0 {
+        rand::random_range(0..len)
+    } else {
+        0
+    }
+}
+
 fn play_from(cx: &mut Cx, tracks: &[&Track], i: usize, context: &str) {
     cx.actions.push(Action::Cmd(Command::Play {
         tracks: tracks.iter().map(|t| (*t).clone()).collect(),
