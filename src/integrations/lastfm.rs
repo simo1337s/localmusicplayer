@@ -195,18 +195,22 @@ pub fn scrobble_names(track: &Track) -> (String, String) {
         return (main_credit(&artist).to_string(), title);
     }
     let title = strip_upload_tags(&title);
-    if let Some((left, right)) = title.split_once(" - ") {
-        let (left, right) = (left.trim(), right.trim());
-        let lower = right.to_lowercase();
-        // "Song - Live", "Song - Slowed": a version, not "Artist - Song".
-        let version = VERSION_WORDS
-            .iter()
-            .any(|w| lower == *w || lower.ends_with(&format!(" {w}")));
-        if !left.is_empty() && !right.is_empty() && !version {
-            return (main_credit(left).to_string(), right.to_string());
-        }
+    if let Some((left, right)) = split_artist_title(&title) {
+        return (main_credit(&left).to_string(), right);
     }
     (main_credit(&artist).to_string(), title)
+}
+
+/// "Artist - Title" -> ("Artist", "Title"); `None` for a plain title or "Song - Live" (a
+/// version, not an artist).
+pub(crate) fn split_artist_title(title: &str) -> Option<(String, String)> {
+    let (left, right) = title.split_once(" - ")?;
+    let (left, right) = (left.trim(), right.trim());
+    let lower = right.to_lowercase();
+    let version = VERSION_WORDS
+        .iter()
+        .any(|w| lower == *w || lower.ends_with(&format!(" {w}")));
+    (!left.is_empty() && !right.is_empty() && !version).then(|| (left.to_string(), right.to_string()))
 }
 
 const VERSION_WORDS: &[&str] = &[
@@ -253,7 +257,7 @@ fn main_credit(artist: &str) -> &str {
 }
 
 /// Drops "[Free DL]", "(Official Audio)", "(prod. X)" and similar from an upload's title.
-fn strip_upload_tags(title: &str) -> String {
+pub(crate) fn strip_upload_tags(title: &str) -> String {
     const TAGS: &[&str] = &[
         "free",
         "download",

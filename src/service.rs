@@ -416,6 +416,9 @@ struct SoundCloudSync {
     playlists: Vec<ImportedPlaylist>,
 }
 
+/// Bumped when the scanner learns to read more from files, so the library is read once again.
+const SCAN_VERSION: &str = "2";
+
 /// How often crossfade timing is checked and volumes are stepped.
 const FADE_STEP: Duration = Duration::from_millis(50);
 /// Longest crossfade offered in the settings.
@@ -2127,7 +2130,11 @@ impl Service {
         if folders.is_empty() {
             return;
         }
-        let known = self.db.local_mtimes().unwrap_or_default();
+        let mut known = self.db.local_mtimes().unwrap_or_default();
+        // Files read by an older version are read again once (it now guesses more from names).
+        if self.db.get_kv("scan_version").as_deref() != Some(SCAN_VERSION) {
+            known.values_mut().for_each(|mtime| *mtime = i64::MIN);
+        }
         let shared = self.shared.clone();
         let tx = self.internal_tx.clone();
         shared.feed.write().unwrap().scan = Some((0, 0));
@@ -2147,12 +2154,17 @@ impl Service {
             self.shared.error(format!("Database error: {e:#}"));
         }
         let _ = self.db.delete_tracks(&result.removed);
+        let _ = self.db.set_kv("scan_version", SCAN_VERSION);
         {
             let mut lib = self.shared.library.write().unwrap();
             for id in &result.removed {
                 lib.tracks.remove(id);
             }
-            for t in result.changed {
+            for mut t in result.changed {
+                // As in the database: a file keeps the date it was first added.
+                if let Some(old) = lib.tracks.get(&t.id).filter(|old| old.added_at != 0) {
+                    t.added_at = old.added_at;
+                }
                 lib.tracks.insert(t.id.clone(), t);
             }
             lib.reindex();
@@ -3109,10 +3121,10 @@ impl Service {
     /// Puts a finished download straight into the library when it was saved inside a library
     /// folder (instead of waiting for the next scan).
     fn add_downloaded_file(&mut self, path: &Path) {
-        if !self.cfg.library.folders.iter().any(|f| path.starts_with(f)) {
+        let Some(folder) = self.cfg.library.folders.iter().find(|f| path.starts_with(f)) else {
             return;
-        }
-        let track = library::scanner::read_track(path, None, now_unix());
+        };
+        let track = library::scanner::read_track_in(path, Some(folder), None, now_unix());
         let mtimes = HashMap::from([(track.id.clone(), library::scanner::mtime_of(path))]);
         if let Err(e) = self.db.upsert_tracks(std::slice::from_ref(&track), &mtimes) {
             tracing::warn!("couldn't add {} to the library: {e:#}", path.display());
@@ -3837,13 +3849,28 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
 
 /// What Last.fm gets for a song. A SoundCloud upload that is also released on Spotify is sent
 /// with Spotify's artist, title and album: those are the names Last.fm knows, and the album is
-/// where Last.fm and apps like .fmbot take the cover from. Remembered per song.
+/// where Last.fm and apps like .fmbot take the cover from. So is a local file without tags,
+/// whose names were only guessed from the file name. Remembered per song.
 async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, track: Track) -> Track {
     static RELEASES: OnceLock<std::sync::Mutex<HashMap<String, Option<Track>>>> = OnceLock::new();
-    // Every SoundCloud song: even uploads with an album often credit "A x B" or a label, where
-    // Spotify has the names Last.fm knows.
-    if track.source != Source::SoundCloud {
-        return track;
+    let mut track = track;
+    match track.source {
+        // Every SoundCloud song: even uploads with an album often credit "A x B" or a label,
+        // where Spotify has the names Last.fm knows.
+        Source::SoundCloud => {}
+        Source::Local => {
+            let path = PathBuf::from(&track.uri);
+            let missing = tokio::task::spawn_blocking(move || library::scanner::untagged(&path)).await;
+            let Ok(missing) = missing else { return track };
+            if missing.album {
+                // The folder's name is only a guess: Spotify's album or Last.fm's is better.
+                track.album.clear();
+            }
+            if !missing.names {
+                return track;
+            }
+        }
+        _ => return track,
     }
     let Some((auth, api)) = spotify else { return track };
     let cache = RELEASES.get_or_init(Default::default);
@@ -3852,20 +3879,31 @@ async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, trac
         Some(release) => release,
         None => {
             let (artist, title) = crate::integrations::lyrics::song_names(&track);
+            let unknown = artist == library::scanner::UNKNOWN_ARTIST;
             let wanted = Track {
-                artist: artist.clone(),
+                artist: if unknown { String::new() } else { artist.clone() },
                 title: title.clone(),
                 ..track.clone()
             };
+            let query = if unknown {
+                title.clone()
+            } else {
+                format!("{artist} {title}")
+            };
             let found = match auth.token().await {
-                Ok(token) => api.search(&token, &format!("{artist} {title}"), 10).await.ok(),
+                Ok(token) => api.search(&token, &query, 10).await.ok(),
                 Err(_) => None,
             };
             let Some(results) = found else {
                 // Couldn't ask: try again next time.
                 return track;
             };
-            let release = best_match(&wanted, &results).filter(|t| !t.album.trim().is_empty());
+            let release = if unknown {
+                same_title_and_length(&wanted, &results)
+            } else {
+                best_match(&wanted, &results)
+            };
+            let release = release.filter(|t| !t.album.trim().is_empty());
             let mut cache = cache.lock().unwrap();
             if cache.len() > 2000 {
                 cache.clear();
@@ -3884,14 +3922,31 @@ async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, trac
                 release.title,
                 release.album
             );
-            // Still a SoundCloud song to Last.fm: its album may be swapped for one with a cover.
+            // Still a SoundCloud (or local) song to Last.fm: a SoundCloud song's album may be
+            // swapped for one with a cover.
             Track {
-                source: Source::SoundCloud,
+                source: track.source,
                 ..release
             }
         }
         None => track,
     }
+}
+
+/// For a song with no known artist: the candidate with the same title and nearly the same
+/// length.
+fn same_title_and_length(target: &Track, candidates: &[Track]) -> Option<Track> {
+    let title = normalize_title(&target.title);
+    if title.is_empty() || target.duration_ms == 0 {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|c| normalize_title(&c.title) == title && c.duration_ms > 0)
+        .map(|c| (c, (target.duration_ms as i64 - c.duration_ms as i64).unsigned_abs()))
+        .filter(|(_, diff)| *diff <= 3_000)
+        .min_by_key(|(_, diff)| *diff)
+        .map(|(c, _)| c.clone())
 }
 
 /// Spotify access for finding an artist there by name.
@@ -4385,6 +4440,42 @@ mod tests {
             track(Source::Spotify, "Adele", "Hello", 400_000),
         ];
         assert!(best_match(&target, &candidates).is_none());
+    }
+
+    #[test]
+    fn songs_without_an_artist_match_by_title_and_length() {
+        let mut target = track(Source::Local, "", "Waster", 200_000);
+        let candidates = vec![
+            track(Source::Spotify, "Someone", "Waster", 150_000),
+            track(Source::Spotify, "Bladee", "Waster", 201_500),
+            track(Source::Spotify, "Bladee", "Waster (Remix)", 200_000),
+        ];
+        let found = same_title_and_length(&target, &candidates).unwrap();
+        assert_eq!(found.artist, "Bladee");
+        // Without a length there's too little to go on.
+        target.duration_ms = 0;
+        assert!(same_title_and_length(&target, &candidates).is_none());
+    }
+
+    #[tokio::test]
+    async fn untagged_files_drop_the_folder_album_for_lastfm() {
+        let dir = std::env::temp_dir().join(format!("multimusic-lfm-local-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Bladee - Waster.mp3");
+        std::fs::write(&path, b"no tags here").unwrap();
+        let mut t = track(Source::Local, "Bladee", "Waster", 200_000);
+        t.album = "Downloads".into();
+        t.uri = path.to_string_lossy().into();
+        let sent = lastfm_track(None, t.clone()).await;
+        assert_eq!((sent.artist.as_str(), sent.title.as_str()), ("Bladee", "Waster"));
+        assert_eq!(sent.album, "");
+        // Other sources are left alone.
+        let sc = Track {
+            source: Source::Spotify,
+            ..t.clone()
+        };
+        assert_eq!(lastfm_track(None, sc).await.album, "Downloads");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
