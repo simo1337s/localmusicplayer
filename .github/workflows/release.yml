@@ -275,7 +275,18 @@ jobs:
           name="MultiMusic-$VERSION-macos-${{ matrix.arch }}"
           ditto -c -k --sequesterRsrc --keepParent dist/MultiMusic.app "dist/$name.zip"
           mkdir dmg && cp -R dist/MultiMusic.app dmg/ && ln -s /Applications dmg/Applications
-          hdiutil create -volname "MultiMusic" -srcfolder dmg -ov -format UDZO "dist/$name.dmg"
+          # hdiutil now and then fails with "Resource busy" on the hosted runners while another
+          # disk image service still holds the volume; it works when tried again a bit later.
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "MultiMusic" -srcfolder dmg -ov -format UDZO "dist/$name.dmg"; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              exit 1
+            fi
+            echo "hdiutil failed (attempt $attempt), trying again"
+            sleep $((attempt * 10))
+          done
           ls -la dist
 
       - uses: actions/upload-artifact@v4
