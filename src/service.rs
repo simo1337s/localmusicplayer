@@ -691,6 +691,7 @@ impl Service {
 
     fn startup(&mut self) {
         self.publish_accounts();
+        self.check_app_secret();
         self.load_downloads();
         self.clear_download_leftovers();
         self.restore_session();
@@ -1152,6 +1153,18 @@ impl Service {
         }
         match &self.spotify_web_auth {
             Some(a) if a.has_login() => Some(a.clone()),
+            _ => self.spotify_auth.has_login().then(|| self.spotify_auth.clone()),
+        }
+    }
+
+    /// Login for Web API calls about the user's own library (likes, playlists): an app token
+    /// from a Client secret can't do those.
+    fn user_web_auth(&self) -> Option<Arc<SpotifyAuth>> {
+        if !self.cfg.spotify.enabled {
+            return None;
+        }
+        match &self.spotify_web_auth {
+            Some(a) if a.has_user_login() => Some(a.clone()),
             _ => self.spotify_auth.has_login().then(|| self.spotify_auth.clone()),
         }
     }
@@ -1970,7 +1983,8 @@ impl Service {
             AccountStatus::Off
         };
         let web_api = match &self.spotify_web_auth {
-            Some(a) if a.has_login() => AccountStatus::Connected(String::new()),
+            Some(a) if a.has_user_login() => AccountStatus::Connected(String::new()),
+            Some(a) if a.uses_secret() => AccountStatus::Working("Checking your app's Client ID and secret…".into()),
             _ => AccountStatus::Off,
         };
         let mut feed = self.shared.feed.write().unwrap();
@@ -2079,7 +2093,7 @@ impl Service {
         };
         self.save_playlists(vec![playlist], &[]);
 
-        if let (Source::Spotify, Some(auth)) = (track.source, self.web_auth()) {
+        if let (Source::Spotify, Some(auth)) = (track.source, self.user_web_auth()) {
             let api = self.spotify_api.clone();
             let t = track.clone();
             tokio::spawn(async move {
@@ -2241,7 +2255,7 @@ impl Service {
                 .map(|t| t.id.clone())
                 .collect()
         };
-        let web = self.web_auth().map(|a| (a, self.spotify_api.clone()));
+        let web = self.user_web_auth().map(|a| (a, self.spotify_api.clone()));
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
             let progress_tx = tx.clone();
@@ -2266,7 +2280,7 @@ impl Service {
 
     /// Fallback when no playback session can be opened (e.g. connection refused).
     fn start_spotify_web_sync(&mut self) {
-        let Some(auth) = self.web_auth() else { return };
+        let Some(auth) = self.user_web_auth() else { return };
         if self.spotify_syncing {
             return;
         }
@@ -2279,6 +2293,27 @@ impl Service {
                 .await
                 .map_err(|e| anyhow!("{}", friendly_spotify_error(&e)));
             let _ = tx.send(Internal::SpotifySynced(r));
+        });
+    }
+
+    /// With a Client secret, fetches an app token right away so Settings can say whether the
+    /// ID and secret work.
+    fn check_app_secret(&self) {
+        let Some(auth) = self
+            .spotify_web_auth
+            .clone()
+            .filter(|a| a.uses_secret() && !a.has_user_login())
+        else {
+            return;
+        };
+        let shared = self.shared.clone();
+        tokio::spawn(async move {
+            let status = match auth.token().await {
+                Ok(_) => AccountStatus::Connected("your app (Client secret) for search and pages".into()),
+                Err(e) => AccountStatus::Error(format!("{e:#}")),
+            };
+            shared.feed.write().unwrap().spotify_web_api = status;
+            shared.repaint();
         });
     }
 
@@ -3134,9 +3169,11 @@ impl Service {
         }
         if old.spotify.web_api_client_id != self.cfg.spotify.web_api_client_id
             || old.spotify.web_api_redirect() != self.cfg.spotify.web_api_redirect()
+            || old.spotify.web_api_client_secret != self.cfg.spotify.web_api_client_secret
         {
             self.spotify_web_auth = SpotifyAuth::web_api(&self.cfg.spotify, &self.paths.spotify_dir()).map(Arc::new);
             self.publish_accounts();
+            self.check_app_secret();
         }
         if old.spotify != self.cfg.spotify {
             if old.spotify.client_id != self.cfg.spotify.client_id

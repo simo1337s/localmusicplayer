@@ -45,6 +45,8 @@ struct AuthState {
 /// OAuth (PKCE) login and token refresh. The refresh token is stored in the data dir.
 pub struct SpotifyAuth {
     client_id: String,
+    /// The app's Client secret: app tokens without a user login.
+    secret: Option<String>,
     file: PathBuf,
     /// Redirect URI registered for `client_id`.
     redirect: String,
@@ -65,7 +67,12 @@ impl SpotifyAuth {
     /// Login with the user's own developer app, used only for Web API calls.
     pub fn web_api(cfg: &SpotifyConfig, dir: &Path) -> Option<SpotifyAuth> {
         let id = cfg.web_api_client_id.trim();
-        (!id.is_empty()).then(|| Self::with_client(id, &cfg.web_api_redirect(), dir, "oauth-webapi.json"))
+        let secret = cfg.web_api_client_secret.trim();
+        (!id.is_empty()).then(|| {
+            let mut auth = Self::with_client(id, &cfg.web_api_redirect(), dir, "oauth-webapi.json");
+            auth.secret = (!secret.is_empty()).then(|| secret.to_string());
+            auth
+        })
     }
 
     pub fn with_client(client_id: &str, redirect: &str, dir: &Path, file_name: &str) -> SpotifyAuth {
@@ -78,6 +85,7 @@ impl SpotifyAuth {
             .map(|t| t.refresh_token);
         SpotifyAuth {
             client_id: client_id.to_string(),
+            secret: None,
             redirect: redirect.to_string(),
             file,
             login_task: Mutex::new(None),
@@ -86,8 +94,18 @@ impl SpotifyAuth {
         }
     }
 
+    /// A user login, or an app token from the Client secret.
     pub fn has_login(&self) -> bool {
+        self.has_user_login() || self.secret.is_some()
+    }
+
+    /// Logged in as a user (needed for anything in their library).
+    pub fn has_user_login(&self) -> bool {
         self.state.lock().unwrap().refresh.is_some()
+    }
+
+    pub fn uses_secret(&self) -> bool {
+        self.secret.is_some()
     }
 
     pub fn client_id(&self) -> &str {
@@ -148,13 +166,16 @@ impl SpotifyAuth {
         if let Some(t) = self.cached_access() {
             return Ok(t);
         }
-        let refresh = self
-            .state
-            .lock()
-            .unwrap()
-            .refresh
-            .clone()
-            .ok_or_else(|| anyhow!("not logged in to Spotify"))?;
+        let refresh = self.state.lock().unwrap().refresh.clone();
+        let Some(refresh) = refresh else {
+            let secret = self
+                .secret
+                .as_ref()
+                .ok_or_else(|| anyhow!("not logged in to Spotify"))?;
+            let token = super::oauth::client_credentials(&self.client_id, secret).await?;
+            self.state.lock().unwrap().access = Some((token.access_token.clone(), token.expires_at));
+            return Ok(token.access_token);
+        };
         let token = super::oauth::refresh(&self.client_id, &refresh)
             .await
             .map_err(|e| anyhow!("Spotify token refresh failed: {e:#}"))?;

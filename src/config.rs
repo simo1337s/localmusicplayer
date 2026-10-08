@@ -108,6 +108,9 @@ pub struct SpotifyConfig {
     /// The exact Redirect URI registered in the user's Spotify app, e.g.
     /// `http://127.0.0.1:8899/callback`. Empty = `http://127.0.0.1:<web_api_redirect_port>/login`.
     pub web_api_redirect_uri: String,
+    /// Optional Client secret of that app: search and pages then use an app token, with no
+    /// browser login or Redirect URI needed.
+    pub web_api_client_secret: String,
     /// Keep downloaded audio in ~/.cache/multimusic/spotify (uses disk, saves bandwidth).
     pub cache_audio: bool,
     /// Spotify audio output: "auto" (PipeWire/PulseAudio when available), "pulseaudio" or "alsa".
@@ -135,6 +138,7 @@ impl Default for SpotifyConfig {
             web_api_client_id: String::new(),
             web_api_redirect_port: 8899,
             web_api_redirect_uri: String::new(),
+            web_api_client_secret: String::new(),
             cache_audio: false,
             audio_output: "auto".into(),
         }

@@ -285,6 +285,43 @@ pub async fn login(client_id: &str, redirect_uri: &str, scopes: &[&str]) -> Resu
     request_token(&form).await
 }
 
+/// An app token from the app's Client ID and secret (no user, no browser, no redirect URI).
+/// Good for search and catalog pages, not for anything in a user's library.
+pub async fn client_credentials(client_id: &str, secret: &str) -> Result<Token> {
+    client_credentials_at(&crate::http::client(), TOKEN_URL, client_id, secret).await
+}
+
+async fn client_credentials_at(http: &reqwest::Client, url: &str, client_id: &str, secret: &str) -> Result<Token> {
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"));
+    let resp = http
+        .post(url)
+        .header(reqwest::header::AUTHORIZATION, format!("Basic {basic}"))
+        .form(&[("grant_type", "client_credentials")])
+        .send()
+        .await
+        .context("couldn't reach accounts.spotify.com")?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let reason = serde_json::from_str::<TokenError>(&body)
+            .map(|e| match e.error_description {
+                Some(d) if !d.is_empty() => format!("{}: {d}", e.error),
+                _ => e.error,
+            })
+            .unwrap_or_else(|_| body.chars().take(200).collect());
+        if reason.contains("invalid_client") {
+            bail!("Spotify didn't accept the Client ID and secret ({reason}); copy both again from your app's page");
+        }
+        bail!("Spotify token request failed ({status}): {reason}");
+    }
+    let t: TokenResponse = serde_json::from_str(&body).context("unexpected token response from Spotify")?;
+    Ok(Token {
+        access_token: t.access_token,
+        refresh_token: None,
+        expires_at: Instant::now() + Duration::from_secs(t.expires_in.unwrap_or(3600)),
+    })
+}
+
 pub async fn refresh(client_id: &str, refresh_token: &str) -> Result<Token> {
     let form = [
         ("grant_type", "refresh_token"),
@@ -439,6 +476,47 @@ pub fn parse_query(q: &str) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn app_token_from_client_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/api/token", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                // "id:secret" in base64.
+                let good = request.contains("authorization: basic awq6c2vjcmv0");
+                let form = request.contains("grant_type=client_credentials");
+                let (status, body) = if good && form {
+                    (
+                        "200 OK",
+                        r#"{"access_token":"apptoken","token_type":"Bearer","expires_in":3600}"#,
+                    )
+                } else {
+                    (
+                        "400 Bad Request",
+                        r#"{"error":"invalid_client","error_description":"Invalid client secret"}"#,
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let token = client_credentials_at(&http, &url, "id", "secret").await.unwrap();
+        assert_eq!(token.access_token, "apptoken");
+        assert!(token.refresh_token.is_none());
+        let err = client_credentials_at(&http, &url, "id", "wrong")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Client ID and secret"), "{err}");
+    }
 
     #[test]
     fn reads_spotify_answers() {

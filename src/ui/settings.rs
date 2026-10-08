@@ -171,55 +171,70 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.label(RichText::new("Your own Spotify app (recommended for search)").strong());
                     hint(
                         ui,
-                        "Your playlists import through MultiMusic's direct Spotify connection. Search and syncing likes use \
-                         Spotify's Web API, whose shared key is often rate limited (HTTP 429). Fix it with a free app: \
-                         developer.spotify.com → Dashboard → Create app → tick \"Web API\" and add a Redirect URI.",
-                    );
-                    ui.add_space(4.0);
-                    ui.label(RichText::new("Redirect URI (must match your app's exactly)").color(TEXT_DIM));
-                    let default_uri = crate::player::oauth::redirect_uri(cfg.spotify.web_api_redirect_port);
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut cfg.spotify.web_api_redirect_uri)
-                                .hint_text(&default_uri)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(ui.available_width() - 80.0),
-                        );
-                        if ui.small_button(theme::ic(icon::COPY, "Copy")).clicked() {
-                            ui.ctx().copy_text(cfg.spotify.web_api_redirect());
-                        }
-                    });
-                    let redirect_ok = match crate::player::oauth::parse_redirect(&cfg.spotify.web_api_redirect()) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            ui.label(RichText::new(format!("{e}")).size(12.0).color(DANGER));
-                            false
-                        }
-                    };
-                    hint(
-                        ui,
-                        &format!(
-                            "Leave it empty to use {default_uri}, or paste the Redirect URI your app already lists."
-                        ),
+                        "Your playlists import through MultiMusic's direct Spotify connection. Search and artist / album \
+                         pages use Spotify's Web API, whose shared key is often rate limited (HTTP 429). Fix it with a free \
+                         app: developer.spotify.com → Dashboard → Create app → tick \"Web API\". Then copy its Client ID \
+                         and Client secret (app → Settings → View client secret) here.",
                     );
                     ui.add_space(4.0);
                     text_field(ui, "Client ID", &mut cfg.spotify.web_api_client_id, "e.g. 1a2b3c4d5e6f…", false);
-                    let ready = !cfg.spotify.web_api_client_id.trim().is_empty() && redirect_ok;
-                    if ui
-                        .add_enabled(ready, egui::Button::new(theme::ic(icon::SIGN_IN, "Authorize")))
-                        .clicked()
-                    {
-                        cx.actions.push(Action::Cmd(Command::SpotifyWebApiLogin));
-                    }
-                    status(ui, &cx.feed.spotify_web_api);
+                    text_field(
+                        ui,
+                        "Client secret",
+                        &mut cfg.spotify.web_api_client_secret,
+                        "from your app's page: Settings → View client secret",
+                        true,
+                    );
                     hint(
                         ui,
-                        "If Spotify says \"redirect_uri: Not matching configuration\", your app doesn't list the Redirect URI \
-                         above: on developer.spotify.com open the app → Settings → Edit, add it under Redirect URIs exactly as \
-                         shown (127.0.0.1, not localhost), click Add, then scroll down and click Save (the URI only counts \
-                         after Save), and Authorize again. The line above shows exactly what MultiMusic sent. The Client \
-                         secret is not needed.",
+                        "With the secret, MultiMusic uses your app straight away: no browser login and no Redirect URI. \
+                         Likes still sync through your normal Spotify login.",
                     );
+                    status(ui, &cx.feed.spotify_web_api);
+                    ui.add_space(4.0);
+                    ui.collapsing("Or log in to your app in the browser (Redirect URI)", |ui| {
+                        ui.label(RichText::new("Redirect URI (must match your app's exactly)").color(TEXT_DIM));
+                        let default_uri = crate::player::oauth::redirect_uri(cfg.spotify.web_api_redirect_port);
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut cfg.spotify.web_api_redirect_uri)
+                                    .hint_text(&default_uri)
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width() - 80.0),
+                            );
+                            if ui.small_button(theme::ic(icon::COPY, "Copy")).clicked() {
+                                ui.ctx().copy_text(cfg.spotify.web_api_redirect());
+                            }
+                        });
+                        let redirect_ok = match crate::player::oauth::parse_redirect(&cfg.spotify.web_api_redirect()) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                ui.label(RichText::new(format!("{e}")).size(12.0).color(DANGER));
+                                false
+                            }
+                        };
+                        hint(
+                            ui,
+                            &format!(
+                                "Leave it empty to use {default_uri}, or paste the Redirect URI your app already lists. \
+                                 Use http:// with 127.0.0.1 (Spotify only wants https for internet addresses)."
+                            ),
+                        );
+                        let ready = !cfg.spotify.web_api_client_id.trim().is_empty() && redirect_ok;
+                        if ui
+                            .add_enabled(ready, egui::Button::new(theme::ic(icon::SIGN_IN, "Authorize")))
+                            .clicked()
+                        {
+                            cx.actions.push(Action::Cmd(Command::SpotifyWebApiLogin));
+                        }
+                        hint(
+                            ui,
+                            "If Spotify says \"redirect_uri: Not matching configuration\", your app doesn't have the \
+                             Redirect URI above saved: on developer.spotify.com open the app → Settings → Edit, add it \
+                             under Redirect URIs exactly as shown, click Add, then scroll down and click Save (it only \
+                             counts after Save). Or skip all this and use the Client secret above.",
+                        );
+                    });
                     ui.add_space(8.0);
                     ui.label(RichText::new("Login client").strong());
                     text_field(ui, "Login client ID", &mut cfg.spotify.client_id, SPOTIFY_DEFAULT_CLIENT_ID, false);
