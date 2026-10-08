@@ -6,6 +6,7 @@ mod http;
 mod integrations;
 mod library;
 mod links;
+mod memory;
 mod model;
 mod player;
 mod providers;
@@ -22,6 +23,7 @@ use crate::config::{Config, Paths};
 use crate::service::{Command, Shared};
 
 fn main() -> anyhow::Result<()> {
+    memory::tune();
     // How Spotify's audio stream shows up in pavucontrol / the PipeWire graph. Set before
     // any other thread exists, as required for set_var.
     std::env::set_var("PULSE_PROP_application.name", "MultiMusic");

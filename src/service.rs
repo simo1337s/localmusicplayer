@@ -2211,6 +2211,8 @@ impl Service {
             lib.reindex();
         }
         self.shared.feed.write().unwrap().scan = None;
+        // A scan reads every changed file's tags: hand that memory back.
+        crate::memory::trim();
         if changed > 0 || !result.removed.is_empty() {
             self.shared.info(format!(
                 "Library updated: {} files, {changed} new or changed, {} removed",
@@ -2256,6 +2258,8 @@ impl Service {
                 }
             }
         }
+        // A sync parses thousands of songs' details: hand that memory back.
+        crate::memory::trim();
     }
 
     // ---------------------------------------------------------------- spotify

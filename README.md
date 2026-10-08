@@ -114,8 +114,14 @@ I measured this in a VM while a local song was playing, with the album view and 
 
 | Process | Resident memory |
 | --- | --- |
-| `multimusic` | ~157 MB in total, but ~66 MB of that is the VM's *software* OpenGL renderer (llvmpipe). Expect roughly **~90 MB** with a real GPU. I estimated that figure and haven't measured it on real hardware. |
+| `multimusic` | ~152 MB in total, but most of that is the VM's *software* OpenGL renderer (llvmpipe: about 66 MB of libraries plus its frame buffers on the heap). With a real GPU that work moves to the graphics driver; I haven't measured it on real hardware. MultiMusic's own heap is under 15 MB. |
 | `mpv` (playback of local files & SoundCloud) | ~54 MB RSS, of which only ~13 MB is private; the rest is shared ffmpeg libraries. It only runs while you play local files or SoundCloud. |
+
+In the same VM and scenario, the version before these memory changes used ~197 MB; most of the saving holds on any machine:
+
+- glibc's allocator is limited to two arenas and hands large freed blocks straight back (`mallopt`), and freed memory is returned after scans, syncs and every 30 s while the window is active (`malloc_trim`).
+- egui's glyph atlas is capped at 2048 px wide instead of the GPU's maximum (often 16384 px), where one big cover letter reserved a whole 16384 px row: 2 MiB instead of 8 MiB, in RAM and on the GPU.
+- Covers are shrunk straight from a cropped view of the decoded image, without two more full-size copies (a 3000 px cover used to take ~90 MB for a moment).
 
 Spotify playback runs inside the MultiMusic process (librespot) and doesn't start another process. The official Spotify client usually uses 400–800 MB.
 

@@ -67,7 +67,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Keep SQLite's page cache small; the library is held in memory anyway.
-        conn.pragma_update(None, "cache_size", -2000)?;
+        conn.pragma_update(None, "cache_size", -512)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Db { conn })
     }

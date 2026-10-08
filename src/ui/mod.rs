@@ -85,6 +85,9 @@ pub struct Cx<'a> {
     pub logo: egui::TextureId,
 }
 
+/// Largest texture egui may make (its glyph atlas grows up to this square).
+const MAX_TEXTURE_SIDE: usize = 2048;
+
 /// Background tint when there is no cover colour to use.
 const NEUTRAL_TINT: Color32 = Color32::from_rgb(0x53, 0x53, 0x53);
 
@@ -132,6 +135,7 @@ pub struct App {
     cjk_checked_version: u64,
     focus_search: bool,
     mem_checked: Instant,
+    trimmed_at: Instant,
     pub(crate) rss_mb: f32,
 }
 
@@ -186,6 +190,7 @@ impl App {
             cjk_checked_version: u64::MAX,
             focus_search: false,
             mem_checked: Instant::now() - Duration::from_secs(60),
+            trimmed_at: Instant::now(),
             rss_mb: 0.0,
         }
     }
@@ -678,6 +683,11 @@ impl App {
             return;
         }
         self.mem_checked = Instant::now();
+        // Freed cover images and layouts go back to the system now and then.
+        if self.trimmed_at.elapsed() > Duration::from_secs(30) {
+            self.trimmed_at = Instant::now();
+            crate::memory::trim();
+        }
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
                 let kb: f32 = line
@@ -906,6 +916,16 @@ impl eframe::App for App {
                 self.send(Command::UpdateConfig(Box::new(self.cfg.clone())));
                 self.sent_cfg = self.cfg.clone();
             }
+        }
+    }
+
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // egui makes its glyph atlas as wide as the largest texture the GPU takes (often
+        // 16384 px), and every row of glyphs is as tall as the tallest one in it, so one big
+        // cover letter reserves a row that wide. A narrower atlas holds the same glyphs in a
+        // fraction of the memory, in RAM and on the GPU. Covers are far smaller than this.
+        if let Some(side) = raw_input.max_texture_side.as_mut() {
+            *side = (*side).min(MAX_TEXTURE_SIDE);
         }
     }
 

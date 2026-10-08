@@ -208,12 +208,23 @@ fn decode(key: Key, bytes: &[u8]) -> Decoded {
             accent: None,
         };
     };
-    // Square-crop like every music app, then shrink to the requested size.
+    // Square-crop like every music app, then shrink to the requested size. The crop is a view
+    // and the shrink reads it directly: a 3000 px cover is never copied at full size.
     let (w, h) = (img.width(), img.height());
     let side = w.min(h);
-    let img = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
+    let (x, y) = ((w - side) / 2, (h - side) / 2);
     let target = size.min(side);
-    let rgba = image::imageops::thumbnail(&img.to_rgba8(), target, target);
+    let rgba = match &img {
+        image::DynamicImage::ImageRgb8(rgb) => {
+            let small = image::imageops::thumbnail(&*image::imageops::crop_imm(rgb, x, y, side, side), target, target);
+            image::DynamicImage::ImageRgb8(small).to_rgba8()
+        }
+        image::DynamicImage::ImageRgba8(rgba) => {
+            image::imageops::thumbnail(&*image::imageops::crop_imm(rgba, x, y, side, side), target, target)
+        }
+        other => image::imageops::thumbnail(&*image::imageops::crop_imm(other, x, y, side, side), target, target),
+    };
+    drop(img);
     let accent = dominant_color(&rgba);
     let image = ColorImage::from_rgba_unmultiplied([rgba.width() as usize, rgba.height() as usize], rgba.as_raw());
     Decoded {
@@ -346,5 +357,39 @@ mod tests {
         let image = d.image.unwrap();
         assert_eq!(image.size, [64, 64]);
         assert!(d.accent.is_some());
+    }
+
+    /// The crop-and-shrink without full-size copies gives exactly what copying did.
+    #[test]
+    fn decode_matches_the_copying_version() {
+        let pattern = |x: u32, y: u32| [(x * 7 % 256) as u8, (y * 13 % 256) as u8, ((x + y) * 3 % 256) as u8];
+        let rgb = image::RgbImage::from_fn(301, 173, |x, y| image::Rgb(pattern(x, y)));
+        let rgba = image::RgbaImage::from_fn(120, 200, |x, y| {
+            let [r, g, b] = pattern(x, y);
+            image::Rgba([r, g, b, (x % 256) as u8])
+        });
+        let gray = image::GrayImage::from_fn(90, 90, |x, y| image::Luma([((x * y) % 256) as u8]));
+        let images = [
+            image::DynamicImage::ImageRgb8(rgb),
+            image::DynamicImage::ImageRgba8(rgba),
+            image::DynamicImage::ImageLuma8(gray),
+        ];
+        for img in images {
+            let mut bytes = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .unwrap();
+            for size in [32, 96, 640] {
+                let got = decode(("x".into(), size), &bytes).image.unwrap();
+                let (w, h) = (img.width(), img.height());
+                let side = w.min(h);
+                let cropped = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
+                let target = size.min(side);
+                let want = image::imageops::thumbnail(&cropped.to_rgba8(), target, target);
+                let want =
+                    ColorImage::from_rgba_unmultiplied([want.width() as usize, want.height() as usize], want.as_raw());
+                assert_eq!(got.size, want.size);
+                assert!(got.pixels == want.pixels, "{:?} at {size}", img.color());
+            }
+        }
     }
 }
