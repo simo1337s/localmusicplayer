@@ -231,6 +231,8 @@ pub struct PageState {
     pub tracks: Vec<Track>,
     /// The page on the service's website.
     pub external_url: Option<String>,
+    /// Still adding the artist's songs from this other service.
+    pub merging: Option<Source>,
 }
 
 /// One song in the Downloads list.
@@ -1169,6 +1171,11 @@ impl Service {
         }
     }
 
+    /// Spotify search, for finding a SoundCloud upload's release there.
+    fn spotify_search(&self) -> Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)> {
+        self.web_auth().map(|auth| (auth, self.spotify_api.clone()))
+    }
+
     fn resolver(&self) -> Resolver {
         Resolver {
             spotify: self.web_auth().map(|auth| (auth, self.spotify_api.clone())),
@@ -1326,7 +1333,9 @@ impl Service {
         self.scrobble_if_due();
         if let Some(lfm) = self.lastfm.clone() {
             let t = track.clone();
+            let spotify = self.spotify_search();
             tokio::spawn(async move {
+                let t = lastfm_track(spotify, t).await;
                 if let Err(e) = lfm.now_playing(&t).await {
                     tracing::debug!("last.fm now playing: {e:#}");
                 }
@@ -1694,7 +1703,9 @@ impl Service {
         if let (Some(lfm), Some((_, started))) = (self.lastfm.clone(), self.scrobble.current()) {
             if let Some(t) = self.queue.current().cloned() {
                 let shared = self.shared.clone();
+                let spotify = self.spotify_search();
                 tokio::spawn(async move {
+                    let t = lastfm_track(spotify, t).await;
                     match lfm.scrobble(&t, started).await {
                         Ok(None) => {}
                         // Usually bad tags on a local file; silently missing scrobbles are worse.
@@ -2663,6 +2674,45 @@ impl Service {
         match target {
             // The UI draws these straight from the library and never asks the service.
             Target::LocalArtist(_) => self.page_failed(&key, "Open library artists from Your Library"),
+            Target::ArtistName(name) => {
+                let soundcloud = self.cfg.soundcloud.enabled.then(|| self.soundcloud.clone());
+                let spotify = self.spotify_lookup();
+                tokio::spawn(async move {
+                    let (on_spotify, on_soundcloud) = tokio::join!(
+                        async {
+                            match &spotify {
+                                Some(l) => spotify_artist(l, &name).await,
+                                None => None,
+                            }
+                        },
+                        async {
+                            match &soundcloud {
+                                Some(sc) => soundcloud_artist(sc, &name).await,
+                                None => None,
+                            }
+                        },
+                    );
+                    let result = if on_spotify.is_none() && on_soundcloud.is_none() {
+                        Err(anyhow!("{name} isn't on Spotify or SoundCloud under that name"))
+                    } else {
+                        let mut page = PageState {
+                            kind: "Artist".into(),
+                            title: name,
+                            round: true,
+                            ..Default::default()
+                        };
+                        for found in [on_spotify, on_soundcloud].into_iter().flatten() {
+                            page.image = page.image.or(found.image);
+                            page.external_url = page.external_url.or(Some(found.url));
+                            page.source = page.source.or(Some(found.source));
+                            add_songs(&mut page.tracks, found.tracks);
+                        }
+                        page.subtitle = artist_subtitle(&page.tracks);
+                        Ok(page)
+                    };
+                    send(key, result);
+                });
+            }
             Target::Spotify(kind, id) => {
                 if !self.cfg.spotify.enabled || !self.spotify_auth.has_login() {
                     self.page_failed(&key, "Log in to Spotify in Settings to open Spotify pages");
@@ -2672,26 +2722,45 @@ impl Service {
                     self.spotify_pending_page = Some(key);
                     return;
                 };
+                // Artist pages also get the artist's SoundCloud uploads.
+                let soundcloud =
+                    (kind == LinkKind::Artist && self.cfg.soundcloud.enabled).then(|| self.soundcloud.clone());
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(Duration::from_secs(45), spotify_page(session, kind, &id))
                         .await
                         .unwrap_or_else(|_| Err(anyhow!("Spotify took too long to answer")));
-                    send(key, result);
+                    match (result, soundcloud) {
+                        (Ok(mut page), Some(sc)) => {
+                            page.tracks = dedupe_songs(page.tracks);
+                            page.merging = Some(Source::SoundCloud);
+                            send(key.clone(), Ok(page.clone()));
+                            if let Some(found) = soundcloud_artist(&sc, &page.title).await {
+                                if add_songs(&mut page.tracks, found.tracks) > 0 {
+                                    page.subtitle = artist_subtitle(&page.tracks);
+                                }
+                            }
+                            page.merging = None;
+                            send(key, Ok(page));
+                        }
+                        (result, _) => send(key, result),
+                    }
                 });
             }
             Target::SoundCloudUser(id) => {
                 let sc = self.soundcloud.clone();
+                let spotify = self.spotify_lookup();
                 tokio::spawn(async move {
                     let result = async {
                         let (user, tracks) = tokio::join!(sc.user(id), sc.user_tracks(id));
                         Ok(soundcloud_user_page(&user?, tracks?))
                     }
                     .await;
-                    send(key, result);
+                    with_spotify_songs(result, spotify, |page| send(key.clone(), page)).await;
                 });
             }
             Target::SoundCloudUrl(url) => {
                 let sc = self.soundcloud.clone();
+                let spotify = self.spotify_lookup();
                 tokio::spawn(async move {
                     let result = async {
                         Ok(match sc.resolve_url(&url).await? {
@@ -2722,7 +2791,7 @@ impl Service {
                         })
                     }
                     .await;
-                    send(key, result);
+                    with_spotify_songs(result, spotify, |page| send(key.clone(), page)).await;
                 });
             }
             Target::AppleMusic { kind, storefront, id } => {
@@ -3050,6 +3119,21 @@ impl Service {
         let mut lib = self.shared.library.write().unwrap();
         lib.tracks.insert(track.id.clone(), track);
         lib.reindex();
+    }
+
+    /// What it takes to look an artist up on Spotify by name (search, then their page through
+    /// the session); `None` when Spotify isn't logged in or connected yet.
+    fn spotify_lookup(&mut self) -> Option<SpotifyLookup> {
+        if !self.cfg.spotify.enabled || !self.spotify_auth.has_login() {
+            return None;
+        }
+        let auth = self.web_auth()?;
+        let session = self.spotify_session()?;
+        Some(SpotifyLookup {
+            auth,
+            api: self.spotify_api.clone(),
+            session,
+        })
     }
 
     /// The Spotify session, or `None` while (re)connecting.
@@ -3749,6 +3833,207 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
     })
 }
 
+/// What Last.fm gets for a song. A SoundCloud upload that is also released on Spotify is sent
+/// with Spotify's artist, title and album: those are the names Last.fm knows, and the album is
+/// where Last.fm and apps like .fmbot take the cover from. Remembered per song.
+async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, track: Track) -> Track {
+    static RELEASES: OnceLock<std::sync::Mutex<HashMap<String, Option<Track>>>> = OnceLock::new();
+    if track.source != Source::SoundCloud || !track.album.trim().is_empty() {
+        return track;
+    }
+    let Some((auth, api)) = spotify else { return track };
+    let cache = RELEASES.get_or_init(Default::default);
+    let known = cache.lock().unwrap().get(&track.id).cloned();
+    let release = match known {
+        Some(release) => release,
+        None => {
+            let (artist, title) = crate::integrations::lyrics::song_names(&track);
+            let wanted = Track {
+                artist: artist.clone(),
+                title: title.clone(),
+                ..track.clone()
+            };
+            let found = match auth.token().await {
+                Ok(token) => api.search(&token, &format!("{artist} {title}"), 10).await.ok(),
+                Err(_) => None,
+            };
+            let Some(results) = found else {
+                // Couldn't ask: try again next time.
+                return track;
+            };
+            let release = best_match(&wanted, &results).filter(|t| !t.album.trim().is_empty());
+            let mut cache = cache.lock().unwrap();
+            if cache.len() > 2000 {
+                cache.clear();
+            }
+            cache.insert(track.id.clone(), release.clone());
+            release
+        }
+    };
+    match release {
+        Some(release) => {
+            tracing::debug!(
+                "lastfm: {} - {} is {} - {} ({}) on Spotify",
+                track.artist,
+                track.title,
+                release.artist,
+                release.title,
+                release.album
+            );
+            release
+        }
+        None => track,
+    }
+}
+
+/// Spotify access for finding an artist there by name.
+struct SpotifyLookup {
+    auth: Arc<SpotifyAuth>,
+    api: Arc<SpotifyApi>,
+    session: librespot_core::session::Session,
+}
+
+/// An artist found on one service by name.
+struct ArtistFound {
+    source: Source,
+    image: Option<String>,
+    url: String,
+    tracks: Vec<Track>,
+}
+
+/// Same artist name, ignoring case, spaces and punctuation ("Yung Lean" = "yunglean").
+fn same_artist_name(a: &str, b: &str) -> bool {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let a = squash(a);
+    !a.is_empty() && a == squash(b)
+}
+
+/// The artist's SoundCloud profile (exact name only, so nobody else's) and their uploads.
+async fn soundcloud_artist(sc: &SoundCloud, name: &str) -> Option<ArtistFound> {
+    let users = sc.search_users(name, 8).await.ok()?;
+    let hit = users.into_iter().find(|u| same_artist_name(&u.name, name))?;
+    let id: u64 = hit.key.strip_prefix("soundcloud:user:")?.parse().ok()?;
+    let tracks = sc.user_tracks(id).await.ok()?;
+    Some(ArtistFound {
+        source: Source::SoundCloud,
+        url: links::web_url(&hit.key).unwrap_or_default(),
+        image: hit.image,
+        tracks,
+    })
+}
+
+/// The artist on Spotify (exact name only) and their popular songs and latest releases.
+async fn spotify_artist(l: &SpotifyLookup, name: &str) -> Option<ArtistFound> {
+    let token = l.auth.token().await.ok()?;
+    let (_, artists) = l.api.search_with_artists(&token, name, 5).await.ok()?;
+    let hit = artists
+        .into_iter()
+        .find(|a| a.source == Source::Spotify && same_artist_name(&a.name, name))?;
+    let id = hit.key.strip_prefix("spotify:artist:")?.to_string();
+    let page = crate::providers::spotify_internal::artist_page(&l.session, &id)
+        .await
+        .ok()?;
+    Some(ArtistFound {
+        source: Source::Spotify,
+        url: format!("https://open.spotify.com/artist/{id}"),
+        image: page.image.or(hit.image),
+        tracks: dedupe_songs(page.tracks),
+    })
+}
+
+/// Sends a SoundCloud profile page, then again with the artist's Spotify songs added.
+async fn with_spotify_songs(
+    result: Result<PageState>,
+    spotify: Option<SpotifyLookup>,
+    send: impl Fn(Result<PageState>),
+) {
+    let (Ok(mut page), Some(spotify)) = (result.as_ref().map(Clone::clone), spotify) else {
+        send(result);
+        return;
+    };
+    if page.kind != "Artist" {
+        send(Ok(page));
+        return;
+    }
+    page.tracks = dedupe_songs(page.tracks);
+    page.merging = Some(Source::Spotify);
+    send(Ok(page.clone()));
+    if let Some(found) = spotify_artist(&spotify, &page.title).await {
+        if add_songs(&mut page.tracks, found.tracks) > 0 {
+            page.subtitle = artist_subtitle(&page.tracks);
+        }
+    }
+    page.merging = None;
+    send(Ok(page));
+}
+
+/// "Artist · 42 songs on Spotify and SoundCloud".
+fn artist_subtitle(tracks: &[Track]) -> String {
+    let on = |s: Source| tracks.iter().filter(|t| t.source == s).count();
+    let (spotify, soundcloud) = (on(Source::Spotify), on(Source::SoundCloud));
+    let total = tracks.len();
+    match (spotify > 0, soundcloud > 0) {
+        (true, true) => format!("Artist · {total} songs on Spotify and SoundCloud"),
+        (true, false) => format!("Artist · {total} songs on Spotify"),
+        (false, true) => format!("Artist · {total} songs on SoundCloud"),
+        (false, false) => format!("Artist · {total} songs"),
+    }
+}
+
+/// What makes two songs the same: the title as people know it ("Artist - Title [Free DL]"
+/// uploads cleaned up, "(feat. …)" and "- Remastered" dropped; "(Live)", "(Remix)" kept).
+fn song_key(t: &Track) -> String {
+    normalize_title(&crate::integrations::lastfm::scrobble_names(t).1)
+}
+
+/// Whether `a` and `b` are the same song: same title and about the same length (a little
+/// looser across services, which encode differently).
+#[cfg(test)]
+fn same_song(a: &Track, b: &Track) -> bool {
+    same_song_keyed(&song_key(a), a, &song_key(b), b)
+}
+
+fn same_song_keyed(ka: &str, a: &Track, kb: &str, b: &Track) -> bool {
+    if ka.is_empty() || ka != kb {
+        return false;
+    }
+    let tolerance = if a.source == b.source { 4_000 } else { 12_000 };
+    a.duration_ms == 0 || b.duration_ms == 0 || a.duration_ms.abs_diff(b.duration_ms) <= tolerance
+}
+
+/// Appends the songs of `extra` that `tracks` doesn't have yet. Returns how many were added.
+pub fn add_songs(tracks: &mut Vec<Track>, extra: Vec<Track>) -> usize {
+    let mut keys: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, t) in tracks.iter().enumerate() {
+        keys.entry(song_key(t)).or_default().push(i);
+    }
+    let mut added = 0;
+    for t in extra {
+        let key = song_key(&t);
+        let known = keys
+            .get(&key)
+            .is_some_and(|ids| ids.iter().any(|&i| same_song_keyed(&key, &tracks[i], &key, &t)));
+        if !known {
+            keys.entry(key).or_default().push(tracks.len());
+            tracks.push(t);
+            added += 1;
+        }
+    }
+    added
+}
+
+/// The list without repeats (a single that is also on the album, the same upload twice).
+pub fn dedupe_songs(tracks: Vec<Track>) -> Vec<Track> {
+    let mut out = Vec::with_capacity(tracks.len());
+    add_songs(&mut out, tracks);
+    out
+}
+
 fn soundcloud_user_page(user: &ScUser, tracks: Vec<Track>) -> PageState {
     let hit = soundcloud::artist_hit(user);
     PageState {
@@ -3996,6 +4281,60 @@ mod tests {
         );
         let e = anyhow!("\"Song\" can't be downloaded: only a 30 second preview is available (Go+ track)");
         assert!(friendly_download_error(&e).starts_with("\"Song\" can't be downloaded"));
+    }
+
+    #[test]
+    fn artist_songs_without_repeats() {
+        let sp = |title: &str, dur: u64| track(Source::Spotify, "Bladee", title, dur);
+        let sc = |title: &str, dur: u64| track(Source::SoundCloud, "bladee", title, dur);
+        // A single that is also on the album; "Intro"s of different albums are different songs.
+        let spotify = dedupe_songs(vec![
+            sp("Waster", 195_000),
+            sp("Be Nice 2 Me", 182_000),
+            sp("Waster", 195_000),
+            sp("Intro", 60_000),
+            sp("Intro", 95_000),
+            sp("Waster - Remastered 2020", 196_000),
+        ]);
+        let titles: Vec<&str> = spotify.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, vec!["Waster", "Be Nice 2 Me", "Intro", "Intro"]);
+
+        // The same songs on SoundCloud are left out; versions and SoundCloud-only songs stay.
+        let mut songs = spotify;
+        let added = add_songs(
+            &mut songs,
+            vec![
+                sc("Bladee - Waster [Free DL]", 197_000),
+                sc("be nice 2 me", 0),
+                sc("Waster (Remix)", 210_000),
+                sc("Waster - Slowed", 260_000),
+                sc("Unreleased Demo", 120_000),
+                sc("Be Nice 2 Me (Live)", 190_000),
+            ],
+        );
+        assert_eq!(added, 4);
+        let extra: Vec<&str> = songs[4..].iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(
+            extra,
+            vec![
+                "Waster (Remix)",
+                "Waster - Slowed",
+                "Unreleased Demo",
+                "Be Nice 2 Me (Live)"
+            ]
+        );
+        assert!(same_song(&sp("Waster", 195_000), &sc("Waster", 205_000)));
+        assert!(!same_song(&sp("Waster", 195_000), &sc("Waster", 240_000)));
+        assert_eq!(artist_subtitle(&songs), "Artist · 8 songs on Spotify and SoundCloud");
+        assert_eq!(artist_subtitle(&songs[..4]), "Artist · 4 songs on Spotify");
+    }
+
+    #[test]
+    fn artist_names_match_exactly() {
+        assert!(same_artist_name("Yung Lean", "yunglean"));
+        assert!(same_artist_name("Bladee", "BLADEE"));
+        assert!(!same_artist_name("Bladee", "Bladee Fan Page"));
+        assert!(!same_artist_name("", ""));
     }
 
     fn track(source: Source, artist: &str, title: &str, dur: u64) -> Track {

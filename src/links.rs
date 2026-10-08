@@ -159,6 +159,8 @@ pub fn page_key(link: &Link) -> String {
 pub enum Target {
     /// Artists, songs and playlists from the library itself.
     LocalArtist(String),
+    /// An artist by name: their songs on Spotify and SoundCloud together.
+    ArtistName(String),
     Spotify(LinkKind, String),
     SoundCloudUser(u64),
     SoundCloudUrl(String),
@@ -176,6 +178,9 @@ pub fn target(key: &str) -> Option<Target> {
     let key = key.trim();
     if let Some(name) = key.strip_prefix("local:artist:") {
         return (!name.is_empty()).then(|| Target::LocalArtist(name.to_string()));
+    }
+    if let Some(name) = key.strip_prefix("artist:") {
+        return (!name.trim().is_empty()).then(|| Target::ArtistName(name.trim().to_string()));
     }
     if let Some(id) = key.strip_prefix("soundcloud:user:") {
         return id.parse().ok().map(Target::SoundCloudUser);
@@ -236,7 +241,7 @@ pub fn web_url(key: &str) -> Option<String> {
             };
             Some(format!("https://music.apple.com/{storefront}/{kind}/{id}"))
         }
-        Target::LocalArtist(_) | Target::SoundCloudUser(_) => None,
+        Target::LocalArtist(_) | Target::ArtistName(_) | Target::SoundCloudUser(_) => None,
     }
 }
 
@@ -376,6 +381,8 @@ mod tests {
             target("local:artist:daft punk"),
             Some(Target::LocalArtist("daft punk".into()))
         );
+        assert_eq!(target("artist:Bladee"), Some(Target::ArtistName("Bladee".into())));
+        assert_eq!(target("artist:  "), None);
         assert_eq!(target("local:artist:"), None);
         let apple = parse("https://music.apple.com/us/artist/taylor-swift/159260351").unwrap();
         assert_eq!(

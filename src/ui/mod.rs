@@ -818,6 +818,13 @@ impl eframe::App for App {
             let key = key.clone();
             self.request_page(&key);
         }
+        // A library artist's page also shows their songs on Spotify and SoundCloud.
+        if let View::Artist(key) = &self.view {
+            let name = self.shared.library.read().unwrap().artist(key).map(|a| a.name.clone());
+            if let Some(name) = name {
+                self.request_page(&format!("artist:{name}"));
+            }
+        }
 
         // Debounced remote search while typing (links open their page instead).
         let typed = self.search_text.trim().to_string();

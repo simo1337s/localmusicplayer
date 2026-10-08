@@ -98,6 +98,11 @@ pub fn normalize_title(s: &str) -> String {
     for marker in [
         " (feat",
         " [feat",
+        " (ft.",
+        " (ft ",
+        " [ft.",
+        " [ft ",
+        " (with ",
         " feat.",
         " ft.",
         " - remaster",
@@ -317,6 +322,12 @@ mod tests {
             match_key("The Beatles", "Let It Be - Remastered 2009"),
             match_key("the beatles", "Let It Be")
         );
+        // SoundCloud-style credits.
+        assert_eq!(normalize_title("SIDE BY SIDE (FT. THAIBOY DIGITAL)"), "side by side");
+        assert_eq!(normalize_title("Side By Side [ft. Thaiboy Digital]"), "side by side");
+        assert_eq!(normalize_title("Side By Side (with Thaiboy Digital)"), "side by side");
+        // Versions stay apart.
+        assert_eq!(normalize_title("Side By Side (Live)"), "side by side live");
     }
 
     #[test]

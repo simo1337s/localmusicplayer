@@ -366,43 +366,62 @@ impl SoundCloud {
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let Some(chosen) = pick_transcoding(transcodings) else {
+        let candidates = ranked_transcodings(transcodings);
+        if candidates.is_empty() {
             bail!(
                 "\"{title}\" has no playable stream on SoundCloud \
                  (not available in your region / Go+ only)"
             );
-        };
-        if chosen.get("snipped").and_then(Value::as_bool) == Some(true) {
+        }
+        if candidates[0].get("snipped").and_then(Value::as_bool) == Some(true) {
             warn!("SoundCloud: only a 30 second preview of \"{title}\" is available (Go+ track)");
         }
-        let endpoint = chosen
-            .get("url")
-            .and_then(Value::as_str)
-            .context("transcoding without url")?;
-        // (Computed outside the macro: tracing's macros shadow `Value`.)
-        let protocol = chosen
-            .pointer("/format/protocol")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        let mime = chosen
-            .pointer("/format/mime_type")
-            .and_then(Value::as_str)
-            .unwrap_or("?");
-        debug!("SoundCloud: streaming \"{title}\" as {protocol} {mime}");
+        let (url, _) = self
+            .first_stream(&json, &candidates)
+            .await
+            .with_context(|| format!("couldn't get a stream URL for \"{title}\""))?;
+        Ok(url)
+    }
 
+    /// The URL of the first of `candidates` (transcodings, best first) SoundCloud hands out.
+    /// Some tracks still list streams that no longer exist (HTTP 404 for many "progressive"
+    /// MP3s), so the next one is tried. Returns the URL and the transcoding's protocol.
+    async fn first_stream(&self, json: &Value, candidates: &[&Value]) -> Result<(String, String)> {
         let mut params = Vec::new();
         if let Some(auth) = json.get("track_authorization").and_then(Value::as_str) {
             params.push(("track_authorization", auth));
         }
-        let resp = self
-            .get_json(endpoint, &params)
-            .await
-            .with_context(|| format!("couldn't get a stream URL for \"{title}\""))?;
-        resp.get("url")
-            .and_then(Value::as_str)
-            .filter(|u| !u.is_empty())
-            .map(str::to_owned)
-            .with_context(|| format!("SoundCloud returned no stream URL for \"{title}\""))
+        let mut first_error = None;
+        for chosen in candidates {
+            let Some(endpoint) = chosen.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            // (Computed outside the macros: tracing's macros shadow `Value`.)
+            let protocol = chosen
+                .pointer("/format/protocol")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let mime = chosen
+                .pointer("/format/mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            match self.get_json(endpoint, &params).await {
+                Ok(resp) => {
+                    if let Some(url) = resp.get("url").and_then(Value::as_str).filter(|u| !u.is_empty()) {
+                        debug!("SoundCloud: streaming as {protocol} {mime}");
+                        return Ok((url.to_owned(), protocol));
+                    }
+                    first_error.get_or_insert_with(|| anyhow!("SoundCloud returned no stream URL"));
+                }
+                Err(e) => {
+                    debug!("SoundCloud: {protocol} {mime} stream unavailable ({e:#}); trying the next one");
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        Err(first_error.unwrap_or_else(|| anyhow!("no stream to try")))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -498,33 +517,18 @@ impl SoundCloud {
             .and_then(Value::as_array)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let Some(chosen) = pick_download_transcoding(transcodings) else {
+        let candidates = ranked_download_transcodings(transcodings);
+        if candidates.is_empty() {
             bail!("\"{title}\" can't be downloaded: SoundCloud only offers it encrypted (Go+) or not at all");
-        };
-        if chosen.get("snipped").and_then(Value::as_bool) == Some(true) {
+        }
+        let full: Vec<&Value> = candidates
+            .into_iter()
+            .filter(|t| t.get("snipped").and_then(Value::as_bool) != Some(true))
+            .collect();
+        if full.is_empty() {
             bail!("\"{title}\" can't be downloaded: only a 30 second preview is available (Go+ track)");
         }
-        let endpoint = chosen
-            .get("url")
-            .and_then(Value::as_str)
-            .context("transcoding without url")?;
-        let protocol = chosen
-            .pointer("/format/protocol")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let mut params = Vec::new();
-        if let Some(auth) = json.get("track_authorization").and_then(Value::as_str) {
-            params.push(("track_authorization", auth));
-        }
-        let url = self
-            .get_json(endpoint, &params)
-            .await?
-            .get("url")
-            .and_then(Value::as_str)
-            .filter(|u| !u.is_empty())
-            .map(str::to_owned)
-            .context("SoundCloud returned no stream URL")?;
+        let (url, protocol) = self.first_stream(json, &full).await?;
         if protocol == "progressive" {
             return save_body(&self.http, &url, part, progress).await;
         }
@@ -1038,32 +1042,39 @@ pub enum DownloadKind {
     Stream,
 }
 
-/// Best stream to save: MP3 first (plays and tags everywhere), then Opus, then AAC. Encrypted
-/// streams are never picked; previews only as a last resort (and then refused).
-fn pick_download_transcoding(transcodings: &[Value]) -> Option<&Value> {
-    fn rank(t: &Value) -> Option<u32> {
-        t.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
-        let protocol = t.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("");
-        let mime = t.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
-        if protocol.contains("encrypted") {
-            return None;
-        }
-        let format = match (protocol, mime) {
-            ("progressive", m) if m.starts_with("audio/mpeg") => 0,
-            ("hls", m) if m.starts_with("audio/mpeg") => 1,
-            ("hls", m) if m.starts_with("audio/ogg") => 2,
-            ("hls", m) if m.starts_with("audio/mp4") => 3,
-            _ => return None,
-        };
-        let snipped = t.get("snipped").and_then(Value::as_bool).unwrap_or(false);
-        let hq = t.get("quality").and_then(Value::as_str) == Some("hq");
-        Some(u32::from(snipped) * 100 + format * 2 + u32::from(!hq))
-    }
-    transcodings
+/// Streams worth saving, best first: MP3 (plays and tags everywhere), then Opus, then AAC.
+/// Encrypted streams are left out; previews come last (and are then refused).
+fn ranked_download_transcodings(transcodings: &[Value]) -> Vec<&Value> {
+    rank_transcodings(transcodings, |protocol, mime| match (protocol, mime) {
+        ("hls", m) if m.starts_with("audio/mpeg") => Some(0),
+        ("progressive", m) if m.starts_with("audio/mpeg") => Some(1),
+        ("hls", m) if m.starts_with("audio/ogg") => Some(2),
+        ("hls", m) if m.starts_with("audio/mp4") => Some(3),
+        _ => None,
+    })
+}
+
+/// Transcodings in order of preference: `format` ranks a (protocol, mime type), `None` = never.
+/// Within a format "hq" comes first; 30 second previews come after every full stream, and
+/// encrypted (DRM) streams are never used.
+fn rank_transcodings(transcodings: &[Value], format: impl Fn(&str, &str) -> Option<u32>) -> Vec<&Value> {
+    let mut ranked: Vec<(u32, &Value)> = transcodings
         .iter()
-        .filter_map(|t| rank(t).map(|r| (r, t)))
-        .min_by_key(|(r, _)| *r)
-        .map(|(_, t)| t)
+        .filter_map(|t| {
+            t.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
+            let protocol = t.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("");
+            let mime = t.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
+            if protocol.contains("encrypted") {
+                return None;
+            }
+            let format = format(protocol, mime)?;
+            let snipped = t.get("snipped").and_then(Value::as_bool).unwrap_or(false);
+            let hq = t.get("quality").and_then(Value::as_str) == Some("hq");
+            Some((u32::from(snipped) * 100 + format * 2 + u32::from(!hq), t))
+        })
+        .collect();
+    ranked.sort_by_key(|(r, _)| *r);
+    ranked.into_iter().map(|(_, t)| t).collect()
 }
 
 /// Segments of an HLS media playlist (plus the fMP4 init segment, if any).
@@ -1210,33 +1221,19 @@ pub fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         .unwrap_or(first)
 }
 
-/// Picks the best transcoding mpv can play: progressive MP3 > HLS Opus > HLS MP3 > HLS AAC >
-/// anything else. Snipped (30s preview) streams are used only when nothing else exists, and
-/// DRM encrypted streams never.
-fn pick_transcoding(transcodings: &[Value]) -> Option<&Value> {
-    fn rank(t: &Value) -> Option<u32> {
-        t.get("url").and_then(Value::as_str).filter(|u| !u.is_empty())?;
-        let protocol = t.pointer("/format/protocol").and_then(Value::as_str).unwrap_or("");
-        let mime = t.pointer("/format/mime_type").and_then(Value::as_str).unwrap_or("");
-        if protocol.contains("encrypted") {
-            return None;
-        }
-        let format = match (protocol, mime) {
-            ("progressive", m) if m.starts_with("audio/mpeg") => 0,
+/// Streams mpv can play, best first: HLS MP3 > HLS Opus > progressive MP3 > HLS AAC > anything
+/// else. ("Progressive" MP3s are often still listed but gone.) Previews come after every full
+/// stream, and DRM encrypted streams are never used.
+fn ranked_transcodings(transcodings: &[Value]) -> Vec<&Value> {
+    rank_transcodings(transcodings, |protocol, mime| {
+        Some(match (protocol, mime) {
+            ("hls", m) if m.starts_with("audio/mpeg") => 0,
             ("hls", m) if m.starts_with("audio/ogg") => 1,
-            ("hls", m) if m.starts_with("audio/mpeg") => 2,
+            ("progressive", m) if m.starts_with("audio/mpeg") => 2,
             ("hls", m) if m.starts_with("audio/mp4") => 3,
             _ => 4,
-        };
-        let snipped = t.get("snipped").and_then(Value::as_bool).unwrap_or(false);
-        let hq = t.get("quality").and_then(Value::as_str) == Some("hq");
-        Some(u32::from(snipped) * 100 + format * 2 + u32::from(!hq))
-    }
-    transcodings
-        .iter()
-        .filter_map(|t| rank(t).map(|r| (r, t)))
-        .min_by_key(|(r, _)| *r)
-        .map(|(_, t)| t)
+        })
+    })
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1610,7 +1607,7 @@ mod tests {
     }
 
     fn picked(list: &[Value]) -> Option<(String, String, bool)> {
-        pick_transcoding(list).map(|t| {
+        ranked_transcodings(list).first().map(|t| {
             (
                 t["format"]["protocol"].as_str().unwrap().to_owned(),
                 t["format"]["mime_type"].as_str().unwrap().to_owned(),
@@ -1634,10 +1631,24 @@ mod tests {
             prog_mp3.clone(),
             opus.clone(),
         ];
-        assert_eq!(picked(&all).unwrap().0, "progressive");
+        // HLS MP3 first; the rest stay as fallbacks in order.
+        let order: Vec<(String, String)> = ranked_transcodings(&all)
+            .iter()
+            .map(|t| {
+                (
+                    t["format"]["protocol"].as_str().unwrap().to_owned(),
+                    t["format"]["mime_type"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(order[0], ("hls".to_string(), "audio/mpeg".to_string()));
+        assert!(order[1].1.starts_with("audio/ogg"));
+        assert_eq!(order[2].0, "progressive");
+        assert!(order[3].1.starts_with("audio/mp4"));
+        assert_eq!(order.len(), 4);
 
-        let no_progressive = [aac.clone(), hls_mp3.clone(), opus.clone()];
-        assert!(picked(&no_progressive).unwrap().1.starts_with("audio/ogg"));
+        let no_mp3 = [aac.clone(), opus.clone()];
+        assert!(picked(&no_mp3).unwrap().1.starts_with("audio/ogg"));
 
         let mp3_or_aac = [aac.clone(), hls_mp3.clone()];
         assert_eq!(picked(&mp3_or_aac).unwrap().1, "audio/mpeg");
@@ -1653,7 +1664,7 @@ mod tests {
         // Within a format, hq wins.
         let aac_hq = transcoding("hls", r#"audio/mp4; codecs="mp4a.40.2""#, false, "hq");
         let both = [aac.clone(), aac_hq];
-        assert_eq!(pick_transcoding(&both).unwrap()["quality"], "hq");
+        assert_eq!(ranked_transcodings(&both)[0]["quality"], "hq");
     }
 
     #[test]
@@ -1814,7 +1825,11 @@ mod tests {
             t("hls", "audio/mpeg", false),
             t("progressive", "audio/mpeg", true),
         ];
-        let pick = |list: &[Value]| pick_download_transcoding(list).map(|v| v["url"].as_str().unwrap().to_string());
+        let pick = |list: &[Value]| {
+            ranked_download_transcodings(list)
+                .first()
+                .map(|v| v["url"].as_str().unwrap().to_string())
+        };
         // A full MP3 stream beats a progressive preview and Opus.
         assert!(pick(&all).unwrap().ends_with("/hls/audio/mpeg/false"));
         assert!(pick(&all[..2]).unwrap().contains("/hls/audio/ogg"));
@@ -1966,6 +1981,15 @@ mod tests {
             .lock()
             .unwrap()
             .contains(&"/stream/hls?track_authorization=tok&client_id=testid".to_string()));
+
+        // A stream SoundCloud still lists but no longer has (HTTP 404) is skipped.
+        let json = json!({ "media": { "transcodings": [
+            { "url": format!("{base}/stream/gone"), "quality": "hq", "format": { "protocol": "hls", "mime_type": "audio/mpeg" } },
+            { "url": format!("{base}/stream/hls"), "quality": "sq", "format": { "protocol": "hls", "mime_type": "audio/mpeg" } },
+        ]}});
+        sc.download_stream(&json, "Song", &part, &report).await.unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"ID3\x04first-second");
+        assert!(seen.lock().unwrap().iter().any(|p| p.starts_with("/stream/gone")));
 
         let json = json!({ "media": { "transcodings": [
             { "url": format!("{base}/stream/progressive"), "format": { "protocol": "progressive", "mime_type": "audio/mpeg" } },

@@ -491,7 +491,12 @@ impl Lastfm {
             }
         }
         if s.album.is_empty() {
-            if let Some(album) = self.known_album(&s.artist, &s.track).await {
+            let cleaned = crate::integrations::lyrics::clean_title(&s.track);
+            let mut album = self.known_album(&s.artist, &s.track).await;
+            if album.is_none() && cleaned != s.track {
+                album = self.known_album(&s.artist, &cleaned).await;
+            }
+            if let Some(album) = album {
                 s.album = album;
             }
         }

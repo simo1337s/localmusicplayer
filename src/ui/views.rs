@@ -886,6 +886,41 @@ fn library_artist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
             show_header: true,
         };
         widgets::track_table(ui, cx, &tracks, &opts, viewport, origin);
+
+        // Their songs on Spotify and SoundCloud that aren't in the library (asked for by the
+        // app as the page `artist:<name>`).
+        let online = &cx.feed.page;
+        if online.key != format!("artist:{}", a.name) || online.error.is_some() {
+            return;
+        }
+        ui.add_space(18.0);
+        if online.loading {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!("Looking for {} on Spotify and SoundCloud…", a.name)).color(TEXT_DIM),
+                );
+            });
+            return;
+        }
+        let mut songs: Vec<Track> = a.track_ids.iter().filter_map(|id| cx.lib.get(id)).cloned().collect();
+        let in_library = songs.len();
+        crate::service::add_songs(&mut songs, online.tracks.clone());
+        let more = songs.split_off(in_library);
+        if more.is_empty() {
+            return;
+        }
+        widgets::heading(ui, "More on Spotify & SoundCloud");
+        let more: Vec<&Track> = more.iter().collect();
+        let more = filter(more, st.filter_text);
+        let opts = TableOpts {
+            id: "artist-more",
+            context: &a.name,
+            playlist: None,
+            show_album: true,
+            show_header: false,
+        };
+        widgets::track_table(ui, cx, &more, &opts, viewport, origin);
     });
 }
 
@@ -910,6 +945,7 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
                 Some(links::Target::Spotify(..)) => "Loading from Spotify…",
                 Some(links::Target::SoundCloudUser(_) | links::Target::SoundCloudUrl(_)) => "Loading from SoundCloud…",
                 Some(links::Target::AppleMusic { .. }) => "Loading from Apple Music…",
+                Some(links::Target::ArtistName(_)) => "Looking on Spotify and SoundCloud…",
                 _ => "Opening link…",
             };
             ui.label(egui::RichText::new(what).color(TEXT_DIM));
@@ -1035,7 +1071,7 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
             return;
         }
         if p.kind == "Artist" {
-            widgets::heading(ui, "Popular");
+            widgets::heading(ui, "Songs");
         }
         let opts = TableOpts {
             id: "remote-page",
@@ -1045,6 +1081,15 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
             show_header: p.kind != "Artist",
         };
         widgets::track_table(ui, cx, &tracks, &opts, viewport, origin);
+        if let Some(other) = p.merging {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new(format!("Adding {}'s songs from {}…", p.title, other.label())).color(TEXT_DIM),
+                );
+            });
+        }
     });
 }
 
