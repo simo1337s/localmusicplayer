@@ -153,26 +153,30 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.checkbox(&mut cfg.spotify.normalisation, "Normalize volume");
                 });
                 ui.checkbox(&mut cfg.spotify.cache_audio, "Cache audio on disk (saves bandwidth, up to 2 GB)");
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Audio output").color(TEXT_DIM));
-                    let label = |v: &str| match v {
-                        "pulseaudio" => "PipeWire / PulseAudio",
-                        "alsa" => "ALSA",
-                        _ => "Automatic",
-                    };
-                    egui::ComboBox::from_id_salt("spotify-output")
-                        .selected_text(label(&cfg.spotify.audio_output))
-                        .show_ui(ui, |ui| {
-                            for v in ["auto", "pulseaudio", "alsa"] {
-                                ui.selectable_value(&mut cfg.spotify.audio_output, v.to_string(), label(v));
-                            }
-                        });
-                });
-                hint(
-                    ui,
-                    "Automatic uses PipeWire/PulseAudio when it's running (it follows your system's output device). \
-                     A change takes effect the next time Spotify playback starts (or after restarting MultiMusic).",
-                );
+                // Windows and macOS have one system output that Spotify follows.
+                if cfg!(target_os = "linux") {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Audio output").color(TEXT_DIM));
+                        let label = |v: &str| match v {
+                            "pulseaudio" => "PipeWire / PulseAudio",
+                            "alsa" => "ALSA",
+                            _ => "Automatic",
+                        };
+                        egui::ComboBox::from_id_salt("spotify-output")
+                            .selected_text(label(&cfg.spotify.audio_output))
+                            .show_ui(ui, |ui| {
+                                for v in ["auto", "pulseaudio", "alsa"] {
+                                    ui.selectable_value(&mut cfg.spotify.audio_output, v.to_string(), label(v));
+                                }
+                            });
+                    });
+                    hint(
+                        ui,
+                        "Automatic uses PipeWire/PulseAudio when it's running (it follows your system's output \
+                         device). A change takes effect the next time Spotify playback starts (or after restarting \
+                         MultiMusic).",
+                    );
+                }
                 ui.collapsing("Advanced", |ui| {
                     st.show_spotify_advanced = true;
                     ui.label(RichText::new("Your own Spotify app (recommended for search)").strong());
@@ -302,7 +306,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         Some(Err(why)) => {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(
-                                    RichText::new(format!("yt-dlp {why}. Install it with: sudo pacman -S yt-dlp"))
+                                    RichText::new(format!("yt-dlp {why}. {}", crate::tools::install_hint("yt-dlp")))
                                         .size(12.5)
                                         .color(DANGER),
                                 );
@@ -340,7 +344,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 hint(
                     ui,
                     "Spotify and Apple Music audio is DRM-protected, so MultiMusic downloads the same recording \
-                     from YouTube (with yt-dlp: sudo pacman -S yt-dlp) or SoundCloud, then tags it with the \
+                     from YouTube (with yt-dlp) or SoundCloud, then tags it with the \
                      song's details from Spotify: album, artists, track and disc number, release date, ISRC, \
                      label, copyright and full-size cover.",
                 );
@@ -492,10 +496,19 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.checkbox(&mut cfg.playback.bit_perfect, "Bit-perfect output for lossless files");
                 hint(
                     ui,
-                    "Opens the device exclusively and skips ReplayGain so FLAC/ALAC/WAV reach your DAC untouched. \
-                     For true bit-perfect playback pick an \"alsa/hw:…\" device above, keep the volume at 100% and use your \
-                     DAC or amp for volume. Through PipeWire, audio is resampled to PipeWire's rate unless you allow more \
-                     rates (see the README).",
+                    if cfg!(windows) {
+                        "Opens the device exclusively (WASAPI exclusive mode) and skips ReplayGain so FLAC/ALAC/WAV \
+                         reach your DAC untouched. Keep the volume at 100% and use your DAC or amp for volume."
+                    } else if cfg!(target_os = "macos") {
+                        "Opens the device exclusively (Core Audio hog mode) and skips ReplayGain so FLAC/ALAC/WAV \
+                         reach your DAC untouched at their own sample rate. Keep the volume at 100% and use your DAC \
+                         or amp for volume."
+                    } else {
+                        "Opens the device exclusively and skips ReplayGain so FLAC/ALAC/WAV reach your DAC untouched. \
+                         For true bit-perfect playback pick an \"alsa/hw:…\" device above, keep the volume at 100% and \
+                         use your DAC or amp for volume. Through PipeWire, audio is resampled to PipeWire's rate unless \
+                         you allow more rates (see the README)."
+                    },
                 );
                 hint(ui, "Local files and SoundCloud play through mpv; Spotify plays through librespot (max 320 kbps Ogg Vorbis).");
             });
@@ -519,6 +532,63 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     ui.add(egui::DragValue::new(&mut cfg.ui.art_cache_size).range(32..=2000));
                 });
                 hint(ui, "Fewer cached covers = less RAM. Takes effect after a restart.");
+            });
+
+            // ---------------------------------------------------------- updates
+            section(ui, icon::ARROW_CIRCLE_UP, TEXT, "Updates", |ui| {
+                use crate::service::UpdateStatus;
+                ui.label(format!("You have MultiMusic {}", env!("CARGO_PKG_VERSION")));
+                ui.checkbox(&mut cfg.updates.check, "Check for updates automatically");
+                let update = &cx.feed.update;
+                ui.horizontal(|ui| {
+                    let busy = matches!(
+                        update.status,
+                        UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
+                    );
+                    if ui.add_enabled(!busy, egui::Button::new("Check now")).clicked() {
+                        cx.actions.push(Action::Cmd(Command::CheckUpdates { manual: true }));
+                    }
+                    match (&update.status, &update.available) {
+                        (UpdateStatus::Checking, _) => {
+                            ui.spinner();
+                        }
+                        (UpdateStatus::Downloading(done), _) => {
+                            ui.add(egui::ProgressBar::new(*done).desired_width(160.0).show_percentage());
+                        }
+                        (UpdateStatus::Installing, _) => {
+                            ui.label("Installing…");
+                        }
+                        (UpdateStatus::Failed(why), _) => {
+                            ui.label(RichText::new(why).color(DANGER));
+                        }
+                        (_, Some(release)) => {
+                            ui.label(RichText::new(format!("Version {} is available", release.version)).strong());
+                            if crate::updater::can_install() && ui.button("Update now").clicked() {
+                                cx.actions.push(Action::Cmd(Command::InstallUpdate));
+                            }
+                        }
+                        (UpdateStatus::UpToDate, None) => {
+                            ui.label(RichText::new("You have the newest version").color(TEXT_DIM));
+                        }
+                        _ => {}
+                    }
+                });
+                if !crate::updater::can_install() {
+                    hint(ui, "On Linux, update the way you installed: git pull && makepkg -sif");
+                }
+                ui.add_space(4.0);
+                text_field(
+                    ui,
+                    "GitHub token (only while the repository is private)",
+                    &mut cfg.updates.github_token,
+                    "github_pat_…",
+                    true,
+                );
+                hint(
+                    ui,
+                    "A fine-grained token with read-only access to the repository's contents. Not needed once \
+                     the repository is public.",
+                );
             });
 
             // ---------------------------------------------------------- backup

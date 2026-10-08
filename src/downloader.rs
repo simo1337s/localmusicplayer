@@ -142,7 +142,10 @@ impl Downloader {
                     }
                 }
                 Err(e) if e.is::<youtube::NotInstalled>() => {
-                    youtube_problem = Some("install yt-dlp to look on YouTube too (sudo pacman -S yt-dlp)".into());
+                    youtube_problem = Some(format!(
+                        "yt-dlp is needed to look on YouTube too. {}",
+                        crate::tools::install_hint("yt-dlp")
+                    ));
                 }
                 Err(e) => youtube_problem = Some(format!("{e:#}")),
             }
@@ -252,7 +255,7 @@ async fn make_taggable(path: &Path) -> bool {
         return true;
     }
     let tmp = path.with_extension("remux.m4a");
-    let status = tokio::process::Command::new("ffmpeg")
+    let status = crate::tools::command(crate::tools::resolve("ffmpeg", "ffmpeg"))
         .args(["-v", "error", "-y", "-i"])
         .arg(path)
         .args(["-map", "0:a", "-c", "copy", "-movflags", "+faststart"])

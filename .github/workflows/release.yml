@@ -1,0 +1,307 @@
+# Builds the Windows installer and the macOS apps (Apple Silicon and Intel) with everything
+# they need (mpv, yt-dlp, ffmpeg, the Inter font), and publishes them as the GitHub release of
+# the version in Cargo.toml. The apps' updater installs new releases from there.
+name: Release
+
+on:
+  push:
+    branches: [claude/pensive-gauss-j8jclj]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "assets/**"
+      - "packaging/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        shell: bash
+        run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows
+
+      - name: Build
+        shell: bash
+        env:
+          # The C runtime is linked in, so no Visual C++ redistributable is needed.
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked --no-default-features
+
+      - name: Fetch mpv, yt-dlp, ffmpeg, Inter and rcedit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          New-Item -ItemType Directory -Force stage\tools, stage\fonts, dl | Out-Null
+
+          # mpv: shinchiro's builds (the ones mpv.io links to), the x86-64 one that runs on any CPU.
+          $rel = gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest | ConvertFrom-Json
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-x86_64-\d{8}-git-[0-9a-f]+\.7z$' } | Select-Object -First 1
+          if (-not $asset) { $rel.assets | ForEach-Object { $_.name }; throw "no mpv build found" }
+          Write-Host "mpv: $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile "dl\mpv.7z"
+          7z x dl\mpv.7z -odl\mpv -y | Out-Null
+          Copy-Item dl\mpv\mpv.exe stage\tools\
+          Get-ChildItem dl\mpv -Filter *.dll | Copy-Item -Destination stage\tools\
+
+          Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile stage\tools\yt-dlp.exe
+
+          # ffmpeg and ffprobe (LGPL, sharing their DLLs).
+          Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip -OutFile dl\ffmpeg.zip
+          Expand-Archive dl\ffmpeg.zip dl\ffmpeg
+          $bin = Get-ChildItem dl\ffmpeg -Recurse -Directory -Filter bin | Select-Object -First 1
+          Copy-Item "$($bin.FullName)\ffmpeg.exe", "$($bin.FullName)\ffprobe.exe" stage\tools\
+          Get-ChildItem $bin.FullName -Filter *.dll | Copy-Item -Destination stage\tools\
+
+          Invoke-WebRequest https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip -OutFile dl\inter.zip
+          Expand-Archive dl\inter.zip dl\inter
+          Copy-Item dl\inter\extras\ttf\Inter-Regular.ttf, dl\inter\extras\ttf\Inter-SemiBold.ttf stage\fonts\
+
+          Invoke-WebRequest https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe -OutFile dl\rcedit.exe
+
+      - name: Check the tools run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          stage\tools\mpv.exe --no-config --version
+          if ($LASTEXITCODE -ne 0) { throw "mpv doesn't run" }
+          stage\tools\ffmpeg.exe -hide_banner -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg doesn't run" }
+          stage\tools\yt-dlp.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "yt-dlp doesn't run" }
+
+      - name: Stage the app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item target\release\multimusic.exe stage\
+          dl\rcedit.exe stage\multimusic.exe --set-icon assets\multimusic.ico `
+            --set-version-string ProductName MultiMusic --set-version-string FileDescription MultiMusic `
+            --set-version-string CompanyName simo1337s --set-file-version $env:VERSION --set-product-version $env:VERSION
+          if ($LASTEXITCODE -ne 0) { throw "rcedit failed" }
+          Copy-Item LICENSE stage\LICENSE.txt
+          Copy-Item packaging\THIRD-PARTY.txt stage\
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc /Qp "/DAppVersion=$env:VERSION" "/DStage=..\..\stage" packaging\windows\multimusic.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-ChildItem dist
+
+      - name: Try a silent install and start
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = Get-ChildItem dist\MultiMusic-Setup-*.exe | Select-Object -First 1
+          $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
+          $dir = "$env:LOCALAPPDATA\Programs\MultiMusic"
+          $app = "$dir\multimusic.exe"
+          if (-not (Test-Path $app)) { throw "not installed at $app" }
+          Get-ChildItem $dir -Recurse | Select-Object -First 40 | ForEach-Object { $_.FullName }
+          Get-Process multimusic -ErrorAction SilentlyContinue | Stop-Process -Force
+          # CI machines have no GPU (OpenGL 1.1 only): for this test only, MultiMusic gets Mesa's
+          # software OpenGL next to it. Real PCs use their graphics driver.
+          $mesa = gh api repos/pal1000/mesa-dist-win/releases/latest | ConvertFrom-Json
+          $m = $mesa.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
+          Invoke-WebRequest $m.browser_download_url -OutFile dl\mesa.7z
+          7z x dl\mesa.7z -odl\mesa -y | Out-Null
+          Copy-Item dl\mesa\x64\*.dll $dir
+          Start-Process $app
+          Start-Sleep -Seconds 12
+          $running = Get-Process multimusic -ErrorAction SilentlyContinue
+          if (-not $running) {
+            Get-Content "$env:APPDATA\multimusic\data\multimusic.log" -ErrorAction SilentlyContinue
+            throw "MultiMusic didn't stay running"
+          }
+          Write-Host "MultiMusic is running, using $([math]::Round($running[0].WorkingSet64 / 1MB)) MB"
+          Get-Content "$env:APPDATA\multimusic\data\multimusic.log" -ErrorAction SilentlyContinue
+          $running | Stop-Process -Force
+          # Clean up the test (the Mesa files must not stay).
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/MultiMusic-Setup-*.exe
+          if-no-files-found: error
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            mpv: arm64
+          - arch: intel
+            target: x86_64-apple-darwin
+            mpv: x86_64
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
+
+      - run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release --locked --no-default-features --target ${{ matrix.target }}
+
+      - name: Fetch mpv, yt-dlp, ffmpeg and Inter
+        run: |
+          set -euo pipefail
+          mkdir -p dl tools fonts
+          # mpv: the macOS builds mpv.io links to.
+          index=$(curl -fsSL https://laboratory.stolendata.net/~djinn/mpv_osx/)
+          builds=$(echo "$index" | grep -oE 'mpv-[A-Za-z0-9_.-]+\.tar\.gz' | sort -u)
+          echo "$builds"
+          if [ "${{ matrix.mpv }}" = arm64 ]; then
+            pick=$(echo "$builds" | grep -E 'arm64' | sort -V | tail -1)
+          else
+            pick=$(echo "$builds" | grep -vE 'arm64' | sort -V | tail -1)
+          fi
+          echo "mpv: $pick"
+          curl -fsSL -o dl/mpv.tar.gz "https://laboratory.stolendata.net/~djinn/mpv_osx/$pick"
+          mkdir -p dl/mpv && tar -xzf dl/mpv.tar.gz -C dl/mpv
+          app=$(find dl/mpv -maxdepth 3 -name mpv.app -type d | head -1)
+          test -n "$app"
+          mv "$app" mpv.app
+          file mpv.app/Contents/MacOS/mpv
+
+          curl -fsSL -o tools/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos
+          ff=$([ "${{ matrix.arch }}" = arm64 ] && echo arm64 || echo x64)
+          for t in ffmpeg ffprobe; do
+            curl -fsSL -o "dl/$t.gz" "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/$t-darwin-$ff.gz"
+            gunzip -c "dl/$t.gz" > "tools/$t"
+          done
+          chmod +x tools/*
+          codesign --force --sign - tools/*
+
+          curl -fsSL -o dl/inter.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+          unzip -q -j dl/inter.zip extras/ttf/Inter-Regular.ttf extras/ttf/Inter-SemiBold.ttf -d fonts
+
+      - name: Build the app
+        run: |
+          set -euo pipefail
+          app=dist/MultiMusic.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/${{ matrix.target }}/release/multimusic "$app/Contents/MacOS/"
+          sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          mkdir icon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s assets/icon-1024.png --out icon.iconset/icon_${s}x${s}.png > /dev/null
+            sips -z $((s*2)) $((s*2)) assets/icon-1024.png --out icon.iconset/icon_${s}x${s}@2x.png > /dev/null
+          done
+          iconutil -c icns icon.iconset -o "$app/Contents/Resources/multimusic.icns"
+          cp -R tools fonts mpv.app "$app/Contents/Resources/"
+          cp LICENSE packaging/THIRD-PARTY.txt "$app/Contents/Resources/"
+          # Ad-hoc signature (needed to run on Apple Silicon); no Apple developer account.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep "$app"
+
+      - name: Check it starts
+        if: matrix.arch == 'arm64'
+        run: |
+          set -euo pipefail
+          app=dist/MultiMusic.app
+          "$app/Contents/Resources/mpv.app/Contents/MacOS/mpv" --no-config --version | head -1
+          "$app/Contents/Resources/tools/ffmpeg" -hide_banner -version | head -1
+          "$app/Contents/Resources/tools/yt-dlp" --version
+          "$app/Contents/MacOS/multimusic" > run.log 2>&1 &
+          pid=$!
+          sleep 12
+          if ! kill -0 $pid 2>/dev/null; then cat run.log; cat ~/Library/Application\ Support/multimusic/multimusic.log || true; exit 1; fi
+          echo "running, $(ps -o rss= -p $pid | awk '{print int($1/1024)}') MB"
+          cat ~/Library/Application\ Support/multimusic/multimusic.log || true
+          kill $pid
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="MultiMusic-$VERSION-macos-${{ matrix.arch }}"
+          ditto -c -k --sequesterRsrc --keepParent dist/MultiMusic.app "dist/$name.zip"
+          mkdir dmg && cp -R dist/MultiMusic.app dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "MultiMusic" -srcfolder dmg -ov -format UDZO "dist/$name.dmg"
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat > ../notes.md <<EOF
+          ## Install
+
+          - **Windows 10/11:** run \`MultiMusic-Setup-$VERSION-x64.exe\`. It installs for your user (no administrator prompt) with everything MultiMusic needs (mpv, yt-dlp, ffmpeg).
+          - **macOS 11+:** open the \`.dmg\` for your Mac (**arm64** for Apple Silicon M1/M2/M3/M4, **intel** for Intel Macs) and drag MultiMusic to Applications. The app isn't notarized by Apple, so the first time: right-click MultiMusic → Open → Open (or System Settings → Privacy & Security → Open Anyway).
+          - **Arch Linux:** build from the repository with \`makepkg -si\`.
+
+          MultiMusic checks for updates by itself and installs them with one click.
+          EOF
+          if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "v$VERSION" ./* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "v$VERSION" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "MultiMusic $VERSION" --notes-file ../notes.md
+          fi

@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>MultiMusic</string>
+    <key>CFBundleDisplayName</key>
+    <string>MultiMusic</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.simo1337s.multimusic</string>
+    <key>CFBundleVersion</key>
+    <string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleExecutable</key>
+    <string>multimusic</string>
+    <key>CFBundleIconFile</key>
+    <string>multimusic</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.music</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>11.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>MIT License</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>MultiMusic plays music and saves settings files in your Documents folder.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>MultiMusic plays music, saves downloads and imports settings files in your Downloads folder.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>MultiMusic plays music and imports settings files from your Desktop.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>MultiMusic plays music from external drives.</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>MultiMusic plays music from network drives.</string>
+</dict>
+</plist>

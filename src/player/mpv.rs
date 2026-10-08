@@ -4,7 +4,7 @@
 //! HLS streams, ReplayGain, gapless playback and outputs straight to PipeWire/PulseAudio/ALSA.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,10 +12,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::OwnedWriteHalf;
-use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,10 +49,13 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 /// Events from one mpv instance, tagged with its [`Mpv::id`] (crossfades run two at once).
 pub type MpvSender = mpsc::UnboundedSender<(u64, MpvEvent)>;
 
+type IpcReader = Box<dyn AsyncRead + Send + Unpin>;
+type IpcWriter = Box<dyn AsyncWrite + Send + Unpin>;
+
 pub struct Mpv {
     id: u64,
     child: Child,
-    writer: tokio::sync::Mutex<OwnedWriteHalf>,
+    writer: tokio::sync::Mutex<IpcWriter>,
     pending: Pending,
     next_id: AtomicU64,
     socket: PathBuf,
@@ -64,18 +65,10 @@ impl Mpv {
     /// Starts an mpv process. `id` tags its events and keeps its IPC socket apart from other
     /// instances.
     pub async fn spawn(opts: &MpvOptions, id: u64, events: MpvSender) -> Result<Mpv> {
-        let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let name = format!("multimusic-mpv-{}-{id}.sock", std::process::id());
-        let mut socket = runtime_dir.join(&name);
-        // Unix socket paths are limited to ~108 bytes.
-        if socket.as_os_str().len() > 100 {
-            socket = PathBuf::from("/tmp").join(&name);
-        }
+        let socket = ipc_path(id);
         let _ = std::fs::remove_file(&socket);
 
-        let mut cmd = Command::new(&opts.binary);
+        let mut cmd = crate::tools::command(&opts.binary);
         cmd.arg("--no-config")
             .arg("--idle=yes")
             .arg("--video=no")
@@ -123,21 +116,25 @@ impl Mpv {
                 cmd.arg(flag);
             }
         }
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("could not start `{}` (is mpv installed?)", opts.binary))?;
+        let child = cmd.spawn().with_context(|| {
+            format!(
+                "could not start mpv (`{}`). {}",
+                opts.binary,
+                crate::tools::install_hint("mpv")
+            )
+        })?;
+        crate::tools::end_with_us(&child);
 
         // Wait for the IPC socket to show up.
         let mut stream = None;
         for _ in 0..100 {
-            if let Ok(s) = UnixStream::connect(&socket).await {
+            if let Ok(s) = connect(&socket).await {
                 stream = Some(s);
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
-        let stream = stream.ok_or_else(|| anyhow!("mpv did not open its IPC socket"))?;
-        let (read, write) = stream.into_split();
+        let (read, write) = stream.ok_or_else(|| anyhow!("mpv did not open its IPC socket"))?;
 
         let pending: Pending = Arc::default();
         let reader_pending = pending.clone();
@@ -271,13 +268,79 @@ impl Mpv {
 
 impl Drop for Mpv {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+const IPC_PREFIX: &str = "multimusic-mpv-";
+
+/// Where mpv listens for commands: a Unix socket, or a named pipe on Windows.
+fn ipc_path(id: u64) -> PathBuf {
+    let name = format!("{IPC_PREFIX}{}-{id}.sock", std::process::id());
+    if cfg!(windows) {
+        return PathBuf::from(format!(r"\\.\pipe\{name}"));
+    }
+    let socket = ipc_dir().join(&name);
+    // Unix socket paths are limited to ~104 bytes.
+    if socket.as_os_str().len() > 100 {
+        return PathBuf::from("/tmp").join(&name);
+    }
+    socket
+}
+
+fn ipc_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+async fn connect(path: &Path) -> std::io::Result<(IpcReader, IpcWriter)> {
+    #[cfg(unix)]
+    {
+        let (read, write) = tokio::net::UnixStream::connect(path).await?.into_split();
+        Ok((Box::new(read), Box::new(write)))
+    }
+    #[cfg(windows)]
+    {
+        let pipe = tokio::net::windows::named_pipe::ClientOptions::new().open(path)?;
+        let (read, write) = tokio::io::split(pipe);
+        Ok((Box::new(read), Box::new(write)))
+    }
+}
+
+/// Stops players a previous MultiMusic left behind when it was killed (Linux ends them with
+/// the app; on Windows a job object does).
+pub fn stop_orphans() {
+    #[cfg(unix)]
+    for dir in [ipc_dir(), PathBuf::from("/tmp")] {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(pid) = name
+                .strip_prefix(IPC_PREFIX)
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|pid| pid.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: signal 0 only checks whether the process exists.
+            let alive = pid == std::process::id() as i32 || unsafe { libc::kill(pid, 0) } == 0;
+            if alive {
+                continue;
+            }
+            if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(entry.path()) {
+                use std::io::Write;
+                let _ = socket.write_all(b"{\"command\":[\"quit\"]}\n");
+            }
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
 /// Output devices mpv can use, as (id, description). The id goes into `--audio-device`.
 pub async fn list_audio_devices(binary: &str) -> Vec<(String, String)> {
-    let output = Command::new(binary)
+    let output = crate::tools::command(binary)
         .arg("--no-config")
         .arg("--audio-device=help")
         .stdin(Stdio::null())
@@ -327,7 +390,7 @@ async fn supported_options(binary: &str) -> Vec<String> {
     if let Some(list) = KNOWN.lock().unwrap().as_ref().and_then(|m| m.get(binary)) {
         return list.clone();
     }
-    let output = Command::new(binary)
+    let output = crate::tools::command(binary)
         .arg("--no-config")
         .arg("--list-options")
         .stdin(Stdio::null())

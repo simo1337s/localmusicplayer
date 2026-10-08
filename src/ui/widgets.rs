@@ -1044,7 +1044,7 @@ pub fn paste(cx: &mut Cx, p: &Playlist, text: Option<&str>, copied: Option<std::
         .unwrap_or_default()
         .lines()
         .map(str::trim)
-        .filter(|l| l.starts_with('/') || l.starts_with("file://") || crate::links::target(l).is_some())
+        .filter(|l| crate::service::local_path(l).is_some() || crate::links::target(l).is_some())
         .map(String::from)
         .collect();
     if !links.is_empty() {

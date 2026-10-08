@@ -2877,7 +2877,7 @@ dependencies = [
 
 [[package]]
 name = "multimusic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2900,6 +2900,7 @@ dependencies = [
  "plist",
  "protobuf",
  "rand 0.9.5",
+ "raw-window-handle",
  "regex",
  "reqwest 0.13.5",
  "rusqlite",
@@ -2913,6 +2914,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "walkdir",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

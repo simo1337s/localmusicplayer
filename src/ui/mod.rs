@@ -132,6 +132,8 @@ pub struct App {
     tag_editor: Option<tag_editor::TagEditor>,
     /// Closing to start again with imported settings.
     restarting: bool,
+    /// A new version the user put off for now.
+    update_dismissed: String,
     /// The last `Feed::art_changed` number handled.
     art_changed_seen: u64,
     rt: tokio::runtime::Handle,
@@ -161,6 +163,16 @@ impl App {
         ctx.set_zoom_factor(cfg.ui.scale.clamp(0.6, 2.5));
         let art = ArtCache::new(rt.clone(), paths.art_cache(), cfg.ui.art_cache_size);
         let logo = theme::load_logo(&ctx);
+        // Windows' media overlay and keys are tied to the window.
+        #[cfg(windows)]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = cc.window_handle() {
+                if let RawWindowHandle::Win32(win) = handle.as_raw() {
+                    let _ = cmd.send(Command::AttachWindow(win.hwnd.get()));
+                }
+            }
+        }
         App {
             shared,
             cmd,
@@ -189,6 +201,7 @@ impl App {
             dialog: None,
             tag_editor: None,
             restarting: false,
+            update_dismissed: String::new(),
             art_changed_seen: 0,
             rt,
             settings: settings::SettingsState::default(),
@@ -721,16 +734,7 @@ impl App {
             self.trimmed_at = Instant::now();
             crate::memory::trim();
         }
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            if let Some(line) = status.lines().find(|l| l.starts_with("VmRSS:")) {
-                let kb: f32 = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0.0);
-                self.rss_mb = kb / 1024.0;
-            }
-        }
+        self.rss_mb = crate::tools::memory_mb();
         tracing::debug!(
             "memory: rss {:.0} MB, font atlas {:?}, cached covers {}",
             self.rss_mb,
@@ -754,6 +758,7 @@ impl eframe::App for App {
             let mut feed = shared.feed.write().unwrap();
             if std::mem::take(&mut feed.raise) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
             // Imported settings: take them over (so closing doesn't save the old ones) and
@@ -867,6 +872,11 @@ impl eframe::App for App {
                             collapsed,
                         });
                         panels::toolbar(ui, &mut cx, can_back, can_forward, search.as_mut());
+                    }
+                    let skipped_before = self.cfg.updates.skipped.clone();
+                    panels::update_bar(ui, &mut cx, &mut self.cfg.updates.skipped, &mut self.update_dismissed);
+                    if self.cfg.updates.skipped != skipped_before {
+                        self.cfg_changed_at = Some(Instant::now());
                     }
                     if self.view == View::Settings {
                         settings::show(ui, &mut cx, &mut self.cfg, &mut self.settings, &self.paths, self.rss_mb);

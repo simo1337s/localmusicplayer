@@ -1,4 +1,5 @@
-//! MPRIS (D-Bus) integration: media keys, playerctl, waybar/polybar modules, desktop widgets.
+//! System media controls: MPRIS on Linux (media keys, playerctl, waybar/polybar modules,
+//! desktop widgets), the media overlay and keys on Windows, Now Playing on macOS.
 
 use std::time::Duration;
 
@@ -16,13 +17,22 @@ pub struct Mpris {
 }
 
 impl Mpris {
-    pub fn new(commands: UnboundedSender<Command>) -> Mpris {
+    /// `window` is the main window's handle, which Windows needs (it has none before the
+    /// window opens).
+    pub fn new(commands: UnboundedSender<Command>, window: Option<isize>) -> Mpris {
         let config = PlatformConfig {
             display_name: "MultiMusic",
             dbus_name: "multimusic",
-            hwnd: None,
+            hwnd: window.map(|h| h as *mut std::ffi::c_void),
         };
-        let controls = session_bus_available()
+        let available = if cfg!(target_os = "linux") {
+            session_bus_available()
+        } else if cfg!(windows) {
+            window.is_some()
+        } else {
+            true
+        };
+        let controls = available
             .then(|| MediaControls::new(config).ok())
             .flatten()
             .and_then(|mut c| {
@@ -73,7 +83,7 @@ impl Mpris {
                 if a.starts_with("http") {
                     Some(a.to_string())
                 } else if is_image(a) {
-                    Some(format!("file://{a}"))
+                    Some(file_url(a))
                 } else {
                     None
                 }
@@ -100,9 +110,13 @@ impl Mpris {
     }
 
     pub fn set_volume(&mut self, volume: f32) {
+        // Only MPRIS has a volume.
+        #[cfg(target_os = "linux")]
         if let Some(c) = self.controls.as_mut() {
             let _ = c.set_volume(volume as f64 / 100.0);
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = volume;
     }
 }
 
@@ -118,6 +132,16 @@ fn session_bus_available() -> bool {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|d| std::path::Path::new(&d).join("bus").exists())
         .unwrap_or(false)
+}
+
+/// A local cover as a `file://` URL (Windows paths need a slash before the drive).
+fn file_url(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if path.starts_with('/') {
+        format!("file://{path}")
+    } else {
+        format!("file:///{path}")
+    }
 }
 
 fn is_image(path: &str) -> bool {

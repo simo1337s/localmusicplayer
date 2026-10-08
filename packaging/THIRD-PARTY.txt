@@ -1,0 +1,22 @@
+MultiMusic ships these programs and fonts unchanged, so it works without installing anything
+else. Each keeps its own license; their source code is available at the addresses below.
+
+mpv (local files and SoundCloud playback)
+  License: GPL-2.0-or-later / LGPL-2.1-or-later (see mpv's Copyright file)
+  Source:  https://github.com/mpv-player/mpv
+  Windows build: https://github.com/shinchiro/mpv-winbuild-cmake
+  macOS builds:  https://laboratory.stolendata.net/~djinn/mpv_osx/
+
+yt-dlp (finding Spotify and Apple Music songs on YouTube for downloads)
+  License: Unlicense
+  Source:  https://github.com/yt-dlp/yt-dlp
+
+FFmpeg / ffprobe (saving and converting downloads)
+  License: LGPL-2.1-or-later (Windows: LGPL build) / GPL (macOS static build)
+  Source:  https://ffmpeg.org/download.html
+  Windows build: https://github.com/BtbN/FFmpeg-Builds
+  macOS builds:  https://github.com/eugeneware/ffmpeg-static
+
+Inter (interface font)
+  License: SIL Open Font License 1.1
+  Source:  https://github.com/rsms/inter

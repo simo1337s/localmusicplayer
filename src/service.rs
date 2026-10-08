@@ -81,6 +81,9 @@ pub enum Command {
     DeletePlaylist(String),
     /// Shows a message (for things the UI does on its own, like copying songs).
     Notify(String),
+    /// The main window's native handle (an HWND on Windows), for the system media controls.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    AttachWindow(isize),
     /// Writes changed details into local files: each field gets the text given (empty removes
     /// it), and the cover is replaced or removed.
     EditTags {
@@ -108,6 +111,12 @@ pub enum Command {
     },
     /// Takes over the settings in a file, then restarts the app.
     ImportSettings(PathBuf),
+    /// Looks for a new version (`manual`: the user asked, so say when there is none).
+    CheckUpdates {
+        manual: bool,
+    },
+    /// Downloads and installs the new version found, then quits (it starts again by itself).
+    InstallUpdate,
     Rescan,
     /// Ask mpv which output devices exist (for the device picker).
     ListAudioDevices,
@@ -332,6 +341,29 @@ pub struct Feed {
     pub imported_settings: Option<Box<Config>>,
     /// The settings file last exported.
     pub exported_settings: Option<PathBuf>,
+    pub update: UpdateState,
+}
+
+/// New versions of MultiMusic.
+#[derive(Debug, Clone, Default)]
+pub struct UpdateState {
+    /// A newer release than this one.
+    pub available: Option<crate::updater::Release>,
+    pub status: UpdateStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    /// Checked on request: this is the newest version.
+    UpToDate,
+    /// Downloading, 0.0..=1.0.
+    Downloading(f32),
+    /// The new version is being installed; MultiMusic quits and starts again.
+    Installing,
+    Failed(String),
 }
 
 /// State shared between the service and the UI.
@@ -404,6 +436,11 @@ enum Internal {
         tracks: Vec<Track>,
         failed: usize,
     },
+    UpdateChecked {
+        manual: bool,
+        result: Result<crate::updater::Release, String>,
+    },
+    UpdateFailed(String),
     TagsEdited {
         /// The files read again, with their new modification times.
         tracks: Vec<(Track, i64)>,
@@ -469,6 +506,9 @@ struct SoundCloudSync {
     likes: Vec<Track>,
     playlists: Vec<ImportedPlaylist>,
 }
+
+/// GitHub's API, where releases (updates) come from.
+const GITHUB_API: &str = "https://api.github.com";
 
 /// Bumped when the scanner learns to read more from files, so the library is read once again.
 const SCAN_VERSION: &str = "2";
@@ -657,7 +697,19 @@ impl Service {
             &cfg.discord.app_id,
             cfg.discord.song_as_activity_name,
         );
-        let mpris = Mpris::new(cmd_tx.clone());
+        crate::player::mpv::stop_orphans();
+        let mpris = Mpris::new(cmd_tx.clone(), None);
+        // Look for a new version a little after starting, then every few hours.
+        let updates = cmd_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(8)).await;
+            loop {
+                if updates.send(Command::CheckUpdates { manual: false }).is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await;
+            }
+        });
 
         let svc = Service {
             shared,
@@ -1003,9 +1055,11 @@ impl Service {
             Command::ImportAppleApi => self.import_apple_api(),
             Command::ExportSettings { path, include } => self.export_settings(&path, include),
             Command::ImportSettings(path) => self.import_settings(&path),
+            Command::CheckUpdates { manual } => self.check_updates(manual),
+            Command::InstallUpdate => self.install_update(),
             Command::Rescan => self.start_scan(),
             Command::ListAudioDevices => {
-                let binary = self.cfg.playback.mpv_path.clone();
+                let binary = crate::tools::resolve(&self.cfg.playback.mpv_path, "mpv");
                 let tx = self.internal_tx.clone();
                 tokio::spawn(async move {
                     let devices = crate::player::mpv::list_audio_devices(&binary).await;
@@ -1063,6 +1117,13 @@ impl Service {
                 });
             }
             Command::UpdateConfig(cfg) => self.update_config(*cfg).await,
+            Command::AttachWindow(handle) => {
+                // Windows media controls belong to a window.
+                if cfg!(windows) {
+                    self.mpris = Mpris::new(self.cmd_tx.clone(), Some(handle));
+                    self.publish_player();
+                }
+            }
             Command::Raise => {
                 self.shared.feed.write().unwrap().raise = true;
                 self.shared.repaint();
@@ -1249,7 +1310,7 @@ impl Service {
             return Ok(());
         }
         let opts = MpvOptions {
-            binary: self.cfg.playback.mpv_path.clone(),
+            binary: crate::tools::resolve(&self.cfg.playback.mpv_path, "mpv"),
             volume: self.cfg.playback.volume,
             replaygain: self.cfg.playback.replaygain && !self.cfg.playback.bit_perfect,
             gapless: self.cfg.playback.gapless,
@@ -2698,6 +2759,102 @@ impl Service {
         });
     }
 
+    // ---------------------------------------------------------------- updates
+
+    fn check_updates(&mut self, manual: bool) {
+        if !manual && !self.cfg.updates.check {
+            return;
+        }
+        {
+            let mut feed = self.shared.feed.write().unwrap();
+            if matches!(
+                feed.update.status,
+                UpdateStatus::Downloading(_) | UpdateStatus::Installing
+            ) {
+                return;
+            }
+            if manual {
+                feed.update.status = UpdateStatus::Checking;
+            }
+        }
+        self.shared.repaint();
+        let (repo, token) = (self.cfg.updates.repo.clone(), self.cfg.updates.github_token.clone());
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let http = crate::updater::client();
+            // Tests point this at a stand-in for GitHub.
+            let api = std::env::var("MULTIMUSIC_UPDATE_API").unwrap_or_else(|_| GITHUB_API.to_string());
+            let result = crate::updater::latest(&http, &api, &repo, &token)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(Internal::UpdateChecked { manual, result });
+        });
+    }
+
+    fn install_update(&mut self) {
+        let release = self.shared.feed.read().unwrap().update.available.clone();
+        let Some(release) = release else { return };
+        let Some(asset) = release.asset.clone() else {
+            let why = if crate::updater::can_install() {
+                "This release has no download for your system yet"
+            } else {
+                "Update with: cd ~/localmusicplayer && git pull && makepkg -sif"
+            };
+            self.shared.feed.write().unwrap().update.status = UpdateStatus::Failed(why.into());
+            return;
+        };
+        self.shared.feed.write().unwrap().update.status = UpdateStatus::Downloading(0.0);
+        self.shared.repaint();
+        let token = self.cfg.updates.github_token.clone();
+        let shared = self.shared.clone();
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let http = crate::updater::client();
+                let dir = crate::updater::download_dir();
+                tokio::fs::create_dir_all(&dir).await?;
+                let file = dir.join(&asset.name);
+                let last = std::sync::atomic::AtomicU32::new(0);
+                crate::updater::download(&http, &asset, &token, &file, |done| {
+                    let percent = (done * 100.0) as u32;
+                    if last.swap(percent, std::sync::atomic::Ordering::Relaxed) != percent {
+                        shared.feed.write().unwrap().update.status = UpdateStatus::Downloading(done);
+                        shared.repaint();
+                    }
+                })
+                .await?;
+                let sums = release
+                    .sums
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("the release has no checksums, so it can't be checked"))?;
+                let sums_file = dir.join(crate::updater::SUMS_FILE);
+                crate::updater::download(&http, sums, &token, &sums_file, |_| {}).await?;
+                let sums_text = tokio::fs::read_to_string(&sums_file).await?;
+                let name = asset.name.clone();
+                let installed = tokio::task::spawn_blocking(move || {
+                    crate::updater::verify(&file, &name, &sums_text)?;
+                    crate::updater::install(&file)
+                })
+                .await?;
+                installed
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    let mut feed = shared.feed.write().unwrap();
+                    feed.update.status = UpdateStatus::Installing;
+                    // Quit so the new version can take over (it starts by itself).
+                    feed.quit = true;
+                    drop(feed);
+                    shared.repaint();
+                }
+                Err(e) => {
+                    let _ = tx.send(Internal::UpdateFailed(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
     // ---------------------------------------------------------------- settings files
 
     fn export_settings(&mut self, path: &Path, include: crate::backup::Include) {
@@ -3740,6 +3897,39 @@ impl Service {
                 Ok((songs, playlists)) => self.merge_apple(songs, playlists),
                 Err(e) => self.shared.error(format!("Apple Music import failed: {e:#}")),
             },
+            Internal::UpdateChecked { manual, result } => {
+                let mut feed = self.shared.feed.write().unwrap();
+                let current = env!("CARGO_PKG_VERSION");
+                match result {
+                    Ok(release) if crate::updater::is_newer(&release.version, current) => {
+                        tracing::info!("MultiMusic {} is available", release.version);
+                        feed.update.available = Some(release);
+                        feed.update.status = UpdateStatus::Idle;
+                    }
+                    Ok(_) => {
+                        feed.update.available = None;
+                        feed.update.status = if manual {
+                            UpdateStatus::UpToDate
+                        } else {
+                            UpdateStatus::Idle
+                        };
+                    }
+                    Err(e) => {
+                        tracing::info!("update check: {e}");
+                        feed.update.status = if manual {
+                            UpdateStatus::Failed(e)
+                        } else {
+                            UpdateStatus::Idle
+                        };
+                    }
+                }
+                drop(feed);
+                self.shared.repaint();
+            }
+            Internal::UpdateFailed(e) => {
+                self.shared.feed.write().unwrap().update.status = UpdateStatus::Failed(e);
+                self.shared.repaint();
+            }
             Internal::TagsEdited {
                 tracks,
                 errors,
@@ -4213,13 +4403,10 @@ async fn load_cover(http: &reqwest::Client, src: &str) -> Result<Vec<u8>> {
         let resp = http.get(src).send().await?.error_for_status()?;
         resp.bytes().await?.to_vec()
     } else {
-        let path = match src.strip_prefix("file://") {
-            Some(rest) => urlencoding::decode(rest).map_or_else(|_| rest.to_string(), |p| p.into_owned()),
-            None => src.to_string(),
-        };
+        let path = local_path(src).unwrap_or_else(|| PathBuf::from(src));
         tokio::fs::read(&path)
             .await
-            .map_err(|e| anyhow!("couldn't read {path}: {e}"))?
+            .map_err(|e| anyhow!("couldn't read {}: {e}", path.display()))?
     };
     tokio::task::spawn_blocking(move || library::tags::cover_data(bytes)).await?
 }
@@ -4273,6 +4460,27 @@ async fn spotify_tags(
     Ok(downloader::basic_metadata(&found))
 }
 
+/// A file path or `file://` link (as file managers copy them) as a path; `None` for anything
+/// else. `file:///C:/Music/a.mp3` is `C:/Music/a.mp3` on Windows.
+pub fn local_path(line: &str) -> Option<PathBuf> {
+    let line = line.trim();
+    let path = match line.strip_prefix("file://") {
+        Some(rest) => {
+            let decoded = urlencoding::decode(rest).map_or_else(|_| rest.to_string(), |p| p.into_owned());
+            let bytes = decoded.as_bytes();
+            // "/C:/…" → "C:/…"
+            if bytes.len() > 2 && bytes[0] == b'/' && bytes[2] == b':' && bytes[1].is_ascii_alphabetic() {
+                decoded[1..].to_string()
+            } else {
+                decoded
+            }
+        }
+        None => line.to_string(),
+    };
+    let path = PathBuf::from(path);
+    (path.is_absolute() || path.has_root()).then_some(path)
+}
+
 /// The songs a pasted line stands for: a Spotify or SoundCloud song, album or playlist link, or
 /// a music file (a path or a `file://` link from a file manager). `None` when it can't be found.
 async fn songs_behind_link(
@@ -4283,12 +4491,7 @@ async fn songs_behind_link(
     shared: &Shared,
 ) -> Option<Vec<Track>> {
     let line = line.trim();
-    let path = match line.strip_prefix("file://") {
-        Some(rest) => urlencoding::decode(rest).map_or_else(|_| rest.to_string(), |p| p.into_owned()),
-        None => line.to_string(),
-    };
-    if path.starts_with('/') {
-        let path = PathBuf::from(path);
+    if let Some(path) = local_path(line) {
         if !library::scanner::is_audio_file(&path) || !path.is_file() {
             return None;
         }
@@ -4983,6 +5186,25 @@ mod tests {
             .is_none());
         assert!(paste("hello".into()).await.is_none());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pasted_paths() {
+        assert_eq!(local_path("/music/a b.mp3"), Some(PathBuf::from("/music/a b.mp3")));
+        assert_eq!(
+            local_path("file:///music/a%20b.mp3"),
+            Some(PathBuf::from("/music/a b.mp3"))
+        );
+        // Windows file manager links drop the slash before the drive.
+        let win = local_path("file:///C:/Music/a.mp3");
+        if cfg!(windows) {
+            assert_eq!(win, Some(PathBuf::from("C:/Music/a.mp3")));
+        } else {
+            assert_eq!(win, None);
+        }
+        assert_eq!(local_path("https://soundcloud.com/a/b"), None);
+        assert_eq!(local_path("spotify:track:1"), None);
+        assert_eq!(local_path("relative/a.mp3"), None);
     }
 
     #[tokio::test]

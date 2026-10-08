@@ -1,5 +1,8 @@
 //! MultiMusic: a lightweight native music player for local files, Spotify and SoundCloud.
 
+// No console window next to the app on Windows.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod backup;
 mod config;
 mod downloader;
@@ -12,7 +15,9 @@ mod model;
 mod player;
 mod providers;
 mod service;
+mod tools;
 mod ui;
+mod updater;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,14 +35,26 @@ fn main() -> anyhow::Result<()> {
     std::env::set_var("PULSE_PROP_application.name", "MultiMusic");
     std::env::set_var("PULSE_PROP_application.icon_name", "multimusic");
     std::env::set_var("PULSE_PROP_stream.description", "Spotify");
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("MULTIMUSIC_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("multimusic=info,librespot=warn,warn")),
-        )
-        .init();
-
     let paths = Paths::new();
+    let filter = EnvFilter::try_from_env("MULTIMUSIC_LOG")
+        .unwrap_or_else(|_| EnvFilter::new("multimusic=info,librespot=warn,warn"));
+    match log_file(&paths) {
+        // Windows and macOS apps have no terminal: the log goes to a file in the data folder.
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt().with_env_filter(filter).init(),
+    }
+    tracing::info!("MultiMusic {} starting", env!("CARGO_PKG_VERSION"));
+
+    // Windows: starting MultiMusic again brings the running one to the front.
+    #[cfg(windows)]
+    if instance::running_elsewhere() {
+        return Ok(());
+    }
+
     let cfg = Config::load(&paths);
 
     // Two workers are plenty: everything heavy is IO bound or runs in mpv/librespot threads.
@@ -50,6 +67,8 @@ fn main() -> anyhow::Result<()> {
 
     let shared = Arc::new(Shared::default());
     let (cmd, service) = service::start(rt.handle().clone(), shared.clone(), paths.clone(), cfg.clone());
+    #[cfg(windows)]
+    instance::listen(rt.handle(), cmd.clone());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -93,6 +112,60 @@ fn main() -> anyhow::Result<()> {
         }
     }
     result.map_err(|e| anyhow!("{e}"))
+}
+
+/// The log file used where there is no terminal to log to (the Windows and macOS apps).
+fn log_file(paths: &Paths) -> Option<std::fs::File> {
+    use std::io::IsTerminal;
+    if !cfg!(any(windows, target_os = "macos")) || std::io::stderr().is_terminal() {
+        return None;
+    }
+    std::fs::File::create(paths.data_dir.join("multimusic.log")).ok()
+}
+
+/// One MultiMusic at a time on Windows: a second start asks the first to show itself.
+#[cfg(windows)]
+mod instance {
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+    use tokio::sync::mpsc::UnboundedSender;
+
+    use crate::service::Command;
+
+    const PIPE: &str = r"\\.\pipe\multimusic-running";
+
+    /// True when another MultiMusic runs (it was asked to come to the front).
+    pub fn running_elsewhere() -> bool {
+        use std::io::Write;
+        match std::fs::OpenOptions::new().write(true).open(PIPE) {
+            Ok(mut pipe) => {
+                let _ = pipe.write_all(b"raise\n");
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn listen(rt: &tokio::runtime::Handle, commands: UnboundedSender<Command>) {
+        let _guard = rt.enter();
+        let Ok(server) = ServerOptions::new().first_pipe_instance(true).create(PIPE) else {
+            return;
+        };
+        rt.spawn(serve(server, commands));
+    }
+
+    async fn serve(mut server: NamedPipeServer, commands: UnboundedSender<Command>) {
+        loop {
+            if server.connect().await.is_err() {
+                return;
+            }
+            let _ = commands.send(Command::Raise);
+            // A new instance of the pipe for the next start.
+            match ServerOptions::new().create(PIPE) {
+                Ok(next) => server = next,
+                Err(_) => return,
+            }
+        }
+    }
 }
 
 /// Window/taskbar icon, from the same artwork as the launcher icon and the in-app logo.

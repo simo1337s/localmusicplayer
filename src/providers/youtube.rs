@@ -69,7 +69,8 @@ impl YtDlp {
     /// From the settings: the program and its extra options as typed (quotes allowed).
     pub fn new(program: &str, args: &str) -> YtDlp {
         YtDlp {
-            program: program.trim().to_string(),
+            // The yt-dlp shipped with MultiMusic on Windows and macOS, unless a path is set.
+            program: crate::tools::resolve(program, "yt-dlp"),
             args: split_args(args),
             mp3: false,
         }
@@ -105,19 +106,21 @@ impl YtDlp {
     }
 
     fn command(&self) -> Command {
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = crate::tools::command(&self.program);
         // The user's yt-dlp config file could change file names or formats; their extra
         // options go first so the ones MultiMusic needs win.
-        cmd.args(["--ignore-config", "--no-warnings"])
-            .args(&self.args)
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
+        cmd.args(["--ignore-config", "--no-warnings"]);
+        // The ffmpeg that comes with MultiMusic isn't on the PATH.
+        if let Some(dir) = crate::tools::bundled_ffmpeg_dir() {
+            cmd.arg("--ffmpeg-location").arg(dir);
+        }
+        cmd.args(&self.args).stdin(Stdio::null()).kill_on_drop(true);
         cmd
     }
 
     /// yt-dlp's version, i.e. whether it is installed and runs.
     pub async fn version(&self) -> Result<String> {
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = crate::tools::command(&self.program);
         cmd.arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -361,7 +364,10 @@ async fn run_download(
     if !status.success() {
         let reason = last_error(&log);
         if reason.contains("ffmpeg") || reason.contains("ffprobe") {
-            bail!("yt-dlp needs ffmpeg to save audio (sudo pacman -S ffmpeg)");
+            bail!(
+                "yt-dlp needs ffmpeg to save audio. {}",
+                crate::tools::install_hint("ffmpeg")
+            );
         }
         bail!("YouTube: {}", explain(&reason));
     }

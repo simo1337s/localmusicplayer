@@ -509,6 +509,86 @@ fn search_box(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, rect: Rect) {
 // ------------------------------------------------------------------ content toolbar
 
 /// Back / forward above the main view.
+/// A slim bar about a new version of MultiMusic, and its download and install.
+pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mut String) {
+    use crate::service::UpdateStatus;
+    let update = &cx.feed.update;
+    let Some(release) = update.available.as_ref() else {
+        return;
+    };
+    let busy = matches!(
+        update.status,
+        UpdateStatus::Downloading(_) | UpdateStatus::Installing | UpdateStatus::Failed(_)
+    );
+    if !busy && (release.version == *skipped || release.version == *dismissed) {
+        return;
+    }
+    let version = release.version.clone();
+    let page = release.page.clone();
+    egui::Frame::new()
+        .fill(theme::mix(cx.accent, CARD, 0.82))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::symmetric(14, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(icon::ARROW_CIRCLE_UP)
+                        .family(theme::icons())
+                        .size(18.0)
+                        .color(TEXT),
+                );
+                match &update.status {
+                    UpdateStatus::Downloading(done) => {
+                        ui.label(format!("Downloading MultiMusic {version}…"));
+                        ui.add(egui::ProgressBar::new(*done).desired_width(160.0).show_percentage());
+                    }
+                    UpdateStatus::Installing => {
+                        ui.spinner();
+                        ui.label(format!("Installing MultiMusic {version}. It starts again in a moment."));
+                    }
+                    UpdateStatus::Failed(why) => {
+                        ui.label(egui::RichText::new(format!("The update didn't work: {why}")).color(DANGER));
+                        if ui.button("Try again").clicked() {
+                            cx.actions.push(Action::Cmd(Command::InstallUpdate));
+                        }
+                        if ui.button("Download page").clicked() {
+                            cx.actions.push(Action::OpenUrl(page.clone()));
+                        }
+                    }
+                    _ => {
+                        ui.label(egui::RichText::new(format!("MultiMusic {version} is available")).strong());
+                        if crate::updater::can_install() {
+                            if widgets::pill(ui, "Update now", cx.accent, theme::on_color(cx.accent)).clicked() {
+                                cx.actions.push(Action::Cmd(Command::InstallUpdate));
+                            }
+                        } else {
+                            ui.label(
+                                egui::RichText::new("Update: git pull && makepkg -sif")
+                                    .small()
+                                    .color(TEXT_DIM),
+                            );
+                        }
+                        if ui.button("What's new").clicked() {
+                            cx.actions.push(Action::OpenUrl(page.clone()));
+                        }
+                        if ui.button("Skip this version").clicked() {
+                            *skipped = version.clone();
+                        }
+                    }
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if !matches!(update.status, UpdateStatus::Downloading(_) | UpdateStatus::Installing)
+                        && widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Later").clicked()
+                    {
+                        *dismissed = version.clone();
+                    }
+                });
+            });
+        });
+    ui.add_space(8.0);
+}
+
 pub fn toolbar(ui: &mut Ui, cx: &mut Cx, can_back: bool, can_forward: bool, search: Option<&mut SidebarState>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
     if let Some(st) = search {

@@ -232,7 +232,8 @@ pub fn apply_style(ctx: &egui::Context, accent: Color32) {
     });
 }
 
-/// Font files looked up in the usual Arch locations. The first family found wins.
+/// Font files looked up in the system's font folders (and the fonts that come with the Windows
+/// and macOS versions). The first family found wins.
 const TEXT_FONTS: &[(&str, &[&str])] = &[
     (
         "Inter",
@@ -247,6 +248,12 @@ const TEXT_FONTS: &[(&str, &[&str])] = &[
     ("Noto Sans", &["NotoSans-Regular.ttf"]),
     ("Cantarell", &["Cantarell-Regular.otf", "Cantarell-VF.otf"]),
     ("DejaVu Sans", &["DejaVuSans.ttf"]),
+    // Windows and macOS system fonts.
+    ("Segoe UI", &["segoeui.ttf"]),
+    (
+        "Helvetica Neue",
+        &["HelveticaNeue.ttc", "Helvetica.ttc", "Arial.ttf", "arial.ttf"],
+    ),
 ];
 const BOLD_FONTS: &[&str] = &[
     "Inter-SemiBold.ttf",
@@ -256,6 +263,10 @@ const BOLD_FONTS: &[&str] = &[
     "NotoSans-Bold.ttf",
     "Cantarell-Bold.otf",
     "DejaVuSans-Bold.ttf",
+    "seguisb.ttf",
+    "segoeuib.ttf",
+    "Arial Bold.ttf",
+    "arialbd.ttf",
 ];
 /// Fallbacks for symbols in names (☆, ✞, ♡, arrows, dingbats...) that text fonts lack.
 const SYMBOL_FONTS: &[&str] = &[
@@ -263,6 +274,8 @@ const SYMBOL_FONTS: &[&str] = &[
     "NotoSansSymbols-Regular.ttf",
     "DejaVuSans.ttf",
     "NotoSansMath-Regular.ttf",
+    "seguisym.ttf",
+    "Apple Symbols.ttf",
 ];
 /// Fallbacks for Japanese/Chinese/Korean titles, smallest first.
 const CJK_FONTS: &[&str] = &[
@@ -278,13 +291,47 @@ const CJK_FONTS: &[&str] = &[
     "ipag.ttf",
     "ipagp.ttf",
     "fonts-japanese-gothic.ttf",
+    // Windows
+    "YuGothM.ttc",
+    "msyh.ttc",
+    "meiryo.ttc",
+    "msgothic.ttc",
+    "malgun.ttf",
+    // macOS
+    "Hiragino Sans GB.ttc",
+    "ヒラギノ角ゴシック W3.ttc",
+    "AppleSDGothicNeo.ttc",
+    "Arial Unicode.ttf",
 ];
 
 fn font_dirs() -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/usr/share/fonts"),
-        PathBuf::from("/usr/local/share/fonts"),
-    ];
+    let mut dirs = Vec::new();
+    // Fonts that come with MultiMusic: next to the program (Windows) or in the app's
+    // Resources (macOS).
+    if let Some(dir) = crate::tools::exe_dir() {
+        dirs.push(dir.join("fonts"));
+        dirs.push(dir.join("..").join("Resources").join("fonts"));
+    }
+    if cfg!(windows) {
+        let windir = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+        dirs.push(windir.join("Fonts"));
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            dirs.push(PathBuf::from(local).join("Microsoft").join("Windows").join("Fonts"));
+        }
+        return dirs;
+    }
+    if cfg!(target_os = "macos") {
+        dirs.push(PathBuf::from("/System/Library/Fonts"));
+        dirs.push(PathBuf::from("/Library/Fonts"));
+        if let Some(home) = directories::BaseDirs::new() {
+            dirs.push(home.home_dir().join("Library").join("Fonts"));
+        }
+        return dirs;
+    }
+    dirs.push(PathBuf::from("/usr/share/fonts"));
+    dirs.push(PathBuf::from("/usr/local/share/fonts"));
     if let Some(home) = directories::BaseDirs::new() {
         dirs.push(home.data_dir().join("fonts"));
         dirs.push(home.home_dir().join(".fonts"));

@@ -2,7 +2,7 @@
 
 # MultiMusic
 
-A fast, lightweight, native music player for Arch Linux that puts **your local files, Spotify, SoundCloud and your Apple Music library** in one place, with **synced lyrics**, **Discord Rich Presence**, **Last.fm scrobbling** and media-key / MPRIS support.
+A fast, lightweight, native music player for **Windows, macOS and Arch Linux** that puts **your local files, Spotify, SoundCloud and your Apple Music library** in one place, with **synced lyrics**, **Discord Rich Presence**, **Last.fm scrobbling** and media-key / MPRIS support.
 
 It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast](https://spotifast.rocks/). There's no Electron and no web view, so it starts instantly and stays small in memory.
 
@@ -37,6 +37,19 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 - **MPRIS / media keys**: works with `playerctl`, waybar, polybar, KDE/GNOME media widgets and headset buttons.
 - **Its own look**: graphite and off-white like the logo, rounded "tile" panels, a floating player dock, header cards that glow in the colours of the cover, and soft hover and page transitions. **Drag the edges** of the sidebar and the lyrics / queue panel to resize them (sizes are remembered); drag the sidebar narrow and it becomes a strip of icons and covers. Also: a queue, back / forward navigation, albums and artists grids, gapless playback, ReplayGain, session restore, and drag and drop (drop a folder, `.m3u` or `Library.xml` onto the window). The accent colour can be changed in Settings.
 - **Low memory use**: cover art is decoded at the size it's drawn and kept in a small LRU cache, fonts are memory-mapped from your system, and only two runtime threads are used. The window doesn't redraw at all while nothing changes.
+
+## Install on Windows or macOS
+
+Download the newest release from the [Releases page](https://github.com/simo1337s/localmusicplayer/releases):
+
+- **Windows 10/11 (64-bit):** `MultiMusic-Setup-<version>-x64.exe`. It installs for your user (no administrator prompt), with everything MultiMusic needs: mpv for playback, yt-dlp and ffmpeg for downloads, and the Inter font. Start menu entry and an optional desktop shortcut included; uninstall from *Settings → Apps*. Your settings stay in `%APPDATA%\multimusic`.
+- **macOS 11 or newer:** `MultiMusic-<version>-macos-arm64.dmg` for Apple Silicon (M1/M2/M3/M4) or `MultiMusic-<version>-macos-intel.dmg` for Intel Macs. Open it and drag MultiMusic to Applications; mpv, yt-dlp and ffmpeg are inside the app. MultiMusic isn't notarized by Apple (that needs a paid developer account), so the first time macOS asks: right-click MultiMusic → **Open** → **Open**, or *System Settings → Privacy & Security → Open Anyway*.
+
+**Updates install themselves:** MultiMusic looks for a new release when it starts (and every few hours), shows a bar when one is out, and **Update now** downloads it, checks its SHA-256 checksum, installs it and starts the new version. Turn this off or check by hand under *Settings → Updates*. While the GitHub repository is private, updates need a GitHub token with read access there (*Settings → Updates*); once it's public, nothing is needed.
+
+Moving from another computer? Export your settings there and import them here (see [Back up or move your settings](#back-up-or-move-your-settings)).
+
+The installers are built by GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) from this repository: the Windows installer with Inno Setup, the macOS apps for Apple Silicon and Intel. Releases come from the version in `Cargo.toml`.
 
 ## Install (Arch Linux)
 
@@ -133,13 +146,13 @@ To keep memory low: lower *Covers kept in memory* in Settings → Appearance, an
 
 ## Files
 
-| What | Where |
-| --- | --- |
-| Settings | `~/.config/multimusic/config.toml` (also editable by hand) |
-| Library database, Spotify login, scrobble queue | `~/.local/share/multimusic/` |
-| Cover art and lyrics cache | `~/.cache/multimusic/` |
+| What | Linux | Windows | macOS |
+| --- | --- | --- | --- |
+| Settings (`config.toml`, also editable by hand) | `~/.config/multimusic/` | `%APPDATA%\multimusic\config\` | `~/Library/Application Support/multimusic/` |
+| Library database, Spotify login, scrobble queue, log | `~/.local/share/multimusic/` | `%APPDATA%\multimusic\data\` | `~/Library/Application Support/multimusic/` |
+| Cover art and lyrics cache | `~/.cache/multimusic/` | `%LOCALAPPDATA%\multimusic\cache\` | `~/Library/Caches/multimusic/` |
 
-Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
+Logs: on Linux run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal. The Windows and macOS apps write `multimusic.log` in the data folder (set `MULTIMUSIC_LOG=multimusic=debug` for more detail).
 
 ## Troubleshooting
 
@@ -158,7 +171,10 @@ Logs: run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal.
 - **A SoundCloud download fails**: Go+ songs only offer a 30 second preview or an encrypted stream, and neither is saved. Region-locked songs fail too. Other failures can be retried from the Downloads page.
 - **Why not save Spotify's own audio?** It is encrypted (DRM). Tools that decrypt it break Spotify's terms and get accounts banned, so MultiMusic downloads the same recording from YouTube or SoundCloud instead and tags it with Spotify's details.
 - **Japanese/Korean/Chinese text shows boxes**: install `noto-fonts-cjk`. MultiMusic loads a CJK font only when your library needs it.
-- **Media keys don't work**: MultiMusic registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has.
+- **Media keys don't work**: on Linux MultiMusic registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has. Windows (media overlay and keys) and macOS (Now Playing and keys) need nothing.
+- **macOS says MultiMusic "can't be opened" or "is damaged"**: it isn't notarized by Apple. Right-click it → Open → Open once, or run `xattr -dr com.apple.quarantine /Applications/MultiMusic.app` in Terminal.
+- **Windows: the window stays black or MultiMusic closes right away**: MultiMusic draws with OpenGL; update your graphics driver. Remote Desktop sessions and virtual machines without a graphics driver only offer OpenGL 1.1, which is too old. `%APPDATA%\multimusic\data\multimusic.log` says what went wrong.
+- **An update doesn't install**: *Settings → Updates* shows why. While the repository is private, the update check needs a GitHub token there. You can always download the newest version from the Releases page and install it over the old one; settings are kept.
 - **Interface too small or too large**: Settings → Appearance → *Interface scale*.
 
 ## How it works

@@ -1771,10 +1771,15 @@ fn downloads(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             }
             ui.add_space(18.0);
         }
+        let missing;
         let note = match st.ytdlp.map(|program| widgets::ytdlp_status(ui, cx, program)) {
             Some(Some(Err(_))) => {
-                "yt-dlp isn't installed, so Spotify and Apple Music songs are only looked for on SoundCloud. \
-                 Install it to find them on YouTube: sudo pacman -S yt-dlp"
+                missing = format!(
+                    "yt-dlp isn't installed, so Spotify and Apple Music songs are only looked for on SoundCloud. \
+                     To find them on YouTube too: {}",
+                    crate::tools::install_hint("yt-dlp")
+                );
+                missing.as_str()
             }
             Some(_) => {
                 "Spotify and Apple Music audio is DRM-protected, so those songs are saved from the same \
