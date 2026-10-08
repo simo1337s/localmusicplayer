@@ -557,6 +557,15 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
     let album_x = num_w + title_w + 16.0;
 
     if opts.show_header {
+        let list = list_key(opts.context, tracks);
+        let picked = ui.data_mut(|d| {
+            let sel = d.get_temp_mut_or_default::<Selection>(Id::new(("table-sel", opts.id)));
+            if sel.list == list {
+                sel.picked.iter().filter(|p| **p).count()
+            } else {
+                0
+            }
+        });
         let (hrect, _) = ui.allocate_exact_size(vec2(width, 32.0), Sense::hover());
         let f = theme::font(12.0);
         let p = ui.painter();
@@ -581,6 +590,15 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
                 "Album",
                 f.clone(),
                 TEXT_FAINT,
+            );
+        }
+        if picked > 1 {
+            p.text(
+                hrect.right_center() - vec2(dur_w + icons_w, 0.0),
+                Align2::RIGHT_CENTER,
+                format!("{picked} selected · Ctrl+C to copy"),
+                f.clone(),
+                TEXT_DIM,
             );
         }
         p.text(
@@ -609,7 +627,20 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
     let current_id = cx.player.current.as_ref().map(|t| t.id.as_str());
     let playing = cx.player.status == PlayStatus::Playing;
     let sel_id = Id::new(("table-sel", opts.id));
-    let selected: Option<usize> = ui.data(|d| d.get_temp(sel_id));
+    let list = list_key(opts.context, tracks);
+    let selected: Vec<bool> = ui.data_mut(|d| {
+        let sel = d.get_temp_mut_or_default::<Selection>(sel_id);
+        if sel.list != list {
+            *sel = Selection {
+                list,
+                ..Default::default()
+            };
+        }
+        (first..last).map(|i| sel.has(i)).collect()
+    });
+    if is_active_table(ui, opts.id) {
+        table_keys(ui, cx, tracks, opts, sel_id);
+    }
 
     for i in first..last {
         let t = tracks[i];
@@ -617,7 +648,7 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
         let resp = ui.interact(row, Id::new((opts.id, i)), Sense::click());
         let is_current = current_id == Some(t.id.as_str());
         let hovered = ui.rect_contains_pointer(row) || resp.context_menu_opened();
-        if selected == Some(i) {
+        if selected[i - first] {
             ui.painter().rect_filled(row, CornerRadius::same(10), SELECTED);
         } else {
             if is_current {
@@ -761,13 +792,326 @@ pub fn track_table(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts
                     play_from(cx, tracks, i, opts.context);
                 }
             } else {
-                ui.data_mut(|d| d.insert_temp(sel_id, i));
+                let m = ui.input(|i| i.modifiers);
+                ui.data_mut(|d| {
+                    d.get_temp_mut_or_default::<Selection>(sel_id)
+                        .click(i, n, m.command, m.shift)
+                });
+                make_active_table(ui, opts.id);
             }
         }
         if resp.double_clicked() {
             play_from(cx, tracks, i, opts.context);
         }
-        resp.context_menu(|ui| track_menu(ui, cx, t, Some((opts.playlist, i))));
+        // Right-clicking a row outside the selection picks just that row.
+        if resp.secondary_clicked() && !selected[i - first] {
+            ui.data_mut(|d| d.get_temp_mut_or_default::<Selection>(sel_id).click(i, n, false, false));
+            make_active_table(ui, opts.id);
+        }
+        resp.context_menu(|ui| {
+            let rows = ui.data(|d| d.get_temp::<Selection>(sel_id)).unwrap_or_default().rows(n);
+            if rows.len() > 1 && rows.contains(&i) {
+                selection_menu(ui, cx, tracks, &rows, opts.playlist);
+            } else {
+                track_menu(ui, cx, t, Some((opts.playlist, i)));
+            }
+        });
+    }
+}
+
+// ------------------------------------------------------------------ selecting and copying songs
+
+/// Rows picked in a track table: click, Ctrl-click, Shift-click or Ctrl+A.
+#[derive(Clone, Default)]
+struct Selection {
+    /// Picked rows; empty until something is picked.
+    picked: Vec<bool>,
+    anchor: usize,
+    /// The list the rows belong to: another (or a changed) list drops them.
+    list: u64,
+}
+
+impl Selection {
+    fn has(&self, i: usize) -> bool {
+        self.picked.get(i).copied().unwrap_or(false)
+    }
+
+    /// The picked rows, in order.
+    fn rows(&self, n: usize) -> Vec<usize> {
+        (0..n.min(self.picked.len())).filter(|i| self.picked[*i]).collect()
+    }
+
+    /// A click on row `i` of `n`: picks it alone, or with `toggle` (Ctrl) adds or drops it, or
+    /// with `range` (Shift) picks everything from the last clicked row to it.
+    fn click(&mut self, i: usize, n: usize, toggle: bool, range: bool) {
+        self.picked.resize(n, false);
+        if i >= n {
+            return;
+        }
+        if range {
+            let (a, b) = (self.anchor.min(i), self.anchor.max(i).min(n - 1));
+            if !toggle {
+                self.picked.fill(false);
+            }
+            self.picked[a..=b].fill(true);
+            return;
+        }
+        if toggle {
+            self.picked[i] = !self.picked[i];
+        } else {
+            self.picked.fill(false);
+            self.picked[i] = true;
+        }
+        self.anchor = i;
+    }
+
+    fn all(&mut self, n: usize) {
+        self.picked = vec![true; n];
+    }
+}
+
+/// Tells lists apart cheaply: what they are and their first and last songs.
+fn list_key(context: &str, tracks: &[&Track]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    context.hash(&mut h);
+    tracks.len().hash(&mut h);
+    tracks.first().map(|t| &t.id).hash(&mut h);
+    tracks.last().map(|t| &t.id).hash(&mut h);
+    h.finish()
+}
+
+const ACTIVE_TABLE: &str = "active-track-table";
+
+/// Whether keyboard shortcuts go to this table: the one last clicked, else the first one on
+/// the screen.
+fn is_active_table(ui: &Ui, table: &str) -> bool {
+    let me = Id::new(("track-table", table));
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| {
+        let active = d.get_temp_mut_or_insert_with(Id::new(ACTIVE_TABLE), || (me, pass));
+        // The active table wasn't drawn last time: it is gone from the screen.
+        if active.0 != me && active.1 + 1 < pass {
+            *active = (me, pass);
+        }
+        if active.0 == me {
+            active.1 = pass;
+        }
+        active.0 == me
+    })
+}
+
+fn make_active_table(ui: &Ui, table: &str) {
+    let pass = ui.ctx().cumulative_pass_nr();
+    ui.data_mut(|d| d.insert_temp(Id::new(ACTIVE_TABLE), (Id::new(("track-table", table)), pass)));
+}
+
+/// Ctrl+A picks every song, Ctrl+C copies the picked ones, Escape lets go of them. In your
+/// own playlists Ctrl+X cuts and Delete removes them.
+fn table_keys(ui: &Ui, cx: &mut Cx, tracks: &[&Track], opts: &TableOpts, sel_id: Id) {
+    if ui.ctx().text_edit_focused() {
+        return;
+    }
+    let (all, copy, cut, delete, escape) = ui.input(|i| {
+        let event = |want: &egui::Event| i.events.iter().any(|e| e == want);
+        (
+            i.modifiers.command && i.key_pressed(egui::Key::A),
+            event(&egui::Event::Copy),
+            event(&egui::Event::Cut),
+            i.key_pressed(egui::Key::Delete),
+            i.key_pressed(egui::Key::Escape),
+        )
+    });
+    // Escape closing a menu keeps the songs picked.
+    let escape = escape && !egui::Popup::is_any_open(ui.ctx());
+    if !(all || copy || cut || delete || escape) {
+        return;
+    }
+    let n = tracks.len();
+    let rows = ui.data_mut(|d| {
+        let sel = d.get_temp_mut_or_default::<Selection>(sel_id);
+        if all {
+            sel.all(n);
+        } else if escape {
+            sel.picked.clear();
+        }
+        sel.rows(n)
+    });
+    if rows.is_empty() {
+        return;
+    }
+    let own = opts.playlist.filter(|p| takes_songs(p));
+    if copy || (cut && own.is_some()) {
+        copy_songs(ui.ctx(), cx, rows.iter().map(|i| tracks[*i].clone()).collect());
+    }
+    if let Some(p) = own.filter(|_| cut || delete) {
+        remove_rows(cx, p, tracks, &rows);
+        ui.data_mut(|d| d.get_temp_mut_or_default::<Selection>(sel_id).picked.clear());
+    }
+}
+
+/// Your own playlists, which songs can be pasted into.
+pub fn takes_songs(p: &Playlist) -> bool {
+    matches!(p.kind, PlaylistKind::Custom | PlaylistKind::M3u)
+}
+
+fn remove_rows(cx: &mut Cx, p: &Playlist, tracks: &[&Track], rows: &[usize]) {
+    cx.actions.push(Action::Cmd(Command::RemoveFromPlaylist {
+        playlist_id: p.id.clone(),
+        rows: rows.iter().map(|i| (*i, tracks[*i].id.clone())).collect(),
+    }));
+}
+
+/// Songs copied with Ctrl+C, ready to paste into a playlist. They go on the system clipboard
+/// too, as links (`text`), so a paste can tell they came from here.
+#[derive(Default)]
+pub struct Copied {
+    pub tracks: Vec<Track>,
+    pub text: String,
+}
+
+const COPIED: &str = "copied-songs";
+
+/// The songs last copied.
+pub fn copied(ctx: &egui::Context) -> Option<std::sync::Arc<Copied>> {
+    ctx.data(|d| d.get_temp(Id::new(COPIED)))
+}
+
+pub fn copy_songs(ctx: &egui::Context, cx: &mut Cx, tracks: Vec<Track>) {
+    if tracks.is_empty() {
+        return;
+    }
+    let text = tracks.iter().map(song_link).collect::<Vec<_>>().join("\n");
+    ctx.copy_text(text.clone());
+    let count = songs(tracks.len());
+    ctx.data_mut(|d| d.insert_temp(Id::new(COPIED), std::sync::Arc::new(Copied { tracks, text })));
+    cx.actions.push(Action::Cmd(Command::Notify(format!(
+        "Copied {count}. Open one of your playlists and press Ctrl+V to add them"
+    ))));
+}
+
+/// "1 song" / "12 songs".
+pub fn songs(n: usize) -> String {
+    if n == 1 {
+        "1 song".into()
+    } else {
+        format!("{n} songs")
+    }
+}
+
+/// A song as a line of text: its web link, or a local file's path.
+pub fn song_link(t: &Track) -> String {
+    let link = match t.source {
+        Source::Spotify => {
+            t.id.strip_prefix("spotify:track:")
+                .map(|id| format!("https://open.spotify.com/track/{id}"))
+        }
+        Source::SoundCloud => t.uri.starts_with("http").then(|| t.uri.clone()),
+        Source::Local => Some(t.uri.clone()),
+        Source::AppleMusic => None,
+    };
+    link.unwrap_or_else(|| format!("{} - {}", t.artist, t.title))
+}
+
+/// Ctrl+V on one of your playlists adds the songs copied here, or the songs behind pasted
+/// Spotify / SoundCloud links or music files.
+pub fn paste_shortcut(ui: &Ui, cx: &mut Cx, p: &Playlist) {
+    if !takes_songs(p) || ui.ctx().text_edit_focused() {
+        return;
+    }
+    let pasted = ui.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Paste(text) => Some(text.clone()),
+            _ => None,
+        })
+    });
+    if let Some(text) = pasted {
+        paste(cx, p, Some(&text), copied(ui.ctx()));
+    }
+}
+
+/// Adds `text` (pasted) or else the copied songs to `p`.
+pub fn paste(cx: &mut Cx, p: &Playlist, text: Option<&str>, copied: Option<std::sync::Arc<Copied>>) {
+    let ours = copied.filter(|c| text.is_none_or(|t| t.trim() == c.text.trim()));
+    if let Some(c) = ours {
+        cx.actions.push(Action::Cmd(Command::AddToPlaylist {
+            playlist_id: p.id.clone(),
+            tracks: c.tracks.clone(),
+        }));
+        return;
+    }
+    let links: Vec<String> = text
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with('/') || l.starts_with("file://") || crate::links::target(l).is_some())
+        .map(String::from)
+        .collect();
+    if !links.is_empty() {
+        cx.actions.push(Action::Cmd(Command::AddLinksToPlaylist {
+            playlist_id: p.id.clone(),
+            links,
+        }));
+    }
+}
+
+/// The right-click menu for several picked songs.
+fn selection_menu(ui: &mut Ui, cx: &mut Cx, tracks: &[&Track], rows: &[usize], playlist: Option<&Playlist>) {
+    ui.set_min_width(220.0);
+    let picked = || rows.iter().map(|i| tracks[*i].clone()).collect::<Vec<Track>>();
+    let count = songs(rows.len());
+    ui.label(
+        egui::RichText::new(format!("{count} selected"))
+            .small()
+            .color(TEXT_FAINT),
+    );
+    if ui.button(theme::ic(icon::QUEUE, "Play next")).clicked() {
+        cx.actions.push(Action::Cmd(Command::PlayNext(picked())));
+        ui.close();
+    }
+    if ui.button(theme::ic(icon::LIST_PLUS, "Add to queue")).clicked() {
+        cx.actions.push(Action::Cmd(Command::Enqueue(picked())));
+        ui.close();
+    }
+    ui.menu_button(theme::ic(icon::PLUS, "Add to playlist"), |ui| {
+        ui.set_min_width(200.0);
+        if ui.button(theme::ic(icon::PLUS, "New playlist…")).clicked() {
+            cx.actions.push(Action::NewPlaylist(picked()));
+            ui.close();
+        }
+        ui.separator();
+        for p in cx.lib.playlists.iter().filter(|p| takes_songs(p)) {
+            if ui.button(&p.name).clicked() {
+                cx.actions.push(Action::Cmd(Command::AddToPlaylist {
+                    playlist_id: p.id.clone(),
+                    tracks: picked(),
+                }));
+                ui.close();
+            }
+        }
+    });
+    if ui.button(theme::ic(icon::COPY, "Copy  (Ctrl+C)")).clicked() {
+        copy_songs(ui.ctx(), cx, picked());
+        ui.close();
+    }
+    if let Some(p) = playlist.filter(|p| takes_songs(p)) {
+        if ui
+            .button(theme::ic(icon::TRASH, "Remove from this playlist  (Delete)"))
+            .clicked()
+        {
+            remove_rows(cx, p, tracks, rows);
+            ui.close();
+        }
+    }
+    let online: Vec<Track> = rows
+        .iter()
+        .map(|i| tracks[*i])
+        .filter(|t| t.source != Source::Local && !cx.feed.downloaded.contains_key(&t.id))
+        .cloned()
+        .collect();
+    if !online.is_empty() && ui.button(theme::ic(icon::DOWNLOAD_SIMPLE, "Download")).clicked() {
+        cx.actions.push(Action::Cmd(Command::Download(online)));
+        ui.close();
     }
 }
 
@@ -862,12 +1206,7 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             ui.close();
         }
         ui.separator();
-        for p in cx
-            .lib
-            .playlists
-            .iter()
-            .filter(|p| p.kind.is_editable() && p.kind != PlaylistKind::Liked)
-        {
+        for p in cx.lib.playlists.iter().filter(|p| takes_songs(p)) {
             if ui.button(&p.name).clicked() {
                 cx.actions.push(Action::Cmd(Command::AddToPlaylist {
                     playlist_id: p.id.clone(),
@@ -877,14 +1216,15 @@ pub fn track_menu(ui: &mut Ui, cx: &mut Cx, t: &Track, in_playlist: Option<(Opti
             }
         }
     });
+    if ui.button(theme::ic(icon::COPY, "Copy  (Ctrl+C)")).clicked() {
+        copy_songs(ui.ctx(), cx, vec![t.clone()]);
+        ui.close();
+    }
     if let Some((Some(p), idx)) = in_playlist {
-        if p.kind.is_editable()
-            && p.kind != PlaylistKind::Liked
-            && ui.button(theme::ic(icon::TRASH, "Remove from this playlist")).clicked()
-        {
+        if takes_songs(p) && ui.button(theme::ic(icon::TRASH, "Remove from this playlist")).clicked() {
             cx.actions.push(Action::Cmd(Command::RemoveFromPlaylist {
                 playlist_id: p.id.clone(),
-                index: idx,
+                rows: vec![(idx, t.id.clone())],
             }));
             ui.close();
         }
@@ -1000,4 +1340,65 @@ pub fn card_frame() -> egui::Frame {
         .fill(CARD)
         .corner_radius(CornerRadius::same(RADIUS))
         .inner_margin(egui::Margin::same(16))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picking_rows() {
+        let mut sel = Selection::default();
+        assert!(sel.rows(5).is_empty());
+        sel.click(1, 5, false, false);
+        assert_eq!(sel.rows(5), vec![1]);
+        // Shift: everything from the last clicked row.
+        sel.click(3, 5, false, true);
+        assert_eq!(sel.rows(5), vec![1, 2, 3]);
+        // Ctrl: add or drop one.
+        sel.click(2, 5, true, false);
+        assert_eq!(sel.rows(5), vec![1, 3]);
+        sel.click(0, 5, true, false);
+        assert_eq!(sel.rows(5), vec![0, 1, 3]);
+        // Ctrl+Shift adds a range to what is picked.
+        sel.click(4, 5, true, true);
+        assert_eq!(sel.rows(5), vec![0, 1, 2, 3, 4]);
+        // A plain click starts over.
+        sel.click(2, 5, false, false);
+        assert_eq!(sel.rows(5), vec![2]);
+        sel.all(5);
+        assert_eq!(sel.rows(5).len(), 5);
+        // A shorter list never reports rows past its end.
+        assert_eq!(sel.rows(3), vec![0, 1, 2]);
+        sel.click(9, 3, false, false);
+        assert!(!sel.has(9));
+    }
+
+    #[test]
+    fn songs_copy_as_links() {
+        let mut t = Track {
+            id: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
+            source: Source::Spotify,
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: String::new(),
+            duration_ms: 0,
+            track_no: None,
+            art: None,
+            uri: String::new(),
+            added_at: 0,
+        };
+        assert_eq!(song_link(&t), "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC");
+        t.source = Source::SoundCloud;
+        t.uri = "https://soundcloud.com/a/b".into();
+        assert_eq!(song_link(&t), "https://soundcloud.com/a/b");
+        t.source = Source::Local;
+        t.uri = "/music/a.flac".into();
+        assert_eq!(song_link(&t), "/music/a.flac");
+        t.source = Source::AppleMusic;
+        assert_eq!(song_link(&t), "Artist - Song");
+        // Every link a copy makes is understood by a paste.
+        assert!(crate::links::target("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC").is_some());
+        assert!(crate::links::target("https://soundcloud.com/a/b").is_some());
+    }
 }

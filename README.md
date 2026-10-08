@@ -24,7 +24,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
   - **M3U/M3U8** playlist import and export.
 - **Search everything at once**: one search box finds songs *and* artists in your library, on Spotify and on SoundCloud (artist profiles included, so small SoundCloud artists show up too). Results appear per service as soon as each one answers, Spotify and SoundCloud artists first; press **Enter** on an artist's exact name to jump straight to their page.
 - **Artist pages and links**: click any artist name to see all their songs in your library, or open their Spotify / SoundCloud / Apple Music page. Artist pages bring Spotify and SoundCloud together: a Spotify artist also shows their SoundCloud uploads, a SoundCloud profile also shows their Spotify releases, and a library artist gets a *More on Spotify & SoundCloud* section. The same song is shown once (a single that is also on an album, or a song on both services), while remixes, live and slowed versions stay. Profiles are matched by exact name only, so you never get someone else's songs. **Paste a link** into the search box to open it, e.g. `https://open.spotify.com/artist/…`, `https://soundcloud.com/someone`, a SoundCloud set, `https://music.apple.com/…/album/…`, a `spotify:` URI, or a `spotify.link` / `on.soundcloud.com` short link. Any page can be saved as a MultiMusic playlist.
-- **Custom playlists that mix sources**: drop a Spotify song, a SoundCloud upload and a FLAC into the same playlist. A cross-source **Liked Songs** collection (♥) also syncs likes back to Spotify and Last.fm.
+- **Custom playlists that mix sources**: drop a Spotify song, a SoundCloud upload and a FLAC into the same playlist. **Copy and paste songs** between lists: in any song list (a Spotify or SoundCloud playlist, an album, search results) press **Ctrl+A** (or Ctrl/Shift-click songs) and **Ctrl+C**, open one of your playlists and press **Ctrl+V**. Pasting Spotify or SoundCloud links (songs, albums or playlists, e.g. copied in the Spotify app) or music files from a file manager works too. In your playlists, **Delete** removes the selected songs and **Ctrl+X** cuts them. A cross-source **Liked Songs** collection (♥) also syncs likes back to Spotify and Last.fm.
 - **Synced lyrics**: reads `.lrc` files next to your music, then embedded lyrics tags, then [LRCLIB](https://lrclib.net), and finally [Genius](https://genius.com) (plain lyrics) for songs LRCLIB doesn't have. Lyrics are shown in a side panel and in a full-screen *Now playing* view with a large cover. Click a line to jump to it.
 - **Discord Rich Presence** shows "Listening to <song>" with the album cover, a progress bar and an "Open in Spotify/SoundCloud" button. Works with the Discord app, Vesktop and arRPC.
 - **Crossfade** (Settings → Playback, up to 12 s) between any two sources: local file into Spotify, Spotify into SoundCloud, Spotify into Spotify, and so on. The next song starts on a second player while the current one fades out. Songs of the same album stay gapless unless you tick *Also crossfade between songs of the same album*. Skipping, seeking or pausing during a fade ends it right away.
@@ -100,10 +100,13 @@ Everything is under **Settings** (bottom of the sidebar).
 | `Ctrl+K`, `Ctrl+F` or `/` | Search (paste a link to open it) |
 | `Alt+←` / `Alt+→`, mouse back / forward buttons | Back / forward |
 | `L` | Toggle the full-screen *Now playing* / lyrics view |
-| `Esc` | Leave the *Now playing* view |
+| `Esc` | Leave the *Now playing* view, or let go of selected songs |
+| `Ctrl+A` / `Ctrl+C` | Select every song in a list / copy the selected songs |
+| `Ctrl+V` | Paste copied songs (or Spotify / SoundCloud links, or music files) into the open playlist |
+| `Ctrl+X` / `Delete` | Cut / remove the selected songs from your playlist |
 | `Ctrl+Q` | Quit |
 
-Double-click a song to play it. Click an artist name to open the artist. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like* and *Open in Spotify / Show in folder*. Drag the sidebar or the right panel by its edge to resize it; drag the sidebar narrow (or click the logo) for the compact icons-and-covers strip.
+Double-click a song to play it. Ctrl-click or Shift-click songs to select several. Click an artist name to open the artist. Right-click a song for *Play next*, *Add to queue*, *Add to playlist*, *Like* and *Open in Spotify / Show in folder*. Drag the sidebar or the right panel by its edge to resize it; drag the sidebar narrow (or click the logo) for the compact icons-and-covers strip.
 
 ## Memory use
 

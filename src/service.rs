@@ -62,15 +62,25 @@ pub enum Command {
         playlist_id: String,
         tracks: Vec<Track>,
     },
+    /// Removes rows of a playlist: each one's position and song (the song wins when the
+    /// position no longer holds it).
     RemoveFromPlaylist {
         playlist_id: String,
-        index: usize,
+        rows: Vec<(usize, String)>,
+    },
+    /// Adds the songs behind pasted links (Spotify or SoundCloud songs, albums and playlists,
+    /// or music files), in order.
+    AddLinksToPlaylist {
+        playlist_id: String,
+        links: Vec<String>,
     },
     RenamePlaylist {
         playlist_id: String,
         name: String,
     },
     DeletePlaylist(String),
+    /// Shows a message (for things the UI does on its own, like copying songs).
+    Notify(String),
     ImportM3u(PathBuf),
     ExportM3u {
         playlist_id: String,
@@ -360,6 +370,11 @@ enum Internal {
     SoundCloudSynced(Result<SoundCloudSync>),
     AppleImported(Result<(Vec<Track>, Vec<ImportedPlaylist>)>),
     M3uImported(Result<ImportedPlaylist>),
+    LinksResolved {
+        playlist_id: String,
+        tracks: Vec<Track>,
+        failed: usize,
+    },
     ScanDone(library::scanner::ScanResult),
     Lyrics {
         track_id: String,
@@ -870,31 +885,26 @@ impl Service {
                 self.save_playlists(vec![p], &[]);
                 self.shared.info(format!("Created playlist “{name}”"));
             }
-            Command::AddToPlaylist { playlist_id, tracks } => {
-                self.store_tracks(&tracks);
-                let updated = {
-                    let mut lib = self.shared.library.write().unwrap();
-                    lib.playlist_mut(&playlist_id).map(|p| {
-                        p.track_ids.extend(tracks.iter().map(|t| t.id.clone()));
-                        if p.art.is_none() {
-                            p.art = tracks.iter().find_map(|t| t.art.clone());
-                        }
-                        p.clone()
-                    })
-                };
-                if let Some(p) = updated {
-                    self.shared.info(format!("Added {} to “{}”", tracks.len(), p.name));
-                    self.save_playlists(vec![p], &[]);
-                }
-            }
-            Command::RemoveFromPlaylist { playlist_id, index } => {
+            Command::AddToPlaylist { playlist_id, tracks } => self.add_to_playlist(&playlist_id, &tracks),
+            Command::AddLinksToPlaylist { playlist_id, links } => self.add_links_to_playlist(playlist_id, links),
+            Command::RemoveFromPlaylist { playlist_id, mut rows } => {
                 let updated = {
                     let mut lib = self.shared.library.write().unwrap();
                     lib.playlist_mut(&playlist_id).and_then(|p| {
-                        (index < p.track_ids.len()).then(|| {
-                            p.track_ids.remove(index);
-                            p.clone()
-                        })
+                        let before = p.track_ids.len();
+                        // Last rows first, so the earlier positions still hold.
+                        rows.sort_by_key(|row| std::cmp::Reverse(row.0));
+                        for (index, id) in rows {
+                            let at = if p.track_ids.get(index) == Some(&id) {
+                                Some(index)
+                            } else {
+                                p.track_ids.iter().position(|t| *t == id)
+                            };
+                            if let Some(at) = at {
+                                p.track_ids.remove(at);
+                            }
+                        }
+                        (p.track_ids.len() != before).then(|| p.clone())
                     })
                 };
                 if let Some(p) = updated {
@@ -913,6 +923,7 @@ impl Service {
                     self.save_playlists(vec![p], &[]);
                 }
             }
+            Command::Notify(text) => self.shared.info(text),
             Command::DeletePlaylist(id) => {
                 if id != LIKED_ID {
                     self.save_playlists(vec![], &[id]);
@@ -2640,6 +2651,62 @@ impl Service {
         });
     }
 
+    // ---------------------------------------------------------------- playlists
+
+    fn add_to_playlist(&mut self, playlist_id: &str, tracks: &[Track]) {
+        self.store_tracks(tracks);
+        let updated = {
+            let mut lib = self.shared.library.write().unwrap();
+            lib.playlist_mut(playlist_id).map(|p| {
+                p.track_ids.extend(tracks.iter().map(|t| t.id.clone()));
+                if p.art.is_none() {
+                    p.art = tracks.iter().find_map(|t| t.art.clone());
+                }
+                p.clone()
+            })
+        };
+        if let Some(p) = updated {
+            let songs = if tracks.len() == 1 {
+                "1 song".to_string()
+            } else {
+                format!("{} songs", tracks.len())
+            };
+            self.shared.info(format!("Added {songs} to “{}”", p.name));
+            self.save_playlists(vec![p], &[]);
+        }
+    }
+
+    fn add_links_to_playlist(&mut self, playlist_id: String, links: Vec<String>) {
+        use futures_util::StreamExt;
+        let spotify_links = links.iter().any(|l| l.contains("spotify"));
+        let session = (spotify_links && self.cfg.spotify.enabled && self.spotify_auth.has_login())
+            .then(|| self.spotify_session())
+            .flatten();
+        let soundcloud = self.soundcloud.clone();
+        let http = self.http.clone();
+        let shared = self.shared.clone();
+        let tx = self.internal_tx.clone();
+        if links.len() > 1 {
+            self.shared
+                .info(format!("Adding the songs behind {} links…", links.len()));
+        }
+        tokio::spawn(async move {
+            let lookups = links.into_iter().map(|link| {
+                let (session, soundcloud, http, shared) =
+                    (session.clone(), soundcloud.clone(), http.clone(), shared.clone());
+                async move { songs_behind_link(&link, session.as_ref(), &soundcloud, &http, &shared).await }
+            });
+            let found: Vec<Option<Vec<Track>>> = futures_util::stream::iter(lookups).buffered(6).collect().await;
+            let failed = found.iter().filter(|f| f.is_none()).count();
+            let tracks = found.into_iter().flatten().flatten().collect();
+            let _ = tx.send(Internal::LinksResolved {
+                playlist_id,
+                tracks,
+                failed,
+            });
+        });
+    }
+
     // ---------------------------------------------------------------- pages
 
     fn set_page(&self, page: PageState) {
@@ -3427,6 +3494,26 @@ impl Service {
                 Ok((songs, playlists)) => self.merge_apple(songs, playlists),
                 Err(e) => self.shared.error(format!("Apple Music import failed: {e:#}")),
             },
+            Internal::LinksResolved {
+                playlist_id,
+                tracks,
+                failed,
+            } => {
+                if !tracks.is_empty() {
+                    self.add_to_playlist(&playlist_id, &tracks);
+                }
+                if failed > 0 {
+                    let spotify = if self.spotify_auth.has_login() {
+                        ""
+                    } else {
+                        " (Spotify links need a Spotify login)"
+                    };
+                    self.shared.error(format!(
+                        "Couldn't find the songs behind {failed} pasted link{}{spotify}",
+                        if failed == 1 { "" } else { "s" }
+                    ));
+                }
+            }
             Internal::M3uImported(r) => match r {
                 Ok(p) => {
                     let name = p.name.clone();
@@ -3845,6 +3932,51 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
         external_url: links::web_url(&format!("spotify:{}:{id}", links::kind_name(kind))),
         ..Default::default()
     })
+}
+
+/// The songs a pasted line stands for: a Spotify or SoundCloud song, album or playlist link, or
+/// a music file (a path or a `file://` link from a file manager). `None` when it can't be found.
+async fn songs_behind_link(
+    line: &str,
+    session: Option<&librespot_core::session::Session>,
+    soundcloud: &SoundCloud,
+    http: &reqwest::Client,
+    shared: &Shared,
+) -> Option<Vec<Track>> {
+    let line = line.trim();
+    let path = match line.strip_prefix("file://") {
+        Some(rest) => urlencoding::decode(rest).map_or_else(|_| rest.to_string(), |p| p.into_owned()),
+        None => line.to_string(),
+    };
+    if path.starts_with('/') {
+        let path = PathBuf::from(path);
+        if !library::scanner::is_audio_file(&path) || !path.is_file() {
+            return None;
+        }
+        let id = Track::local_id(&path.to_string_lossy());
+        if let Some(known) = shared.library.read().unwrap().get(&id).cloned() {
+            return Some(vec![known]);
+        }
+        let read = tokio::task::spawn_blocking(move || library::scanner::read_track(&path, None, now_unix()));
+        return read.await.ok().map(|t| vec![t]);
+    }
+    let mut target = links::target(line)?;
+    if let Target::Short(url) = &target {
+        target = links::target(&expand_short_link(http, url).await.ok()?)?;
+    }
+    match target {
+        Target::Spotify(kind @ (LinkKind::Track | LinkKind::Album | LinkKind::Playlist), id) => {
+            let page = spotify_page(session?.clone(), kind, &id);
+            let page = tokio::time::timeout(Duration::from_secs(45), page).await.ok()?.ok()?;
+            Some(page.tracks)
+        }
+        Target::SoundCloudUrl(url) => match soundcloud.resolve_url(&url).await.ok()? {
+            ScResolved::Track(t) => Some(vec![t]),
+            ScResolved::Playlist(p) => Some(p.tracks),
+            ScResolved::User(_) => None,
+        },
+        _ => None,
+    }
 }
 
 /// What Last.fm gets for a song. A SoundCloud upload that is also released on Spotify is sent
@@ -4475,6 +4607,42 @@ mod tests {
             ..t.clone()
         };
         assert_eq!(lastfm_track(None, sc).await.album, "Downloads");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pasted_files_and_links_become_songs() {
+        let dir = std::env::temp_dir().join(format!("multimusic-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Bladee - Waster.mp3");
+        std::fs::write(&path, b"no tags").unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let sc = SoundCloud::new(http.clone(), "", "");
+        let shared = Shared::default();
+        let paste = |line: String| {
+            let (sc, http, shared) = (&sc, &http, &shared);
+            async move { songs_behind_link(&line, None, sc, http, shared).await }
+        };
+        // A path, or a file manager's file:// link.
+        let found = paste(path.to_string_lossy().into()).await.unwrap();
+        assert_eq!(
+            (found[0].artist.as_str(), found[0].title.as_str()),
+            ("Bladee", "Waster")
+        );
+        let link = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(paste(link).await.unwrap()[0].id, found[0].id);
+        // A song already in the library comes from there.
+        let mut known = found[0].clone();
+        known.title = "Known".into();
+        shared.library.write().unwrap().tracks.insert(known.id.clone(), known);
+        assert_eq!(paste(path.to_string_lossy().into()).await.unwrap()[0].title, "Known");
+        // Not music, gone, or a Spotify link without a session.
+        assert!(paste(dir.to_string_lossy().into()).await.is_none());
+        assert!(paste("/nowhere/x.mp3".into()).await.is_none());
+        assert!(paste("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC".into())
+            .await
+            .is_none());
+        assert!(paste("hello".into()).await.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

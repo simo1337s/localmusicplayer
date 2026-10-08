@@ -752,6 +752,7 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         if play || shuffle {
             play_list(cx, &tracks, shuffle, &p.name);
         }
+        widgets::paste_shortcut(ui, cx, p);
         if p.kind == PlaylistKind::AppleMusic {
             ui.label(
                 egui::RichText::new("Apple Music songs play from your local files, Spotify or SoundCloud")
@@ -763,6 +764,8 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         if tracks.is_empty() {
             let msg = if p.kind == PlaylistKind::Liked {
                 "Songs you like (♥) from any source show up here"
+            } else if widgets::takes_songs(p) {
+                "This playlist is empty. Copy songs anywhere (Ctrl+A, Ctrl+C) and press Ctrl+V here"
             } else {
                 "This playlist is empty"
             };
@@ -793,6 +796,12 @@ fn playlist_actions(ui: &mut Ui, cx: &mut Cx, p: &Playlist) {
             }
         }
         PlaylistKind::Custom | PlaylistKind::M3u => {
+            if let Some(copied) = widgets::copied(ui.ctx()) {
+                let tip = format!("Paste {} (Ctrl+V)", widgets::songs(copied.tracks.len()));
+                if widgets::icon_button(ui, icon::CLIPBOARD_TEXT, 22.0, TEXT_DIM, &tip).clicked() {
+                    widgets::paste(cx, p, None, Some(copied));
+                }
+            }
             if widgets::icon_button(ui, icon::PENCIL_SIMPLE, 22.0, TEXT_DIM, "Rename").clicked() {
                 cx.actions.push(Action::Rename(p.id.clone(), p.name.clone()));
             }

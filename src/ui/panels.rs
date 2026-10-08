@@ -382,6 +382,17 @@ fn playlist_row(ui: &mut Ui, cx: &mut Cx, p: &crate::model::Playlist, view: &Vie
                 .push(Action::Cmd(Command::Enqueue(cx.lib.tracks_for(&p.track_ids))));
             ui.close();
         }
+        if ui.button(theme::ic(icon::COPY, "Copy songs")).clicked() {
+            widgets::copy_songs(ui.ctx(), cx, cx.lib.tracks_for(&p.track_ids));
+            ui.close();
+        }
+        if let Some(copied) = widgets::copied(ui.ctx()).filter(|_| widgets::takes_songs(p)) {
+            let label = format!("Paste {}", widgets::songs(copied.tracks.len()));
+            if ui.button(theme::ic(icon::CLIPBOARD_TEXT, &label)).clicked() {
+                widgets::paste(cx, p, None, Some(copied));
+                ui.close();
+            }
+        }
         ui.separator();
         if p.kind.is_editable() {
             if ui.button(theme::ic(icon::PENCIL_SIMPLE, "Rename")).clicked() {
