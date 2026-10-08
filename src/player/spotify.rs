@@ -90,6 +90,15 @@ impl SpotifyAuth {
         self.state.lock().unwrap().refresh.is_some()
     }
 
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// The Redirect URI sent to Spotify, exactly.
+    pub fn redirect(&self) -> &str {
+        &self.redirect
+    }
+
     /// Opens the browser for the Spotify login page and waits for the redirect.
     /// Starting a new login cancels a previous one that is still waiting.
     pub async fn login(&self) -> Result<String> {

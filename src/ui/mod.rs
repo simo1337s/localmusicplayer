@@ -242,7 +242,16 @@ impl App {
     fn apply(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Cmd(c) => self.send(c),
+                Action::Cmd(c) => {
+                    // Settings typed a moment ago (e.g. a redirect URI right before clicking
+                    // Authorize) must reach the service before the command does.
+                    if self.cfg != self.sent_cfg {
+                        self.send(Command::UpdateConfig(Box::new(self.cfg.clone())));
+                        self.sent_cfg = self.cfg.clone();
+                        self.cfg_changed_at = None;
+                    }
+                    self.send(c)
+                }
                 Action::Go(v) => self.go(v),
                 Action::Back => self.back(),
                 Action::Forward => self.forward(),

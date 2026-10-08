@@ -10,6 +10,7 @@ use anyhow::{bail, Context, Result};
 use librespot_core::session::Session;
 use tracing::{info, warn};
 
+use crate::integrations::genius::{self, Match};
 use crate::integrations::lyrics::{self, LyricsFetcher};
 use crate::library::tags::{self, Metadata};
 use crate::model::{Source, Track};
@@ -58,7 +59,8 @@ impl Downloader {
                 let saved = self.soundcloud.download(track, work, progress).await?;
                 let original = saved.kind == DownloadKind::Original;
                 let from = if original { "original file" } else { "SoundCloud" };
-                (saved.path, saved.meta, from.to_string(), original)
+                let meta = upload_details(track, saved.meta).await;
+                (saved.path, meta, from.to_string(), original)
             }
             Source::Spotify | Source::AppleMusic => {
                 let (path, from) = self.find_and_download(track, work, progress).await?;
@@ -177,6 +179,36 @@ impl Downloader {
         }
         None
     }
+}
+
+/// A SoundCloud upload without release details: "Artist - Title [Free DL]" titles cleaned up,
+/// then the album and release date from Genius when it has the song by the same artist.
+async fn upload_details(track: &Track, mut meta: Metadata) -> Metadata {
+    if !meta.album.trim().is_empty() {
+        return meta;
+    }
+    let (artist, title) = crate::integrations::lastfm::scrobble_names(track);
+    if !artist.is_empty() && !title.is_empty() {
+        meta.artist = artist.clone();
+        meta.album_artist = lyrics::first_artist(&artist);
+        meta.title = title.clone();
+    }
+    let found = genius::shared()
+        .find(
+            &lyrics::first_artist(&artist),
+            &lyrics::clean_title(&title),
+            Match::SameArtist,
+        )
+        .await;
+    if let Some(song) = found {
+        meta.album = song.album;
+        if meta.date.is_empty() {
+            meta.date = song.release_date;
+        }
+        // The upload's own artwork stays first; the album cover is the fallback.
+        meta.cover_urls.extend(song.art);
+    }
+    meta
 }
 
 /// Details from the library's copy of the song (no Spotify session, or Apple Music).

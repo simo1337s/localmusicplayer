@@ -368,6 +368,25 @@ mod tests {
     }
 
     #[test]
+    fn redirect_uri_without_a_path_is_sent_as_is() {
+        // Spotify compares character by character: no slash may be added.
+        let r = parse_redirect("http://127.0.0.1:1337").unwrap();
+        assert_eq!(
+            (r.uri.as_str(), r.port, r.path.as_str()),
+            ("http://127.0.0.1:1337", 1337, "/")
+        );
+        let url = authorize_url(
+            "b9793ae53d764abeb54f4f0950b25cb1",
+            &r.uri,
+            &["user-library-read"],
+            "c",
+            "s",
+        );
+        assert!(url.contains("&redirect_uri=http%3A%2F%2F127.0.0.1%3A1337&"), "{url}");
+        assert!(url.contains("client_id=b9793ae53d764abeb54f4f0950b25cb1&"), "{url}");
+    }
+
+    #[test]
     fn redirect_uris() {
         let r = parse_redirect("http://127.0.0.1:8899/login").unwrap();
         assert_eq!((r.host, r.port, r.path.as_str()), ("127.0.0.1", 8899, "/login"));

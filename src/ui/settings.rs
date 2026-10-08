@@ -216,7 +216,9 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         ui,
                         "If Spotify says \"redirect_uri: Not matching configuration\", your app doesn't list the Redirect URI \
                          above: on developer.spotify.com open the app → Settings → Edit, add it under Redirect URIs exactly as \
-                         shown (127.0.0.1, not localhost), click Add, then Save at the bottom, and Authorize again.",
+                         shown (127.0.0.1, not localhost), click Add, then scroll down and click Save (the URI only counts \
+                         after Save), and Authorize again. The line above shows exactly what MultiMusic sent. The Client \
+                         secret is not needed.",
                     );
                     ui.add_space(8.0);
                     ui.label(RichText::new("Login client").strong());
@@ -421,7 +423,10 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 }
                 ui.checkbox(&mut cfg.playback.replaygain, "Use ReplayGain tags (local files)");
                 ui.checkbox(&mut cfg.lyrics.enabled, "Show lyrics");
-                ui.checkbox(&mut cfg.lyrics.online, "Fetch lyrics from LRCLIB when there are no local lyrics");
+                ui.checkbox(
+                    &mut cfg.lyrics.online,
+                    "Fetch lyrics online when there are no local lyrics (LRCLIB, then Genius)",
+                );
                 text_field(ui, "mpv binary", &mut cfg.playback.mpv_path, "mpv", false);
                 if !st.devices_requested {
                     st.devices_requested = true;

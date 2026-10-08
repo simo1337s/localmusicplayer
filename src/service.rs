@@ -12,6 +12,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use crate::config::{Config, Paths};
 use crate::downloader::{self, Downloader, Saved};
 use crate::integrations::discord::{Discord, Presence};
+use crate::integrations::genius;
 use crate::integrations::lastfm::{Lastfm, ScrobbleTracker};
 use crate::integrations::lyrics::LyricsFetcher;
 use crate::integrations::mpris::Mpris;
@@ -588,11 +589,9 @@ impl Service {
             &cfg.soundcloud.client_id,
             &cfg.soundcloud.oauth_token,
         ));
-        let lyrics = Arc::new(LyricsFetcher::new(
-            http.clone(),
-            paths.lyrics_cache(),
-            cfg.lyrics.online,
-        ));
+        let lyrics = Arc::new(
+            LyricsFetcher::new(http.clone(), paths.lyrics_cache(), cfg.lyrics.online).with_genius(genius::shared()),
+        );
         let lastfm = make_lastfm(&cfg, &http, &paths);
         let discord = Discord::spawn(
             cfg.discord.enabled,
@@ -2289,9 +2288,14 @@ impl Service {
                 .error("Enter your Spotify app's client ID in Settings → Spotify → Advanced first");
             return;
         };
+        // Show exactly what goes to Spotify, so a mismatch with the app's settings is visible.
         self.set_account(
             |f| &mut f.spotify_web_api,
-            AccountStatus::Working("Waiting for browser login…".into()),
+            AccountStatus::Working(format!(
+                "Waiting for browser login… (sent Client ID {} and Redirect URI {})",
+                auth.client_id(),
+                auth.redirect()
+            )),
         );
         let shared = self.shared.clone();
         tokio::spawn(async move {
@@ -3123,11 +3127,10 @@ impl Service {
             ));
         }
         if old.lyrics != self.cfg.lyrics {
-            self.lyrics = Arc::new(LyricsFetcher::new(
-                self.http.clone(),
-                self.paths.lyrics_cache(),
-                self.cfg.lyrics.online,
-            ));
+            self.lyrics = Arc::new(
+                LyricsFetcher::new(self.http.clone(), self.paths.lyrics_cache(), self.cfg.lyrics.online)
+                    .with_genius(genius::shared()),
+            );
         }
         if old.spotify.web_api_client_id != self.cfg.spotify.web_api_client_id
             || old.spotify.web_api_redirect() != self.cfg.spotify.web_api_redirect()
@@ -3462,7 +3465,8 @@ fn make_lastfm(cfg: &Config, http: &reqwest::Client, paths: &Paths) -> Option<Ar
         l.api_secret.trim(),
         if l.enabled { l.session_key.trim() } else { "" },
         paths.data_dir.join("scrobble-queue.json"),
-    );
+    )
+    .with_genius(genius::shared());
     Some(Arc::new(lfm))
 }
 

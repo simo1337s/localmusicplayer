@@ -13,7 +13,11 @@ use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::model::{now_unix, Track};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use crate::integrations::genius::{Genius, Match};
+use crate::model::{now_unix, Source, Track};
 
 pub const API_ROOT: &str = "https://ws.audioscrobbler.com/2.0/";
 const AUTH_URL: &str = "https://www.last.fm/api/auth/";
@@ -162,6 +166,108 @@ pub fn ignored_reasons(v: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+/// Artist and title as Last.fm knows them. SoundCloud uploads are often titled
+/// "Artist - Title [Free DL]" and posted by a label, a fan or a repost channel, so for those
+/// the artist comes from the title and upload tags are dropped.
+pub fn scrobble_names(track: &Track) -> (String, String) {
+    let artist = scrobble_artist(&track.artist).to_string();
+    let title = track.title.trim().to_string();
+    // Official releases on SoundCloud come with proper credits (and an album).
+    if track.source != Source::SoundCloud || !track.album.trim().is_empty() {
+        return (artist, title);
+    }
+    let title = strip_upload_tags(&title);
+    if let Some((left, right)) = title.split_once(" - ") {
+        let (left, right) = (left.trim(), right.trim());
+        let lower = right.to_lowercase();
+        // "Song - Live", "Song - Slowed": a version, not "Artist - Song".
+        let version = VERSION_WORDS
+            .iter()
+            .any(|w| lower == *w || lower.ends_with(&format!(" {w}")));
+        if !left.is_empty() && !right.is_empty() && !version {
+            return (main_credit(left).to_string(), right.to_string());
+        }
+    }
+    (artist, title)
+}
+
+const VERSION_WORDS: &[&str] = &[
+    "live",
+    "remix",
+    "edit",
+    "mix",
+    "slowed",
+    "sped up",
+    "reverb",
+    "demo",
+    "acoustic",
+    "instrumental",
+    "remastered",
+    "remaster",
+    "bootleg",
+    "flip",
+    "vip",
+    "rework",
+    "cover",
+    "extended",
+    "version",
+];
+
+/// "A ft. B" / "A feat. B" -> "A".
+fn main_credit(artist: &str) -> &str {
+    let lower = artist.to_lowercase();
+    [" feat. ", " feat ", " ft. ", " ft ", " featuring ", " (feat", " (ft"]
+        .iter()
+        .filter_map(|sep| lower.find(sep))
+        .min()
+        .map_or(artist, |i| artist[..i].trim())
+}
+
+/// Drops "[Free DL]", "(Official Audio)", "(prod. X)" and similar from an upload's title.
+fn strip_upload_tags(title: &str) -> String {
+    const TAGS: &[&str] = &[
+        "free",
+        "download",
+        "dl",
+        "out now",
+        "premiere",
+        "exclusive",
+        "official",
+        "video",
+        "audio",
+        "prod",
+        "produced",
+        "lyrics",
+        "hq",
+        "320",
+    ];
+    let mut out = String::new();
+    let mut rest = title;
+    while let Some(start) = rest.find(['[', '(']) {
+        let close = if rest[start..].starts_with('[') { ']' } else { ')' };
+        let Some(len) = rest[start..].find(close) else { break };
+        let inner = rest[start + 1..start + len].to_lowercase();
+        let words: Vec<&str> = inner
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let tag = TAGS.iter().any(|t| {
+            if t.contains(' ') {
+                inner.contains(t)
+            } else {
+                words.contains(t)
+            }
+        });
+        out.push_str(&rest[..start]);
+        if !tag {
+            out.push_str(&rest[start..=start + len]);
+        }
+        rest = &rest[start + len + 1..];
+    }
+    out.push_str(rest);
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Last.fm prefers the main artist: "A, B" -> "A".
 pub fn scrobble_artist(artist: &str) -> &str {
     let artist = artist.trim();
@@ -188,14 +294,13 @@ pub struct QueuedScrobble {
 impl QueuedScrobble {
     /// `None` when the track lacks an artist or title (Last.fm would reject it).
     pub fn from_track(track: &Track, started_at: i64) -> Option<Self> {
-        let artist = scrobble_artist(&track.artist);
-        let title = track.title.trim();
+        let (artist, title) = scrobble_names(track);
         if artist.is_empty() || title.is_empty() {
             return None;
         }
         Some(QueuedScrobble {
-            artist: artist.to_string(),
-            track: title.to_string(),
+            artist,
+            track: title,
             album: track.album.trim().to_string(),
             duration: track.duration_ms.saturating_add(500) / 1000,
             timestamp: started_at,
@@ -295,6 +400,11 @@ pub struct Lastfm {
     queue_path: PathBuf,
     /// Serializes access to the queue file.
     queue_lock: tokio::sync::Mutex<()>,
+    root: String,
+    /// Albums Last.fm knows for "artist\u{1f}title" (lowercase); `None` = it doesn't.
+    albums: Mutex<HashMap<String, Option<String>>>,
+    /// The real artist, title and album of SoundCloud uploads.
+    genius: Option<std::sync::Arc<Genius>>,
 }
 
 impl Lastfm {
@@ -307,6 +417,83 @@ impl Lastfm {
             session_key: (!session_key.is_empty()).then(|| session_key.to_string()),
             queue_path,
             queue_lock: tokio::sync::Mutex::new(()),
+            root: API_ROOT.to_string(),
+            albums: Mutex::new(HashMap::new()),
+            genius: None,
+        }
+    }
+
+    pub fn with_genius(mut self, genius: std::sync::Arc<Genius>) -> Self {
+        self.genius = Some(genius);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_root(mut self, root: &str) -> Self {
+        self.root = root.to_string();
+        self
+    }
+
+    /// The album Last.fm has for this song (`track.getInfo`), for songs that come without one
+    /// (most SoundCloud uploads). Last.fm and apps built on it (e.g. .fmbot) take the cover art
+    /// from the album, so a scrobble without one shows no art.
+    async fn known_album(&self, artist: &str, title: &str) -> Option<String> {
+        let key = format!("{}\u{1f}{}", artist.to_lowercase(), title.to_lowercase());
+        if let Some(found) = self.albums.lock().unwrap().get(&key) {
+            return found.clone();
+        }
+        let params = vec![
+            ("artist".to_string(), artist.to_string()),
+            ("track".to_string(), title.to_string()),
+            ("autocorrect".to_string(), "1".to_string()),
+        ];
+        let answer = tokio::time::timeout(Duration::from_secs(8), self.get("track.getInfo", params)).await;
+        let album = match answer {
+            Ok(Ok(v)) => v
+                .pointer("/track/album/title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_string),
+            // "Track not found" is an answer too.
+            Ok(Err(e)) if api_error_code(&e).is_some() => None,
+            // Network trouble: don't remember anything.
+            _ => return None,
+        };
+        let mut albums = self.albums.lock().unwrap();
+        if albums.len() > 2000 {
+            albums.clear();
+        }
+        albums.insert(key, album.clone());
+        album
+    }
+
+    /// Makes a SoundCloud upload look like the song it is (Genius knows the real artist, title
+    /// and album), then fills in a missing album from Last.fm itself.
+    async fn complete(&self, s: &mut QueuedScrobble, track: &Track) {
+        let upload = track.source == Source::SoundCloud && track.album.trim().is_empty();
+        if let Some(genius) = self.genius.as_ref().filter(|_| upload) {
+            if let Some(song) = genius.find(&s.artist, &s.track, Match::Upload).await {
+                tracing::debug!(
+                    "lastfm: {} - {} is {} - {} on Genius",
+                    s.artist,
+                    s.track,
+                    song.artist,
+                    song.title
+                );
+                if !song.artist.is_empty() && !song.title.is_empty() {
+                    s.artist = song.artist;
+                    s.track = song.title;
+                }
+                if !song.album.is_empty() {
+                    s.album = song.album;
+                }
+            }
+        }
+        if s.album.is_empty() {
+            if let Some(album) = self.known_album(&s.artist, &s.track).await {
+                s.album = album;
+            }
         }
     }
 
@@ -346,12 +533,12 @@ impl Lastfm {
 
     async fn get(&self, method: &str, params: Vec<(String, String)>) -> anyhow::Result<Value> {
         let params = self.signed(method, params, false)?;
-        self.send(self.http.get(API_ROOT).query(&params)).await
+        self.send(self.http.get(&self.root).query(&params)).await
     }
 
     async fn post(&self, method: &str, params: Vec<(String, String)>, with_session: bool) -> anyhow::Result<Value> {
         let params = self.signed(method, params, with_session)?;
-        self.send(self.http.post(API_ROOT).form(&params)).await
+        self.send(self.http.post(&self.root).form(&params)).await
     }
 
     /// `auth.getToken`: a request token the user approves at [`Lastfm::auth_url`].
@@ -383,9 +570,10 @@ impl Lastfm {
 
     /// `track.updateNowPlaying`. Tracks without artist/title are silently skipped.
     pub async fn now_playing(&self, track: &Track) -> anyhow::Result<()> {
-        let Some(s) = QueuedScrobble::from_track(track, 0) else {
+        let Some(mut s) = QueuedScrobble::from_track(track, 0) else {
             return Ok(());
         };
+        self.complete(&mut s, track).await;
         let mut params = vec![("artist".into(), s.artist), ("track".into(), s.track)];
         if !s.album.is_empty() {
             params.push(("album".into(), s.album));
@@ -419,13 +607,14 @@ impl Lastfm {
     /// session queue the scrobble for later; transient ones return `Ok(())`. After a
     /// successful scrobble the queue is flushed too.
     pub async fn scrobble(&self, track: &Track, started_at: i64) -> anyhow::Result<Option<String>> {
-        let Some(s) = QueuedScrobble::from_track(track, started_at) else {
+        let Some(mut s) = QueuedScrobble::from_track(track, started_at) else {
             tracing::debug!("lastfm: not scrobbling {:?}: missing artist or title", track.id);
             return Ok(None);
         };
         if !self.is_authenticated() {
             anyhow::bail!("not logged in to Last.fm");
         }
+        self.complete(&mut s, track).await;
         match self.submit(std::slice::from_ref(&s)).await {
             Ok(ignored) => {
                 if let Err(e) = self.flush_queue().await {
@@ -732,6 +921,151 @@ mod tests {
                 "duration[1]"
             ]
         );
+    }
+
+    fn upload(title: &str, uploader: &str) -> Track {
+        Track {
+            id: "soundcloud:1".into(),
+            source: Source::SoundCloud,
+            title: title.into(),
+            artist: uploader.into(),
+            album: String::new(),
+            duration_ms: 200_000,
+            track_no: None,
+            art: None,
+            uri: "https://soundcloud.com/x/y".into(),
+            added_at: 0,
+        }
+    }
+
+    #[test]
+    fn soundcloud_upload_names() {
+        let names = |t: &Track| scrobble_names(t);
+        assert_eq!(
+            names(&upload("Bladee - Waster [Free DL]", "drainfan99")),
+            ("Bladee".into(), "Waster".into())
+        );
+        assert_eq!(
+            names(&upload(
+                "Yung Lean ft. Bladee - Hennessy & Sailor Moon (prod. Gud)",
+                "sadboys"
+            )),
+            ("Yung Lean".into(), "Hennessy & Sailor Moon".into())
+        );
+        // Versions, not "Artist - Song".
+        assert_eq!(
+            names(&upload("Waster - Slowed", "bladee")),
+            ("bladee".into(), "Waster - Slowed".into())
+        );
+        assert_eq!(
+            names(&upload("Be Nice 2 Me - Live", "Bladee")),
+            ("Bladee".into(), "Be Nice 2 Me - Live".into())
+        );
+        // Plain titles, remix brackets kept.
+        assert_eq!(
+            names(&upload("Waster (Remix)", "bladee")),
+            ("bladee".into(), "Waster (Remix)".into())
+        );
+        // Official releases (with an album) and other sources are left alone.
+        let mut official = upload("Artist - Song", "Label");
+        official.album = "Album".into();
+        assert_eq!(names(&official), ("Label".into(), "Artist - Song".into()));
+        assert_eq!(names(&track("A, B", "X - Y")), ("A".into(), "X - Y".into()));
+    }
+
+    /// A SoundCloud re-upload is scrobbled under the real artist and title with an album
+    /// (from Genius), and a fan upload gets its album from Last.fm.
+    #[tokio::test]
+    async fn soundcloud_scrobbles_get_real_details() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                // Read the whole request (headers and form body).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text
+                            .lines()
+                            .find_map(|l| {
+                                l.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf).to_string();
+                let line = request.lines().next().unwrap_or("").to_string();
+                let path = line.split(' ').nth(1).unwrap_or("").to_string();
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                log.lock().unwrap().push(format!("{path} {body}"));
+                let reply = if path.starts_with("/api/search/song") && path.contains("Angel") {
+                    r#"{"response":{"sections":[{"type":"song","hits":[{"type":"song","result":{"_type":"song","id":7,
+                        "title":"Angel with a Shotgun","artist_names":"The Cab","primary_artist":{"name":"The Cab"},
+                        "url":"https://genius.com/The-cab-angel-with-a-shotgun-lyrics"}}]}]}}"#
+                        .to_string()
+                } else if path.starts_with("/api/search/song") {
+                    r#"{"response":{"sections":[{"type":"song","hits":[]}]}}"#.to_string()
+                } else if path == "/api/songs/7" {
+                    r#"{"response":{"song":{"album":{"name":"Symphony Soldier"},"release_date":"2011-08-23"}}}"#
+                        .to_string()
+                } else if path.contains("method=track.getInfo") {
+                    r#"{"track":{"name":"Waster","album":{"artist":"Bladee","title":"Icedancer"}}}"#.to_string()
+                } else {
+                    r##"{"scrobbles":{"scrobble":{"track":{"#text":"x"},"ignoredMessage":{"code":"0","#text":""}},"@attr":{"accepted":1,"ignored":0}}}"##
+                        .to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let genius = std::sync::Arc::new(crate::integrations::genius::Genius::new(http.clone()).with_root(&base));
+        let lfm = Lastfm::new(http, "key", "secret", "session", temp_path("queue.json"))
+            .with_root(&format!("{base}/2.0/"))
+            .with_genius(genius);
+
+        let ignored = lfm
+            .scrobble(&upload("Angel With A Shotgun", "Nightcore Reality"), 1_700_000_000)
+            .await
+            .unwrap();
+        assert_eq!(ignored, None);
+        lfm.now_playing(&upload("Bladee - Waster [Free DL]", "drainfan99"))
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        let scrobble = seen
+            .iter()
+            .find(|r| r.contains("method=track.scrobble"))
+            .expect("scrobbled");
+        assert!(scrobble.contains("artist%5B0%5D=The+Cab"), "{scrobble}");
+        assert!(scrobble.contains("track%5B0%5D=Angel+with+a+Shotgun"), "{scrobble}");
+        assert!(scrobble.contains("album%5B0%5D=Symphony+Soldier"), "{scrobble}");
+        let playing = seen
+            .iter()
+            .find(|r| r.contains("method=track.updateNowPlaying"))
+            .expect("now playing sent");
+        assert!(playing.contains("artist=Bladee"), "{playing}");
+        assert!(playing.contains("track=Waster"), "{playing}");
+        assert!(playing.contains("album=Icedancer"), "{playing}");
     }
 
     #[test]

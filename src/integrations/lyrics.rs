@@ -19,6 +19,7 @@ use crate::model::{now_unix, LyricLine, Lyrics, Source, Track};
 pub const PROVIDER_SIDECAR: &str = "Sidecar file";
 pub const PROVIDER_EMBEDDED: &str = "Embedded tag";
 pub const PROVIDER_LRCLIB: &str = "LRCLIB";
+pub const PROVIDER_GENIUS: &str = "Genius";
 
 const LRCLIB_GET: &str = "https://lrclib.net/api/get";
 const LRCLIB_SEARCH: &str = "https://lrclib.net/api/search";
@@ -430,6 +431,13 @@ pub fn to_tag_text(l: &Lyrics) -> String {
         .join("\n")
 }
 
+/// Artist and title to look a song up by: SoundCloud upload names cleaned up, the first
+/// credited artist and the title without "(feat. …)" / version suffixes.
+pub fn song_names(track: &Track) -> (String, String) {
+    let (artist, title) = crate::integrations::lastfm::scrobble_names(track);
+    (first_artist(&artist), clean_title(&title))
+}
+
 /// The first credited artist ("A, B" / "A & B" / "A feat. B" -> "A").
 pub fn first_artist(artist: &str) -> String {
     let artist = artist.trim();
@@ -612,6 +620,8 @@ pub struct LyricsFetcher {
     http: reqwest::Client,
     cache_dir: PathBuf,
     online: bool,
+    /// Plain lyrics when LRCLIB has none.
+    genius: Option<std::sync::Arc<crate::integrations::genius::Genius>>,
 }
 
 impl LyricsFetcher {
@@ -623,7 +633,13 @@ impl LyricsFetcher {
             http,
             cache_dir,
             online,
+            genius: None,
         }
+    }
+
+    pub fn with_genius(mut self, genius: std::sync::Arc<crate::integrations::genius::Genius>) -> Self {
+        self.genius = Some(genius);
+        self
     }
 
     pub fn cache_path(&self, track: &Track) -> PathBuf {
@@ -692,10 +708,20 @@ impl LyricsFetcher {
             return None;
         }
 
-        match self.fetch_lrclib(track).await {
-            Ok(found) => {
-                self.store_cached(track, found.as_ref(), now).await;
-                found
+        let lrclib = self.fetch_lrclib(track).await;
+        if let Ok(Some(found)) = lrclib {
+            self.store_cached(track, Some(&found), now).await;
+            return Some(found);
+        }
+        // Genius has plain (not time-synced) lyrics for far more songs.
+        if let Some(found) = self.fetch_genius(track).await {
+            self.store_cached(track, Some(&found), now).await;
+            return Some(found);
+        }
+        match lrclib {
+            Ok(_) => {
+                self.store_cached(track, None, now).await;
+                None
             }
             Err(e) => {
                 tracing::warn!(
@@ -708,6 +734,24 @@ impl LyricsFetcher {
         }
     }
 
+    async fn fetch_genius(&self, track: &Track) -> Option<Lyrics> {
+        let genius = self.genius.as_ref()?;
+        let (artist, title) = song_names(track);
+        match genius.lyrics(&artist, &title).await {
+            Ok(Some(text)) => Some(Lyrics {
+                synced: Vec::new(),
+                plain: text,
+                instrumental: false,
+                provider: PROVIDER_GENIUS.to_string(),
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::debug!("lyrics: Genius lookup for {artist} - {title} failed: {e:#}");
+                None
+            }
+        }
+    }
+
     /// Exact metadata first, then a cleaned title / first artist. `Err` means at least one
     /// lookup failed for a transient reason, so a negative result must not be cached.
     async fn fetch_lrclib(&self, track: &Track) -> anyhow::Result<Option<Lyrics>> {
@@ -715,8 +759,11 @@ impl LyricsFetcher {
         let exact = (track.artist.trim().to_string(), track.title.trim().to_string());
         let cleaned = (first_artist(&track.artist), clean_title(&track.title));
         let mut attempts = vec![exact];
-        if cleaned != attempts[0] && !cleaned.1.is_empty() {
-            attempts.push(cleaned);
+        // SoundCloud uploads: "Artist - Title [Free DL]" posted by someone else.
+        for pair in [cleaned, song_names(track)] {
+            if !attempts.contains(&pair) && !pair.1.is_empty() {
+                attempts.push(pair);
+            }
         }
 
         let mut error = None;
