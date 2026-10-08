@@ -466,7 +466,8 @@ impl Lastfm {
             session_key: (!session_key.is_empty()).then(|| session_key.to_string()),
             queue_path,
             queue_lock: tokio::sync::Mutex::new(()),
-            root: API_ROOT.to_string(),
+            // Tests of the whole app point this at a stand-in for Last.fm.
+            root: std::env::var("MULTIMUSIC_LASTFM_API").unwrap_or_else(|_| API_ROOT.to_string()),
             albums: Mutex::new(HashMap::new()),
             covers: Mutex::new(HashMap::new()),
             genius: None,
@@ -479,7 +480,7 @@ impl Lastfm {
     }
 
     #[cfg(test)]
-    fn with_root(mut self, root: &str) -> Self {
+    pub(crate) fn with_root(mut self, root: &str) -> Self {
         self.root = root.to_string();
         self
     }
@@ -631,6 +632,18 @@ impl Lastfm {
 
     async fn get(&self, method: &str, params: Vec<(String, String)>) -> anyhow::Result<Value> {
         let params = self.signed(method, params, false)?;
+        self.send(self.http.get(&self.root).query(&params)).await
+    }
+
+    /// A read-only call (`user.getInfo`, `user.getTopArtists`, …), which needs the API key but
+    /// no signature or login.
+    pub(crate) async fn public(&self, method: &str, mut params: Vec<(String, String)>) -> anyhow::Result<Value> {
+        if self.api_key.is_empty() {
+            anyhow::bail!("Last.fm API key not configured");
+        }
+        params.push(("method".into(), method.into()));
+        params.push(("api_key".into(), self.api_key.clone()));
+        params.push(("format".into(), "json".into()));
         self.send(self.http.get(&self.root).query(&params)).await
     }
 

@@ -133,8 +133,13 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, size: SidebarSiz
                     );
                 }
             }
-            // The playlist list fills the space above Settings.
-            let list_h = (ui.available_height() - 50.0).max(40.0);
+            // The playlist list fills the space above Settings (or the Last.fm account card).
+            let bottom = match (super::profile::username(cx.feed).is_some(), st.collapsed) {
+                (false, _) => 50.0,
+                (true, false) => 66.0,
+                (true, true) => 92.0,
+            };
+            let list_h = (ui.available_height() - bottom).max(40.0);
             let view = st.view.clone();
             let collapsed = st.collapsed;
             ui.allocate_ui(vec2(ui.available_width(), list_h), |ui| {
@@ -163,7 +168,9 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, size: SidebarSiz
                     });
             });
             ui.add_space(6.0);
-            nav_item(ui, cx, icon::GEAR, "Settings", View::Settings, st.view, st.collapsed);
+            if !super::profile::sidebar_account(ui, cx, st.view, st.collapsed) {
+                nav_item(ui, cx, icon::GEAR, "Settings", View::Settings, st.view, st.collapsed);
+            }
         })
         .response
         .rect

@@ -401,6 +401,9 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.horizontal(|ui| {
                     let connected = matches!(cx.feed.lastfm, AccountStatus::Connected(_));
                     if connected {
+                        if ui.button(theme::ic(icon::CHART_BAR, "Your stats")).clicked() {
+                            cx.actions.push(Action::Go(super::View::Profile));
+                        }
                         if ui.button("Disconnect").clicked() {
                             cx.actions.push(Action::Cmd(Command::LastfmLogout));
                         }

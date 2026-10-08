@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::integrations::lastfm_stats::{ActivityRange, Period};
+
 /// Spotify's own desktop client id. librespot uses it for streaming, and it is
 /// allowed to request the library/playlist scopes too, so no developer app is needed.
 pub const SPOTIFY_DEFAULT_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
@@ -301,6 +303,20 @@ pub struct UiConfig {
     pub right_panel_width: f32,
     /// Max decoded cover images kept in memory.
     pub art_cache_size: usize,
+    /// The periods picked on the Last.fm profile page.
+    pub profile: ProfilePrefs,
+}
+
+/// What each part of the Last.fm profile page shows.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ProfilePrefs {
+    pub summary: Period,
+    pub activity: ActivityRange,
+    pub artists: Period,
+    pub albums: Period,
+    pub tracks: Period,
+    pub genres: Period,
 }
 
 impl Default for UiConfig {
@@ -314,6 +330,7 @@ impl Default for UiConfig {
             sidebar_width: 248.0,
             right_panel_width: 352.0,
             art_cache_size: 200,
+            profile: ProfilePrefs::default(),
         }
     }
 }

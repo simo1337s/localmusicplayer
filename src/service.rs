@@ -14,6 +14,7 @@ use crate::downloader::{self, Downloader, Saved};
 use crate::integrations::discord::{Discord, Presence};
 use crate::integrations::genius;
 use crate::integrations::lastfm::{Lastfm, ScrobbleTracker};
+use crate::integrations::lastfm_stats::{ArtLookup, ProfileFeed, ProfileStats, StatsData, StatsRequest};
 use crate::integrations::lyrics::LyricsFetcher;
 use crate::integrations::mpris::Mpris;
 use crate::library::{self, liked_playlist, Db, Library, LIKED_ID};
@@ -128,6 +129,12 @@ pub enum Command {
     SyncSoundCloud,
     LastfmLogin,
     LastfmLogout,
+    /// Loads (or reloads, once it's old) something the Last.fm profile page shows.
+    LastfmStats(StatsRequest),
+    /// Looks up pictures for artists (title empty) and songs Last.fm lists without one.
+    LastfmPictures(Vec<(String, String)>),
+    /// Loads everything on the profile page again.
+    RefreshLastfmProfile,
     Search(String),
     /// Load an artist / album / playlist / song page: a page key or a pasted link.
     OpenPage(String),
@@ -332,6 +339,8 @@ pub struct Feed {
     pub spotify_web_api: AccountStatus,
     pub soundcloud: AccountStatus,
     pub lastfm: AccountStatus,
+    /// The Last.fm profile page: stats loaded so far.
+    pub profile: ProfileFeed,
     pub scan: Option<(usize, usize)>,
     /// mpv output devices as (id, description), filled on request.
     pub audio_devices: Vec<(String, String)>,
@@ -474,6 +483,17 @@ enum Internal {
         result: Result<String>,
     },
     LastfmSession(Result<(String, String)>),
+    LastfmStats {
+        user: String,
+        request: StatsRequest,
+        result: Result<StatsData, String>,
+    },
+    LastfmPicture {
+        user: String,
+        artist: String,
+        title: String,
+        found: Option<String>,
+    },
     Quality {
         track_id: String,
         quality: Option<AudioQuality>,
@@ -627,6 +647,8 @@ pub struct Service {
     soundcloud: Arc<SoundCloud>,
     lyrics: Arc<LyricsFetcher>,
     lastfm: Option<Arc<Lastfm>>,
+    /// Loads the profile page's stats (made when first needed).
+    profile_stats: Option<Arc<ProfileStats>>,
     scrobble: ScrobbleTracker,
     discord: Discord,
     mpris: Mpris,
@@ -751,6 +773,7 @@ impl Service {
             soundcloud,
             lyrics,
             lastfm,
+            profile_stats: None,
             scrobble: {
                 let mut tracker = ScrobbleTracker::new();
                 tracker.set_instant(cfg.lastfm.scrobble_instantly);
@@ -1092,7 +1115,20 @@ impl Service {
                 self.cfg.lastfm.username.clear();
                 self.save_config();
                 self.lastfm = make_lastfm(&self.cfg, &self.http, &self.paths);
+                self.profile_stats = None;
+                self.shared.feed.write().unwrap().profile = ProfileFeed::default();
                 self.publish_accounts();
+            }
+            Command::LastfmStats(request) => self.lastfm_stats(request),
+            Command::LastfmPictures(wanted) => self.lastfm_pictures(wanted),
+            Command::RefreshLastfmProfile => {
+                let mut feed = self.shared.feed.write().unwrap();
+                for fetch in feed.profile.stats.values_mut() {
+                    fetch.at = None;
+                    fetch.error = None;
+                }
+                drop(feed);
+                self.shared.repaint();
             }
             Command::Search(q) => self.search(q),
             Command::OpenPage(key) => self.open_page(key),
@@ -4086,7 +4122,150 @@ impl Service {
                 }
                 Err(e) => self.set_account(|f| &mut f.lastfm, AccountStatus::Error(format!("{e:#}"))),
             },
+            Internal::LastfmStats { user, request, result } => {
+                let mut feed = self.shared.feed.write().unwrap();
+                if feed.profile.user == user {
+                    let fetch = feed.profile.stats.entry(request).or_default();
+                    fetch.loading = false;
+                    fetch.at = Some(Instant::now());
+                    match result {
+                        Ok(data) => {
+                            fetch.data = Some(data);
+                            fetch.error = None;
+                        }
+                        Err(e) => {
+                            tracing::warn!("lastfm: {request:?}: {e}");
+                            fetch.error = Some(e);
+                        }
+                    }
+                }
+                drop(feed);
+                self.shared.repaint();
+            }
+            Internal::LastfmPicture {
+                user,
+                artist,
+                title,
+                found,
+            } => {
+                let mut feed = self.shared.feed.write().unwrap();
+                if feed.profile.user == user {
+                    let key = crate::integrations::lastfm_stats::art_key(&artist, &title);
+                    feed.profile
+                        .art
+                        .insert(key, found.map(ArtLookup::Found).unwrap_or(ArtLookup::Missing));
+                }
+                drop(feed);
+                self.shared.repaint();
+            }
         }
+    }
+
+    /// The stats loader for the signed-in Last.fm account (`None` when not signed in or the
+    /// API key is missing). Switching accounts starts the profile page over.
+    fn profile_stats(&mut self) -> Option<Arc<ProfileStats>> {
+        let lastfm = self.lastfm.clone()?;
+        let user = self.cfg.lastfm.username.trim().to_string();
+        if user.is_empty() || self.cfg.lastfm.session_key.is_empty() {
+            return None;
+        }
+        if let Some(stats) = self.profile_stats.as_ref().filter(|s| s.serves(&lastfm, &user)) {
+            return Some(stats.clone());
+        }
+        let stats = Arc::new(ProfileStats::new(lastfm, &user));
+        self.profile_stats = Some(stats.clone());
+        let mut feed = self.shared.feed.write().unwrap();
+        if feed.profile.user != user {
+            feed.profile = ProfileFeed {
+                user,
+                ..ProfileFeed::default()
+            };
+        }
+        Some(stats)
+    }
+
+    fn lastfm_stats(&mut self, request: StatsRequest) {
+        let Some(stats) = self.profile_stats() else {
+            // Say why instead of being asked again and again.
+            let why = if self.lastfm.is_none() {
+                "Add your Last.fm API key and secret in Settings"
+            } else {
+                "Connect your Last.fm account in Settings"
+            };
+            let mut feed = self.shared.feed.write().unwrap();
+            let fetch = feed.profile.stats.entry(request).or_default();
+            if fetch.wanted(request) {
+                fetch.error = Some(why.into());
+                fetch.at = Some(Instant::now());
+            }
+            return;
+        };
+        {
+            let mut feed = self.shared.feed.write().unwrap();
+            let fetch = feed.profile.stats.entry(request).or_default();
+            if !fetch.wanted(request) {
+                return;
+            }
+            fetch.loading = true;
+        }
+        self.shared.repaint();
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let result = stats.load(request).await.map_err(|e| friendly_lastfm_error(&e));
+            let _ = tx.send(Internal::LastfmStats {
+                user: stats.user.clone(),
+                request,
+                result,
+            });
+        });
+    }
+
+    fn lastfm_pictures(&mut self, wanted: Vec<(String, String)>) {
+        let Some(stats) = self.profile_stats() else { return };
+        let mut feed = self.shared.feed.write().unwrap();
+        for (artist, title) in wanted {
+            let key = crate::integrations::lastfm_stats::art_key(&artist, &title);
+            if feed.profile.art.contains_key(&key) || artist.trim().is_empty() {
+                continue;
+            }
+            feed.profile.art.insert(key, ArtLookup::Pending);
+            let stats = stats.clone();
+            let tx = self.internal_tx.clone();
+            tokio::spawn(async move {
+                let found = stats.picture(&artist, &title).await;
+                let _ = tx.send(Internal::LastfmPicture {
+                    user: stats.user.clone(),
+                    artist,
+                    title,
+                    found,
+                });
+            });
+        }
+    }
+}
+
+/// Why the profile page couldn't load something, in a few words.
+fn friendly_lastfm_error(e: &anyhow::Error) -> String {
+    let offline = e.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_connect() || r.is_timeout())
+    });
+    if offline {
+        return "Can't reach Last.fm right now".into();
+    }
+    match e.downcast_ref::<crate::integrations::lastfm::LastfmError>() {
+        Some(crate::integrations::lastfm::LastfmError::Api { code: 29, .. }) => {
+            "Last.fm asked to slow down; trying again in a minute".into()
+        }
+        Some(crate::integrations::lastfm::LastfmError::Api { code: 10 | 26, .. }) => {
+            "Last.fm doesn't accept the API key in Settings".into()
+        }
+        Some(crate::integrations::lastfm::LastfmError::Api { code: 17, .. }) => {
+            "This profile's listening history is private on Last.fm".into()
+        }
+        Some(crate::integrations::lastfm::LastfmError::Api { message, .. }) => message.clone(),
+        _ => format!("{e:#}"),
     }
 }
 

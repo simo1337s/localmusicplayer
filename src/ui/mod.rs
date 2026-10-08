@@ -2,6 +2,7 @@
 
 mod art;
 mod panels;
+mod profile;
 mod settings;
 mod tag_editor;
 pub mod theme;
@@ -39,6 +40,8 @@ pub enum View {
     NowPlaying,
     Downloads,
     Settings,
+    /// Last.fm stats of the signed-in account.
+    Profile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,6 +883,12 @@ impl eframe::App for App {
                     }
                     if self.view == View::Settings {
                         settings::show(ui, &mut cx, &mut self.cfg, &mut self.settings, &self.paths, self.rss_mb);
+                    } else if self.view == View::Profile {
+                        let before = self.cfg.ui.profile;
+                        profile::page(ui, &mut cx, &mut self.cfg.ui.profile);
+                        if self.cfg.ui.profile != before {
+                            self.cfg_changed_at = Some(Instant::now());
+                        }
                     } else {
                         let custom = self.cfg.downloads.folder.trim();
                         let download_dir = if custom.is_empty() {

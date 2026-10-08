@@ -39,12 +39,12 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         View::Page(key) => remote_page(ui, cx, st, &key),
         View::NowPlaying => now_playing(ui, cx),
         View::Downloads => downloads(ui, cx, st),
-        View::Settings => {}
+        View::Settings | View::Profile => {}
     }
 }
 
 /// Scrollable page below the toolbar.
-fn page(ui: &mut Ui, id: &str, content: impl FnOnce(&mut Ui, Rect, f32)) {
+pub(super) fn page(ui: &mut Ui, id: &str, content: impl FnOnce(&mut Ui, Rect, f32)) {
     egui::ScrollArea::vertical()
         .id_salt(id)
         .auto_shrink([false, false])
@@ -107,6 +107,7 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
         let playlists: Vec<&Playlist> = cx.lib.playlists.iter().filter(|p| !p.track_ids.is_empty()).collect();
         if playlists.is_empty() && cx.lib.local.is_empty() {
             onboarding(ui, cx);
+            super::profile::home_card(ui, cx);
             return;
         }
 
@@ -208,6 +209,9 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
             let albums: Vec<&Album> = cx.lib.albums.iter().take(n).collect();
             album_grid(ui, cx, &albums);
         }
+
+        // You on Last.fm, near the bottom.
+        super::profile::home_card(ui, cx);
     });
 }
 
@@ -408,7 +412,7 @@ struct Header<'a> {
 }
 
 /// The largest title size (Spotify-style 64 → 24 px) that fits on one line.
-fn title_size(ui: &Ui, title: &str, width: f32) -> f32 {
+pub(super) fn title_size(ui: &Ui, title: &str, width: f32) -> f32 {
     for size in [34.0, 28.0, 24.0] {
         let galley = ui
             .painter()
