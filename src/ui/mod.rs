@@ -830,12 +830,14 @@ impl eframe::App for App {
         let typed = self.search_text.trim().to_string();
         if self.view == View::Search && typed != self.search_sent && !crate::links::looks_like_link(&typed) {
             let changed = *self.search_changed_at.get_or_insert_with(Instant::now);
-            if changed.elapsed() > Duration::from_millis(300) {
+            if changed.elapsed() > Duration::from_millis(200) {
                 self.search_sent = typed;
                 self.search_changed_at = None;
                 actions.push(Action::Cmd(Command::Search(self.search_sent.clone())));
             } else {
-                ctx.request_repaint_after(Duration::from_millis(100));
+                ctx.request_repaint_after(
+                    Duration::from_millis(200).saturating_sub(changed.elapsed()) + Duration::from_millis(10),
+                );
             }
         }
 

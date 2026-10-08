@@ -128,6 +128,20 @@ fn parse_response(status: u16, body: &str) -> anyhow::Result<Value> {
     json.context("Last.fm returned invalid JSON")
 }
 
+/// Whether an `album.getInfo` answer has a real cover (not empty, not Last.fm's grey star).
+pub fn album_has_cover(v: &Value) -> bool {
+    const PLACEHOLDER: &str = "2a96cbd8b46e442fc41c2b86b821562f";
+    v.pointer("/album/image")
+        .and_then(Value::as_array)
+        .is_some_and(|images| {
+            images.iter().any(|i| {
+                i.get("#text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with("http") && !url.contains(PLACEHOLDER))
+            })
+        })
+}
+
 /// Why Last.fm ignored scrobbles in a `track.scrobble` answer (`ignoredMessage` codes).
 pub fn ignored_reasons(v: &serde_json::Value) -> Vec<String> {
     let scrobbles = match v.pointer("/scrobbles/scrobble") {
@@ -403,6 +417,8 @@ pub struct Lastfm {
     root: String,
     /// Albums Last.fm knows for "artist\u{1f}title" (lowercase); `None` = it doesn't.
     albums: Mutex<HashMap<String, Option<String>>>,
+    /// Whether Last.fm has a cover for "artist\u{1f}album" (lowercase).
+    covers: Mutex<HashMap<String, bool>>,
     /// The real artist, title and album of SoundCloud uploads.
     genius: Option<std::sync::Arc<Genius>>,
 }
@@ -419,6 +435,7 @@ impl Lastfm {
             queue_lock: tokio::sync::Mutex::new(()),
             root: API_ROOT.to_string(),
             albums: Mutex::new(HashMap::new()),
+            covers: Mutex::new(HashMap::new()),
             genius: None,
         }
     }
@@ -490,16 +507,59 @@ impl Lastfm {
                 }
             }
         }
+        let cleaned = crate::integrations::lyrics::clean_title(&s.track);
+        let mut listed = self.known_album(&s.artist, &s.track).await;
+        if listed.is_none() && cleaned != s.track {
+            listed = self.known_album(&s.artist, &cleaned).await;
+        }
         if s.album.is_empty() {
-            let cleaned = crate::integrations::lyrics::clean_title(&s.track);
-            let mut album = self.known_album(&s.artist, &s.track).await;
-            if album.is_none() && cleaned != s.track {
-                album = self.known_album(&s.artist, &cleaned).await;
-            }
-            if let Some(album) = album {
-                s.album = album;
+            if let Some(album) = &listed {
+                s.album = album.clone();
             }
         }
+        // A SoundCloud song's album was worked out by MultiMusic, so it may as well be one Last.fm
+        // has a cover for: apps like .fmbot then show it at once instead of searching for art.
+        if track.source == Source::SoundCloud && self.has_cover(&s.artist, &s.album).await == Some(false) {
+            for candidate in [listed, Some(cleaned)].into_iter().flatten() {
+                if !candidate.eq_ignore_ascii_case(&s.album)
+                    && self.has_cover(&s.artist, &candidate).await == Some(true)
+                {
+                    tracing::debug!("lastfm: {} has no cover on Last.fm; using {candidate}", s.album);
+                    s.album = candidate;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Whether Last.fm has cover art for the album (`album.getInfo`); `None` when it couldn't
+    /// be asked. Remembered.
+    async fn has_cover(&self, artist: &str, album: &str) -> Option<bool> {
+        if album.trim().is_empty() {
+            return Some(false);
+        }
+        let key = format!("{}\u{1f}{}", artist.to_lowercase(), album.to_lowercase());
+        if let Some(known) = self.covers.lock().unwrap().get(&key) {
+            return Some(*known);
+        }
+        let params = vec![
+            ("artist".to_string(), artist.to_string()),
+            ("album".to_string(), album.to_string()),
+            ("autocorrect".to_string(), "1".to_string()),
+        ];
+        let answer = tokio::time::timeout(Duration::from_secs(8), self.get("album.getInfo", params)).await;
+        let found = match answer {
+            Ok(Ok(v)) => album_has_cover(&v),
+            // "Album not found": no cover.
+            Ok(Err(e)) if api_error_code(&e).is_some() => false,
+            _ => return None,
+        };
+        let mut covers = self.covers.lock().unwrap();
+        if covers.len() > 2000 {
+            covers.clear();
+        }
+        covers.insert(key, found);
+        Some(found)
     }
 
     pub fn is_authenticated(&self) -> bool {
@@ -1087,6 +1147,23 @@ mod tests {
         t.set_duration_if_unknown(10_000);
         t.tick(true, secs(150));
         assert!(t.should_scrobble());
+    }
+
+    #[test]
+    fn album_covers() {
+        let with: serde_json::Value = serde_json::from_str(
+            r##"{"album":{"name":"Bladeecity","image":[{"#text":"","size":"small"},
+                {"#text":"https://lastfm.freetls.fastly.net/i/u/300x300/abc.png","size":"extralarge"}]}}"##,
+        )
+        .unwrap();
+        assert!(album_has_cover(&with));
+        let star: serde_json::Value = serde_json::from_str(
+            r##"{"album":{"image":[{"#text":"https://lastfm.freetls.fastly.net/i/u/300x300/2a96cbd8b46e442fc41c2b86b821562f.png"}]}}"##,
+        )
+        .unwrap();
+        assert!(!album_has_cover(&star));
+        assert!(!album_has_cover(&serde_json::json!({"album":{"image":[{"#text":""}]}})));
+        assert!(!album_has_cover(&serde_json::json!({})));
     }
 
     #[test]

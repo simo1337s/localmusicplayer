@@ -485,9 +485,12 @@ fn search_box(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, rect: Rect) {
         cx.actions.push(Action::Go(View::Search));
     }
     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && !text.is_empty() {
-        cx.actions.push(match &link {
-            Some(l) => Action::Open(links::page_key(l)),
-            None => Action::Search(text),
+        // Enter on an artist's exact name goes straight to their Spotify / SoundCloud page.
+        let artist = super::views::top_artist(cx.feed, &text);
+        cx.actions.push(match (&link, artist) {
+            (Some(l), _) => Action::Open(links::page_key(l)),
+            (None, Some(a)) => Action::Open(a.key),
+            (None, None) => Action::Search(text),
         });
     }
 }

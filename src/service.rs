@@ -2947,7 +2947,9 @@ impl Service {
                 lyrics: d.lyrics.then(|| self.lyrics.clone()),
                 spotify,
                 spotify_twin,
-                ytdlp: d.youtube.then(|| YtDlp::new(&d.ytdlp_path, &d.ytdlp_args)),
+                ytdlp: d
+                    .youtube
+                    .then(|| YtDlp::new(&d.ytdlp_path, &d.ytdlp_args).with_mp3(d.youtube_mp3)),
             };
             let dir = self.cfg.download_dir(track.source);
             self.download_seq += 1;
@@ -3880,7 +3882,11 @@ async fn lastfm_track(spotify: Option<(Arc<SpotifyAuth>, Arc<SpotifyApi>)>, trac
                 release.title,
                 release.album
             );
-            release
+            // Still a SoundCloud song to Last.fm: its album may be swapped for one with a cover.
+            Track {
+                source: Source::SoundCloud,
+                ..release
+            }
         }
         None => track,
     }

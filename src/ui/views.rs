@@ -1121,22 +1121,16 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
         let spotify_pending = !fresh || search.spotify_pending;
         let soundcloud_pending = !fresh || search.soundcloud_pending;
 
-        // Artists: the library's own first, then Spotify and SoundCloud.
-        let mut artists: Vec<ArtistHit> = cx
-            .lib
-            .search_artists(&q, 4)
-            .into_iter()
-            .map(|a| ArtistHit {
-                key: format!("local:artist:{}", a.key),
-                name: a.name.clone(),
-                image: a.art.clone(),
-                source: Source::Local,
-                subtitle: format!("{} songs in your library", a.track_ids.len()),
-            })
-            .collect();
-        if fresh {
-            artists.extend(search.artists.iter().cloned());
-        }
+        // Artists: Spotify and SoundCloud first (their pages have everything), then the
+        // library's own.
+        let mut artists: Vec<ArtistHit> = if fresh { search.artists.clone() } else { Vec::new() };
+        artists.extend(cx.lib.search_artists(&q, 4).into_iter().map(|a| ArtistHit {
+            key: format!("local:artist:{}", a.key),
+            name: a.name.clone(),
+            image: a.art.clone(),
+            source: Source::Local,
+            subtitle: format!("{} songs in your library", a.track_ids.len()),
+        }));
 
         // Songs: the catalogue results first, like Spotify.
         let songs: Vec<&Track> = spotify
@@ -1145,13 +1139,16 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             .chain(local.iter().copied())
             .take(4)
             .collect();
-        // An artist named like the query is the top result (exact match first, then prefix).
+        // An artist named like the query is the top result: exact match first (Spotify and
+        // SoundCloud before the library), then prefix.
         let q_lower = q.to_lowercase();
-        let exact_artist = artists
-            .iter()
-            .find(|a| a.name.to_lowercase() == q_lower)
-            .or_else(|| artists.iter().find(|a| a.name.to_lowercase().starts_with(&q_lower)))
-            .cloned();
+        let exact_artist = top_artist(cx.feed, &q).or_else(|| {
+            artists
+                .iter()
+                .find(|a| a.name.to_lowercase() == q_lower)
+                .or_else(|| artists.iter().find(|a| a.name.to_lowercase().starts_with(&q_lower)))
+                .cloned()
+        });
         let ctx_name = format!("Search: {q}");
 
         let any = !songs.is_empty() || !artists.is_empty();
@@ -1316,6 +1313,26 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             panels::empty_state(ui, icon::MAGNIFYING_GLASS, &format!("No results for “{q}”"));
         }
     });
+}
+
+/// The Spotify or SoundCloud artist named exactly like `query`, once its results are in
+/// (Enter in the search box opens it).
+pub fn top_artist(feed: &crate::service::Feed, query: &str) -> Option<ArtistHit> {
+    let squash = |s: &str| {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let want = squash(query);
+    if want.is_empty() || feed.search.query != query.trim() {
+        return None;
+    }
+    feed.search
+        .artists
+        .iter()
+        .find(|a| a.source != Source::Local && squash(&a.name) == want)
+        .cloned()
 }
 
 fn artist_source_fallback(source: Source) -> (Color32, &'static str) {

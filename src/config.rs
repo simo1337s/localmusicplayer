@@ -183,6 +183,8 @@ pub struct DownloadsConfig {
     pub ytdlp_path: String,
     /// Extra yt-dlp options, e.g. `--cookies-from-browser firefox` for YouTube's bot check.
     pub ytdlp_args: String,
+    /// Save YouTube downloads as MP3 instead of YouTube's own Opus / AAC.
+    pub youtube_mp3: bool,
     /// Embed lyrics (from LRCLIB, time-synced when available).
     pub lyrics: bool,
 }
@@ -194,6 +196,7 @@ impl Default for DownloadsConfig {
             youtube: true,
             ytdlp_path: "yt-dlp".into(),
             ytdlp_args: String::new(),
+            youtube_mp3: false,
             lyrics: true,
         }
     }

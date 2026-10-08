@@ -320,7 +320,14 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     hint(
                         ui,
                         "If YouTube asks yt-dlp to confirm you're not a bot, --cookies-from-browser firefox (or \
-                         chrome) lets it use your browser's YouTube login.",
+                         chrome) lets it use your browser's YouTube login. With a YouTube Music Premium login that \
+                         way, downloads get YouTube's 256 kbps AAC instead of ~160 kbps Opus.",
+                    );
+                    ui.checkbox(&mut cfg.downloads.youtube_mp3, "Save YouTube downloads as MP3 instead of Opus");
+                    hint(
+                        ui,
+                        "Opus at ~160 kbps already sounds like a high-bitrate MP3; converting can't add quality, \
+                         but MP3 plays on every device and player.",
                     );
                 }
                 hint(

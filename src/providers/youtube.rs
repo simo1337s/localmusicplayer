@@ -61,6 +61,8 @@ const UNWANTED: &[&str] = &[
 pub struct YtDlp {
     pub program: String,
     pub args: Vec<String>,
+    /// Convert downloads to MP3 instead of keeping YouTube's Opus / AAC.
+    pub mp3: bool,
 }
 
 impl YtDlp {
@@ -69,7 +71,37 @@ impl YtDlp {
         YtDlp {
             program: program.trim().to_string(),
             args: split_args(args),
+            mp3: false,
         }
+    }
+
+    pub fn with_mp3(mut self, mp3: bool) -> YtDlp {
+        self.mp3 = mp3;
+        self
+    }
+
+    /// Options for saving the audio of a video.
+    fn download_args(&self) -> Vec<&'static str> {
+        let mut args = vec![
+            "--no-playlist",
+            "--newline",
+            "--progress",
+            "--no-mtime",
+            // The best audio YouTube has, by bitrate: 256 kbps AAC when it offers it (YouTube
+            // Music Premium, with --cookies-from-browser), else ~160 kbps Opus.
+            "--format",
+            "bestaudio/best",
+            "--format-sort",
+            "abr,asr",
+            "--extract-audio",
+        ];
+        if self.mp3 {
+            // Re-encoded at the highest VBR setting (~245 kbps); it can't add quality, but MP3
+            // plays everywhere.
+            args.extend(["--audio-format", "mp3", "--audio-quality", "0"]);
+        }
+        // Otherwise the codec is kept and only moved into an .opus / .m4a file (needs ffmpeg).
+        args
     }
 
     fn command(&self) -> Command {
@@ -301,27 +333,20 @@ async fn run_download(
     progress: &(dyn Fn(f32) + Send + Sync),
 ) -> Result<PathBuf> {
     let mut cmd = ytdlp.command();
-    cmd.args([
-        "--no-playlist",
-        "--newline",
-        "--progress",
-        "--no-mtime",
-        "--format",
-        "bestaudio[acodec=opus]/bestaudio[ext=m4a]/bestaudio",
-        // Keeps the codec and only moves it into an .opus / .m4a file (needs ffmpeg).
-        "--extract-audio",
-        "--progress-template",
-        "download:mmprog %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s",
-        "--print",
-        "after_move:mmfile %(filepath)s",
-        "--paths",
-    ])
-    .arg(dir)
-    .arg("--output")
-    .arg(format!("{stem}.%(ext)s"))
-    .arg(format!("https://www.youtube.com/watch?v={id}"))
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+    cmd.args(ytdlp.download_args())
+        .args([
+            "--progress-template",
+            "download:mmprog %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s",
+            "--print",
+            "after_move:mmfile %(filepath)s",
+            "--paths",
+        ])
+        .arg(dir)
+        .arg("--output")
+        .arg(format!("{stem}.%(ext)s"))
+        .arg(format!("https://www.youtube.com/watch?v={id}"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(spawn_error)?;
     // Progress, the saved path and errors come on both stdout and stderr.
     let (tx, mut lines) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -535,6 +560,16 @@ mod tests {
         // Nothing for a different song or length.
         assert!(rank(&videos, "Something Else", "Rick Astley", Some(213.0)).is_empty());
         assert!(rank(&videos[1..2], "Never Gonna Give You Up", "Rick Astley", Some(250.0)).is_empty());
+    }
+
+    #[test]
+    fn download_quality_options() {
+        let keep = YtDlp::new("yt-dlp", "").download_args();
+        assert!(keep.windows(2).any(|w| w == ["--format-sort", "abr,asr"]));
+        assert!(!keep.contains(&"--audio-format"));
+        let mp3 = YtDlp::new("yt-dlp", "").with_mp3(true).download_args();
+        assert!(mp3.windows(2).any(|w| w == ["--audio-format", "mp3"]));
+        assert!(mp3.windows(2).any(|w| w == ["--audio-quality", "0"]));
     }
 
     #[test]
