@@ -52,8 +52,12 @@ package() {
   install -Dm755 target/release/multimusic "$pkgdir/usr/bin/multimusic"
   ln -s multimusic "$pkgdir/usr/bin/sumo"
   install -Dm644 packaging/multimusic.desktop "$pkgdir/usr/share/applications/multimusic.desktop"
-  install -Dm644 assets/logo.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/multimusic.svg"
-  install -Dm644 assets/icon-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/multimusic.png"
-  install -Dm644 assets/icon-64.png "$pkgdir/usr/share/icons/hicolor/64x64/apps/multimusic.png"
+  # The icon is named "sumo" (not "multimusic"), so desktops that cached the old logo under the
+  # old name load the new one.
+  install -Dm644 assets/logo.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/sumo.svg"
+  local size
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "assets/icon-$size.png" "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/sumo.png"
+  done
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

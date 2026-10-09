@@ -329,6 +329,9 @@ jobs:
           pacman -Qi multimusic | head -3
           test -x /usr/bin/multimusic
           test -x /usr/bin/sumo
+          test -f /usr/share/icons/hicolor/scalable/apps/sumo.svg
+          test -f /usr/share/icons/hicolor/32x32/apps/sumo.png
+          grep -q "^Icon=sumo$" /usr/share/applications/multimusic.desktop
 
       - uses: actions/upload-artifact@v4
         with:

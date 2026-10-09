@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
     // How Spotify's audio stream shows up in pavucontrol / the PipeWire graph. Set before
     // any other thread exists, as required for set_var.
     std::env::set_var("PULSE_PROP_application.name", "Sumo");
-    std::env::set_var("PULSE_PROP_application.icon_name", "multimusic");
+    std::env::set_var("PULSE_PROP_application.icon_name", "sumo");
     std::env::set_var("PULSE_PROP_stream.description", "Spotify");
     let paths = Paths::new();
     let filter = EnvFilter::try_from_env("MULTIMUSIC_LOG")
