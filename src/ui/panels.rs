@@ -202,7 +202,7 @@ fn brand(ui: &mut Ui, cx: &mut Cx, collapsed: bool) {
         ui.painter().text(
             Pos2::new(logo.right() + 10.0, rect.center().y),
             Align2::LEFT_CENTER,
-            "MultiMusic",
+            "Sumo",
             theme::bold_font(18.0),
             TEXT,
         );
@@ -410,7 +410,7 @@ fn playlist_row(ui: &mut Ui, cx: &mut Cx, p: &crate::model::Playlist, view: &Vie
                 cx.actions.push(Action::Delete(p.id.clone()));
                 ui.close();
             }
-        } else if ui.button(theme::ic(icon::TRASH, "Remove from MultiMusic")).clicked() {
+        } else if ui.button(theme::ic(icon::TRASH, "Remove from Sumo")).clicked() {
             cx.actions.push(Action::Delete(p.id.clone()));
             ui.close();
         }
@@ -516,7 +516,7 @@ fn search_box(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, rect: Rect) {
 // ------------------------------------------------------------------ content toolbar
 
 /// Back / forward above the main view.
-/// A slim bar about a new version of MultiMusic, and its download and install.
+/// A slim bar about a new version of Sumo, and its download and install.
 pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mut String) {
     use crate::service::UpdateStatus;
     let update = &cx.feed.update;
@@ -551,22 +551,20 @@ pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mu
                 );
                 match &update.status {
                     UpdateStatus::Downloading(done) => {
-                        ui.label(format!("Downloading MultiMusic {version}…"));
+                        ui.label(format!("Downloading Sumo {version}…"));
                         ui.add(egui::ProgressBar::new(*done).desired_width(160.0).show_percentage());
                     }
                     UpdateStatus::NeedsPassword { .. } => {
                         ui.label(format!(
-                            "MultiMusic {version} is downloaded. Enter your password to install it."
+                            "Sumo {version} is downloaded. Enter your password to install it."
                         ));
                     }
                     UpdateStatus::Installing => {
                         ui.spinner();
-                        ui.label(format!("Installing MultiMusic {version}. It starts again in a moment."));
+                        ui.label(format!("Installing Sumo {version}. It starts again in a moment."));
                     }
                     UpdateStatus::Installed => {
-                        ui.label(format!(
-                            "MultiMusic {version} is installed. Start MultiMusic again to use it."
-                        ));
+                        ui.label(format!("Sumo {version} is installed. Start Sumo again to use it."));
                     }
                     UpdateStatus::Failed(why) => {
                         ui.label(egui::RichText::new(format!("The update didn't work: {why}")).color(DANGER));
@@ -578,7 +576,7 @@ pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mu
                         }
                     }
                     _ => {
-                        ui.label(egui::RichText::new(format!("MultiMusic {version} is available")).strong());
+                        ui.label(egui::RichText::new(format!("Sumo {version} is available")).strong());
                         if crate::updater::can_install() {
                             if widgets::pill(ui, "Update now", cx.accent, theme::on_color(cx.accent)).clicked() {
                                 cx.actions.push(Action::Cmd(Command::InstallUpdate));

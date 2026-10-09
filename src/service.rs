@@ -358,7 +358,7 @@ pub struct Feed {
     pub update: UpdateState,
 }
 
-/// New versions of MultiMusic.
+/// New versions of Sumo.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateState {
     /// A newer release than this one.
@@ -381,9 +381,9 @@ pub enum UpdateStatus {
         attempt: u32,
         wrong: bool,
     },
-    /// The new version is being installed; MultiMusic quits and starts again.
+    /// The new version is being installed; Sumo quits and starts again.
     Installing,
-    /// Installed, but MultiMusic couldn't start itself again.
+    /// Installed, but Sumo couldn't start itself again.
     Installed,
     Failed(String),
 }
@@ -3773,7 +3773,7 @@ impl Service {
         };
         self.set_account(
             |f| &mut f.lastfm,
-            AccountStatus::Working("Approve MultiMusic in your browser…".into()),
+            AccountStatus::Working("Approve Sumo in your browser…".into()),
         );
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -4035,7 +4035,7 @@ impl Service {
                 let current = env!("CARGO_PKG_VERSION");
                 match result {
                     Ok(release) if crate::updater::is_newer(&release.version, current) => {
-                        tracing::info!("MultiMusic {} is available", release.version);
+                        tracing::info!("Sumo {} is available", release.version);
                         feed.update.available = Some(release);
                         feed.update.status = UpdateStatus::Idle;
                     }

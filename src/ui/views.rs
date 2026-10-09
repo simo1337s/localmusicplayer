@@ -279,7 +279,7 @@ fn onboarding(ui: &mut Ui, cx: &mut Cx) {
         ui.add_space(6.0);
         ui.label(
             egui::RichText::new(
-                "MultiMusic plays your local files, Spotify (Premium) and SoundCloud in one place, \
+                "Sumo plays your local files, Spotify (Premium) and SoundCloud in one place, \
                  with synced lyrics, Discord status and Last.fm scrobbling.",
             )
             .color(TEXT_DIM),
@@ -1046,14 +1046,8 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
             },
             |ui, cx| {
                 if !p.tracks.is_empty()
-                    && widgets::icon_button(
-                        ui,
-                        icon::PLUS_CIRCLE,
-                        28.0,
-                        TEXT_DIM,
-                        "Save as a playlist in MultiMusic",
-                    )
-                    .clicked()
+                    && widgets::icon_button(ui, icon::PLUS_CIRCLE, 28.0, TEXT_DIM, "Save as a playlist in Sumo")
+                        .clicked()
                 {
                     cx.actions.push(Action::Cmd(Command::CreatePlaylist {
                         name: p.title.clone(),

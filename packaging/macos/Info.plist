@@ -3,9 +3,9 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>MultiMusic</string>
+    <string>Sumo</string>
     <key>CFBundleDisplayName</key>
-    <string>MultiMusic</string>
+    <string>Sumo</string>
     <key>CFBundleIdentifier</key>
     <string>io.github.simo1337s.multimusic</string>
     <key>CFBundleVersion</key>
@@ -15,7 +15,7 @@
     <key>CFBundleExecutable</key>
     <string>multimusic</string>
     <key>CFBundleIconFile</key>
-    <string>multimusic</string>
+    <string>sumo</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -31,14 +31,14 @@
     <key>NSHumanReadableCopyright</key>
     <string>MIT License</string>
     <key>NSDocumentsFolderUsageDescription</key>
-    <string>MultiMusic plays music and saves settings files in your Documents folder.</string>
+    <string>Sumo plays music and saves settings files in your Documents folder.</string>
     <key>NSDownloadsFolderUsageDescription</key>
-    <string>MultiMusic plays music, saves downloads and imports settings files in your Downloads folder.</string>
+    <string>Sumo plays music, saves downloads and imports settings files in your Downloads folder.</string>
     <key>NSDesktopFolderUsageDescription</key>
-    <string>MultiMusic plays music and imports settings files from your Desktop.</string>
+    <string>Sumo plays music and imports settings files from your Desktop.</string>
     <key>NSRemovableVolumesUsageDescription</key>
-    <string>MultiMusic plays music from external drives.</string>
+    <string>Sumo plays music from external drives.</string>
     <key>NSNetworkVolumesUsageDescription</key>
-    <string>MultiMusic plays music from network drives.</string>
+    <string>Sumo plays music from network drives.</string>
 </dict>
 </plist>

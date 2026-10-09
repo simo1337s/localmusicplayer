@@ -90,7 +90,7 @@ jobs:
           $version = (& stage\tools\mpv.exe --no-config --version 2>&1 | Out-String)
           if ($version -notmatch 'mpv v?\d') { $version; throw "mpv doesn't run" }
           ($version -split "`n")[0]
-          # Talk to mpv the way MultiMusic does: over a named pipe.
+          # Talk to mpv the way Sumo does: over a named pipe.
           $mpv = Start-Process stage\tools\mpv.exe -ArgumentList '--no-config','--idle=yes','--no-terminal','--video=no','--input-ipc-server=\\.\pipe\multimusic-ci' -PassThru
           $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'multimusic-ci', [System.IO.Pipes.PipeDirection]::InOut)
           $pipe.Connect(10000)
@@ -114,8 +114,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Copy-Item target\release\multimusic.exe stage\
-          dl\rcedit.exe stage\multimusic.exe --set-icon assets\multimusic.ico `
-            --set-version-string ProductName MultiMusic --set-version-string FileDescription MultiMusic `
+          dl\rcedit.exe stage\multimusic.exe --set-icon assets\sumo.ico `
+            --set-version-string ProductName Sumo --set-version-string FileDescription Sumo `
             --set-version-string CompanyName v0-0x --set-file-version $env:VERSION --set-product-version $env:VERSION
           if ($LASTEXITCODE -ne 0) { throw "rcedit failed" }
           Copy-Item LICENSE stage\LICENSE.txt
@@ -130,7 +130,7 @@ jobs:
             choco install innosetup -y --no-progress
             $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
           }
-          & $iscc /Qp "/DAppVersion=$env:VERSION" "/DStage=..\..\stage" packaging\windows\multimusic.iss
+          & $iscc /Qp "/DAppVersion=$env:VERSION" "/DStage=..\..\stage" packaging\windows\sumo.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           Get-ChildItem dist
 
@@ -140,15 +140,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $setup = Get-ChildItem dist\MultiMusic-Setup-*.exe | Select-Object -First 1
+          $setup = Get-ChildItem dist\Sumo-Setup-*.exe | Select-Object -First 1
           $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "installer exited with $($p.ExitCode)" }
-          $dir = "$env:LOCALAPPDATA\Programs\MultiMusic"
+          $dir = "$env:LOCALAPPDATA\Programs\Sumo"
           $app = "$dir\multimusic.exe"
           if (-not (Test-Path $app)) { throw "not installed at $app" }
           Get-ChildItem $dir -Recurse | Select-Object -First 40 | ForEach-Object { $_.FullName }
           Get-Process multimusic -ErrorAction SilentlyContinue | Stop-Process -Force
-          # CI machines have no GPU (OpenGL 1.1 only): for this test only, MultiMusic gets Mesa's
+          # CI machines have no GPU (OpenGL 1.1 only): for this test only, Sumo gets Mesa's
           # software OpenGL next to it. Real PCs use their graphics driver.
           $mesa = gh api repos/pal1000/mesa-dist-win/releases/latest | ConvertFrom-Json
           $m = $mesa.assets | Where-Object { $_.name -match 'release-msvc\.7z$' } | Select-Object -First 1
@@ -160,9 +160,9 @@ jobs:
           $running = Get-Process multimusic -ErrorAction SilentlyContinue
           if (-not $running) {
             Get-Content "$env:APPDATA\multimusic\data\multimusic.log" -ErrorAction SilentlyContinue
-            throw "MultiMusic didn't stay running"
+            throw "Sumo didn't stay running"
           }
-          Write-Host "MultiMusic is running, using $([math]::Round($running[0].WorkingSet64 / 1MB)) MB"
+          Write-Host "Sumo is running, using $([math]::Round($running[0].WorkingSet64 / 1MB)) MB"
           Get-Content "$env:APPDATA\multimusic\data\multimusic.log" -ErrorAction SilentlyContinue
           $running | Stop-Process -Force
           # Clean up the test (the Mesa files must not stay).
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: dist/MultiMusic-Setup-*.exe
+          path: dist/Sumo-Setup-*.exe
           if-no-files-found: error
 
   macos:
@@ -239,7 +239,7 @@ jobs:
       - name: Build the app
         run: |
           set -euo pipefail
-          app=dist/MultiMusic.app
+          app=dist/Sumo.app
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/${{ matrix.target }}/release/multimusic "$app/Contents/MacOS/"
           sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
@@ -248,7 +248,7 @@ jobs:
             sips -z $s $s assets/icon-1024.png --out icon.iconset/icon_${s}x${s}.png > /dev/null
             sips -z $((s*2)) $((s*2)) assets/icon-1024.png --out icon.iconset/icon_${s}x${s}@2x.png > /dev/null
           done
-          iconutil -c icns icon.iconset -o "$app/Contents/Resources/multimusic.icns"
+          iconutil -c icns icon.iconset -o "$app/Contents/Resources/sumo.icns"
           cp -R tools fonts mpv.app "$app/Contents/Resources/"
           cp LICENSE packaging/THIRD-PARTY.txt "$app/Contents/Resources/"
           # Ad-hoc signature (needed to run on Apple Silicon); no Apple developer account.
@@ -259,7 +259,7 @@ jobs:
         if: matrix.arch == 'arm64'
         run: |
           set -euo pipefail
-          app=dist/MultiMusic.app
+          app=dist/Sumo.app
           "$app/Contents/Resources/mpv.app/Contents/MacOS/mpv" --no-config --version | head -1
           "$app/Contents/Resources/tools/ffmpeg" -hide_banner -version | head -1
           "$app/Contents/Resources/tools/yt-dlp" --version
@@ -274,13 +274,13 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          name="MultiMusic-$VERSION-macos-${{ matrix.arch }}"
-          ditto -c -k --sequesterRsrc --keepParent dist/MultiMusic.app "dist/$name.zip"
-          mkdir dmg && cp -R dist/MultiMusic.app dmg/ && ln -s /Applications dmg/Applications
+          name="Sumo-$VERSION-macos-${{ matrix.arch }}"
+          ditto -c -k --sequesterRsrc --keepParent dist/Sumo.app "dist/$name.zip"
+          mkdir dmg && cp -R dist/Sumo.app dmg/ && ln -s /Applications dmg/Applications
           # hdiutil now and then fails with "Resource busy" on the hosted runners while another
           # disk image service still holds the volume; it works when tried again a bit later.
           for attempt in 1 2 3 4 5; do
-            if hdiutil create -volname "MultiMusic" -srcfolder dmg -ov -format UDZO "dist/$name.dmg"; then
+            if hdiutil create -volname "Sumo" -srcfolder dmg -ov -format UDZO "dist/$name.dmg"; then
               break
             fi
             if [ "$attempt" = 5 ]; then
@@ -328,6 +328,7 @@ jobs:
           pacman -U --noconfirm dist/multimusic-*.pkg.tar.zst
           pacman -Qi multimusic | head -3
           test -x /usr/bin/multimusic
+          test -x /usr/bin/sumo
 
       - uses: actions/upload-artifact@v4
         with:
@@ -355,20 +356,30 @@ jobs:
           set -euo pipefail
           VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           cd dist
+          # The same installers under the old name, which MultiMusic 0.3 and older look for when they
+          # update (the app was renamed Sumo in 0.4).
+          if [ -f "Sumo-Setup-$VERSION-x64.exe" ]; then
+            cp "Sumo-Setup-$VERSION-x64.exe" "MultiMusic-Setup-$VERSION-x64.exe"
+          fi
+          for arch in arm64 intel; do
+            if [ -f "Sumo-$VERSION-macos-$arch.zip" ]; then
+              cp "Sumo-$VERSION-macos-$arch.zip" "MultiMusic-$VERSION-macos-$arch.zip"
+            fi
+          done
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
           cat > ../notes.md <<EOF
           ## Install
 
-          - **Windows 10/11:** run \`MultiMusic-Setup-$VERSION-x64.exe\`. It installs for your user (no administrator prompt) with everything MultiMusic needs (mpv, yt-dlp, ffmpeg).
-          - **macOS 11+:** open the \`.dmg\` for your Mac (**arm64** for Apple Silicon M1/M2/M3/M4, **intel** for Intel Macs) and drag MultiMusic to Applications. The app isn't notarized by Apple, so the first time: right-click MultiMusic → Open → Open (or System Settings → Privacy & Security → Open Anyway).
+          - **Windows 10/11:** run \`Sumo-Setup-$VERSION-x64.exe\`. It installs for your user (no administrator prompt) with everything Sumo needs (mpv, yt-dlp, ffmpeg).
+          - **macOS 11+:** open the \`.dmg\` for your Mac (**arm64** for Apple Silicon M1/M2/M3/M4, **intel** for Intel Macs) and drag Sumo to Applications. The app isn't notarized by Apple, so the first time: right-click Sumo → Open → Open (or System Settings → Privacy & Security → Open Anyway).
           - **Arch Linux (x86_64):** \`sudo pacman -U multimusic-*-x86_64.pkg.tar.zst\`, or build from the repository with \`makepkg -si\`.
 
-          MultiMusic checks for updates by itself and installs them with one click.
+          Sumo checks for updates by itself and installs them with one click. Sumo was called MultiMusic until 0.4: the \`MultiMusic-…\` files are the same installers under the old name, for older versions to update from.
           EOF
           if gh release view "v$VERSION" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "v$VERSION" ./* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "v$VERSION" ./* --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --title "MultiMusic $VERSION" --notes-file ../notes.md
+              --title "Sumo $VERSION" --notes-file ../notes.md
           fi

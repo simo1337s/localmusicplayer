@@ -645,10 +645,7 @@ fn search_for(item: &TopItem) -> Action {
 }
 
 fn item_menu(ui: &mut Ui, cx: &mut Cx, item: &TopItem) {
-    if ui
-        .button(theme::ic(icon::MAGNIFYING_GLASS, "Search in MultiMusic"))
-        .clicked()
-    {
+    if ui.button(theme::ic(icon::MAGNIFYING_GLASS, "Search in Sumo")).clicked() {
         cx.actions.push(if item.artist.is_empty() {
             Action::Search(item.name.clone())
         } else {

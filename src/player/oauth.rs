@@ -47,7 +47,7 @@ pub fn redirect_uri(port: u16) -> String {
     format!("http://127.0.0.1:{port}/login")
 }
 
-/// A redirect URI MultiMusic can catch on this computer.
+/// A redirect URI Sumo can catch on this computer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redirect {
     pub uri: String,
@@ -57,14 +57,12 @@ pub struct Redirect {
 }
 
 /// Checks that `uri` is a loopback address with a port (what Spotify allows for desktop apps
-/// and what MultiMusic can listen on), e.g. `http://127.0.0.1:8899/callback`.
+/// and what Sumo can listen on), e.g. `http://127.0.0.1:8899/callback`.
 pub fn parse_redirect(uri: &str) -> Result<Redirect> {
     let uri = uri.trim();
     let example = "e.g. http://127.0.0.1:8899/login";
     let Some(rest) = uri.strip_prefix("http://") else {
-        bail!(
-            "the redirect URI must start with http://127.0.0.1:<port>/ so MultiMusic can catch the login ({example})"
-        );
+        bail!("the redirect URI must start with http://127.0.0.1:<port>/ so Sumo can catch the login ({example})");
     };
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -414,10 +412,7 @@ async fn wait_for_code(listener: &TcpListener, state: &str, path: &str) -> Resul
         respond(
             &mut stream,
             "200 OK",
-            &page(
-                "Logged in to Spotify",
-                "You can close this tab and go back to MultiMusic.",
-            ),
+            &page("Logged in to Spotify", "You can close this tab and go back to Sumo."),
         )
         .await;
         return Ok(code);
@@ -451,7 +446,7 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 
 fn page(title: &str, text: &str) -> String {
     format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>MultiMusic</title><style>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sumo</title><style>\
          body{{background:#121212;color:#f2f0ea;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0}}\
          .c{{text-align:center}}svg{{width:96px;height:96px}}h1{{font-weight:700;margin:18px 0 6px}}p{{color:#a7a59f}}\
          </style></head><body><div class=\"c\">{LOGO_SVG}<h1>{title}</h1><p>{text}</p></div></body></html>"

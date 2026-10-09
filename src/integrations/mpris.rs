@@ -21,7 +21,7 @@ impl Mpris {
     /// window opens).
     pub fn new(commands: UnboundedSender<Command>, window: Option<isize>) -> Mpris {
         let config = PlatformConfig {
-            display_name: "MultiMusic",
+            display_name: "Sumo",
             dbus_name: "multimusic",
             hwnd: window.map(|h| h as *mut std::ffi::c_void),
         };

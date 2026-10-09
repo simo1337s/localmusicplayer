@@ -1,5 +1,5 @@
-//! The helper programs MultiMusic runs: mpv (local files and SoundCloud), yt-dlp and ffmpeg
-//! (downloads). The Windows installer and the macOS app ship them next to MultiMusic; otherwise
+//! The helper programs Sumo runs: mpv (local files and SoundCloud), yt-dlp and ffmpeg
+//! (downloads). The Windows installer and the macOS app ship them next to Sumo; otherwise
 //! they come from the PATH, and on macOS also from Homebrew's folders, which apps started from
 //! the Finder don't have on their PATH.
 
@@ -34,10 +34,10 @@ fn candidates(name: &str) -> Vec<PathBuf> {
     };
     let mut out = Vec::new();
     if let Some(dir) = exe_dir() {
-        // Windows: C:\…\MultiMusic\tools\mpv.exe
+        // Windows: C:\…\Sumo\tools\mpv.exe
         out.push(dir.join("tools").join(&file));
         if cfg!(target_os = "macos") {
-            // MultiMusic.app/Contents/MacOS/multimusic → Contents/Resources
+            // Sumo.app/Contents/MacOS/multimusic → Contents/Resources
             let resources = dir.join("..").join("Resources");
             if name == "mpv" {
                 out.push(resources.join("mpv.app/Contents/MacOS/mpv"));
@@ -57,16 +57,16 @@ pub fn install_hint(program: &str) -> String {
     if cfg!(target_os = "linux") {
         format!("Install it with: sudo pacman -S {program}")
     } else {
-        format!("It comes with MultiMusic: reinstall MultiMusic, or set the path to your own {program}")
+        format!("It comes with Sumo: reinstall Sumo, or set the path to your own {program}")
     }
 }
 
-/// The folder MultiMusic's executable is in.
+/// The folder Sumo's executable is in.
 pub fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe().ok()?.parent().map(Path::to_path_buf)
 }
 
-/// The folder of the ffmpeg shipped with MultiMusic (or Homebrew's), for yt-dlp's
+/// The folder of the ffmpeg shipped with Sumo (or Homebrew's), for yt-dlp's
 /// `--ffmpeg-location`; `None` where ffmpeg simply comes from the PATH.
 pub fn bundled_ffmpeg_dir() -> Option<PathBuf> {
     if !cfg!(any(windows, target_os = "macos")) {
@@ -91,7 +91,7 @@ pub fn command(program: impl AsRef<OsStr>) -> tokio::process::Command {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Makes a child process end when MultiMusic does, even if MultiMusic crashes. (Linux uses
+/// Makes a child process end when Sumo does, even if Sumo crashes. (Linux uses
 /// `PR_SET_PDEATHSIG` when spawning; elsewhere stale players are stopped at the next start.)
 pub fn end_with_us(child: &tokio::process::Child) {
     #[cfg(windows)]
@@ -101,7 +101,7 @@ pub fn end_with_us(child: &tokio::process::Child) {
             AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
-        // The job lives as long as the process: when MultiMusic exits, Windows closes the
+        // The job lives as long as the process: when Sumo exits, Windows closes the
         // handle and ends every process in the job.
         static JOB: OnceLock<usize> = OnceLock::new();
         let job = *JOB.get_or_init(|| unsafe {

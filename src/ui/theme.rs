@@ -306,7 +306,7 @@ const CJK_FONTS: &[&str] = &[
 
 fn font_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    // Fonts that come with MultiMusic: next to the program (Windows) or in the app's
+    // Fonts that come with Sumo: next to the program (Windows) or in the app's
     // Resources (macOS).
     if let Some(dir) = crate::tools::exe_dir() {
         dirs.push(dir.join("fonts"));

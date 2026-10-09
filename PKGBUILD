@@ -1,11 +1,11 @@
 # Maintainer: v0-0x
-# Builds MultiMusic from this checkout:  makepkg -si
+# Builds Sumo from this checkout:  makepkg -si
 pkgname=multimusic
 # The same as `version` in Cargo.toml (a test checks). A fixed version, not a pkgver() function:
 # makepkg writes what pkgver() returns into this file, which then blocks `git pull`.
-pkgver=0.3.2
+pkgver=0.4.0
 pkgrel=1
-pkgdesc="Lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
+pkgdesc="Sumo: lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
 arch=('x86_64' 'aarch64')
 url="https://github.com/v0-0x/localmusicplayer"
 license=('MIT')
@@ -18,7 +18,8 @@ optdepends=('pipewire-pulse: Spotify output on PipeWire desktops (usually alread
             'inter-font: nicer interface font'
             'discord: Rich Presence (also works with Vesktop / arRPC)'
             'yt-dlp: download Spotify and Apple Music songs (found on YouTube)')
-provides=('multimusic')
+# The app is called Sumo; the package keeps its old name so installed copies update in place.
+provides=('multimusic' 'sumo')
 conflicts=('medley')
 replaces=('medley')
 options=('!lto' '!debug')
@@ -49,6 +50,7 @@ check() {
 package() {
   cd "$(_root)"
   install -Dm755 target/release/multimusic "$pkgdir/usr/bin/multimusic"
+  ln -s multimusic "$pkgdir/usr/bin/sumo"
   install -Dm644 packaging/multimusic.desktop "$pkgdir/usr/share/applications/multimusic.desktop"
   install -Dm644 assets/logo.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/multimusic.svg"
   install -Dm644 assets/icon-256.png "$pkgdir/usr/share/icons/hicolor/256x256/apps/multimusic.png"

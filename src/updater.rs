@@ -1,5 +1,5 @@
 //! Updates from GitHub releases. A new version is downloaded, checked against the release's
-//! SHA-256 sums and installed: on Windows the installer runs silently and starts MultiMusic
+//! SHA-256 sums and installed: on Windows the installer runs silently and starts Sumo
 //! again, on macOS the app is swapped in place, and on Arch Linux the release's package is
 //! installed with `sudo pacman -U` after asking for the password.
 
@@ -36,14 +36,14 @@ pub struct Asset {
 /// Whether `name` is what this platform downloads from the release of `version`.
 pub fn is_platform_asset(name: &str, version: &str) -> bool {
     if cfg!(windows) {
-        name == format!("MultiMusic-Setup-{version}-x64.exe")
+        name == format!("Sumo-Setup-{version}-x64.exe")
     } else if cfg!(target_os = "macos") {
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else {
             "intel"
         };
-        name == format!("MultiMusic-{version}-macos-{arch}.zip")
+        name == format!("Sumo-{version}-macos-{arch}.zip")
     } else {
         is_arch_package(name, version, std::env::consts::ARCH)
     }
@@ -245,12 +245,12 @@ pub fn download_dir() -> PathBuf {
     std::env::temp_dir().join("multimusic-update")
 }
 
-/// Starts installing a downloaded update. MultiMusic has to quit right after; the new
+/// Starts installing a downloaded update. Sumo has to quit right after; the new
 /// version starts by itself.
 pub fn install(file: &Path) -> Result<()> {
     #[cfg(windows)]
     {
-        // The installer closes what is left of MultiMusic, installs over it and starts it.
+        // The installer closes what is left of Sumo, installs over it and starts it.
         std::process::Command::new(file)
             .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/SP-"])
             .spawn()
@@ -370,20 +370,20 @@ pub fn relaunch() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .context("couldn't start MultiMusic again")?;
+        .context("couldn't start Sumo again")?;
     Ok(())
 }
 
-/// macOS: unpacks the new MultiMusic.app and puts it where the running one is.
+/// macOS: unpacks the new Sumo.app and puts it where the running one is.
 #[cfg(target_os = "macos")]
 fn install_app(zip: &Path) -> Result<()> {
     let exe = std::env::current_exe()?;
-    // …/MultiMusic.app/Contents/MacOS/multimusic
+    // …/Sumo.app/Contents/MacOS/multimusic (MultiMusic.app before the app was renamed)
     let bundle = exe
         .ancestors()
         .nth(3)
         .filter(|p| p.extension().is_some_and(|e| e == "app"))
-        .ok_or_else(|| anyhow!("MultiMusic isn't running from its app bundle"))?
+        .ok_or_else(|| anyhow!("Sumo isn't running from its app bundle"))?
         .to_path_buf();
     let unpack = zip.with_extension("unpacked");
     let _ = std::fs::remove_dir_all(&unpack);
@@ -402,6 +402,16 @@ fn install_app(zip: &Path) -> Result<()> {
         .map(|e| e.path())
         .find(|p| p.extension().is_some_and(|e| e == "app"))
         .ok_or_else(|| anyhow!("the update has no app in it"))?;
+    // The app keeps the name it comes with, so MultiMusic.app becomes Sumo.app.
+    let named = new_app
+        .file_name()
+        .map(|name| bundle.with_file_name(name))
+        .unwrap_or_else(|| bundle.clone());
+    let target = if named != bundle && named.exists() {
+        bundle.clone()
+    } else {
+        named
+    };
     let old = bundle.with_extension("app-old");
     let _ = std::fs::remove_dir_all(&old);
     std::fs::rename(&bundle, &old).with_context(|| {
@@ -410,11 +420,11 @@ fn install_app(zip: &Path) -> Result<()> {
             bundle.display()
         )
     })?;
-    let moved = std::fs::rename(&new_app, &bundle).or_else(|_| {
+    let moved = std::fs::rename(&new_app, &target).or_else(|_| {
         // Another volume: copy it over.
         let ok = std::process::Command::new("/usr/bin/ditto")
             .arg(&new_app)
-            .arg(&bundle)
+            .arg(&target)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
@@ -434,12 +444,12 @@ fn install_app(zip: &Path) -> Result<()> {
     let script = format!(
         "while kill -0 {} 2>/dev/null; do sleep 0.2; done; open \"{}\"",
         std::process::id(),
-        bundle.display()
+        target.display()
     );
     std::process::Command::new("/bin/sh")
         .args(["-c", &script])
         .spawn()
-        .context("couldn't restart MultiMusic")?;
+        .context("couldn't restart Sumo")?;
     Ok(())
 }
 
@@ -466,9 +476,9 @@ mod tests {
             "body": "Fixes",
             "html_url": "https://github.com/o/r/releases/tag/v0.3.0",
             "assets": [
-                {"name": "MultiMusic-Setup-0.3.0-x64.exe", "url": "https://api.github.com/a/1", "size": 10},
-                {"name": "MultiMusic-0.3.0-macos-arm64.zip", "url": "https://api.github.com/a/2", "size": 20},
-                {"name": "MultiMusic-0.3.0-macos-intel.zip", "url": "https://api.github.com/a/4", "size": 20},
+                {"name": "Sumo-Setup-0.3.0-x64.exe", "url": "https://api.github.com/a/1", "size": 10},
+                {"name": "Sumo-0.3.0-macos-arm64.zip", "url": "https://api.github.com/a/2", "size": 20},
+                {"name": "Sumo-0.3.0-macos-intel.zip", "url": "https://api.github.com/a/4", "size": 20},
                 {"name": "multimusic-0.3.0.r130.gabc1234-1-x86_64.pkg.tar.zst", "url": "https://api.github.com/a/5", "size": 9},
                 {"name": "multimusic-0.3.0.r130.gabc1234-1-aarch64.pkg.tar.zst", "url": "https://api.github.com/a/6", "size": 9},
                 {"name": "SHA256SUMS.txt", "url": "https://api.github.com/a/3", "size": 1,

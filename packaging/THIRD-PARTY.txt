@@ -1,4 +1,4 @@
-MultiMusic ships these programs and fonts unchanged, so it works without installing anything
+Sumo ships these programs and fonts unchanged, so it works without installing anything
 else. Each keeps its own license; their source code is available at the addresses below.
 
 mpv (local files and SoundCloud playback)

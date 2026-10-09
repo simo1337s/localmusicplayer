@@ -96,7 +96,7 @@ impl Downloader {
     /// The song's details: everything Spotify knows for Spotify songs, else what the library
     /// has.
     async fn details(&self, track: &Track) -> Metadata {
-        // An Apple Music song MultiMusic already matched to Spotify gets Spotify's details.
+        // An Apple Music song Sumo already matched to Spotify gets Spotify's details.
         let on_spotify = match track.source {
             Source::Spotify => Some(track),
             _ => self.spotify_twin.as_ref().filter(|t| t.source == Source::Spotify),

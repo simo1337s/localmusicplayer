@@ -1,6 +1,6 @@
 //! Apple Music library import.
 //!
-//! Apple Music streams are DRM protected and can't be played on Linux, so MultiMusic only imports
+//! Apple Music streams are DRM protected and can't be played on Linux, so Sumo only imports
 //! the user's library and playlists as *metadata*. Songs that point at an existing local file
 //! become [`Source::Local`] tracks straight away; everything else becomes a [`Source::AppleMusic`]
 //! track that is resolved to a local / Spotify / SoundCloud match at play time.

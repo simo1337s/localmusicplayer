@@ -551,7 +551,7 @@ impl Lastfm {
                 s.album = album.clone();
             }
         }
-        // A SoundCloud song's album was worked out by MultiMusic, so it may as well be one Last.fm
+        // A SoundCloud song's album was worked out by Sumo, so it may as well be one Last.fm
         // has a cover for: apps like .fmbot then show it at once instead of searching for art.
         if track.source == Source::SoundCloud && self.has_cover(&s.artist, &s.album).await == Some(false) {
             for candidate in [listed, Some(cleaned)].into_iter().flatten() {

@@ -69,7 +69,7 @@ impl YtDlp {
     /// From the settings: the program and its extra options as typed (quotes allowed).
     pub fn new(program: &str, args: &str) -> YtDlp {
         YtDlp {
-            // The yt-dlp shipped with MultiMusic on Windows and macOS, unless a path is set.
+            // The yt-dlp shipped with Sumo on Windows and macOS, unless a path is set.
             program: crate::tools::resolve(program, "yt-dlp"),
             args: split_args(args),
             mp3: false,
@@ -108,9 +108,9 @@ impl YtDlp {
     fn command(&self) -> Command {
         let mut cmd = crate::tools::command(&self.program);
         // The user's yt-dlp config file could change file names or formats; their extra
-        // options go first so the ones MultiMusic needs win.
+        // options go first so the ones Sumo needs win.
         cmd.args(["--ignore-config", "--no-warnings"]);
-        // The ffmpeg that comes with MultiMusic isn't on the PATH.
+        // The ffmpeg that comes with Sumo isn't on the PATH.
         if let Some(dir) = crate::tools::bundled_ffmpeg_dir() {
             cmd.arg("--ffmpeg-location").arg(dir);
         }

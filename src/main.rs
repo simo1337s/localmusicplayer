@@ -1,4 +1,4 @@
-//! MultiMusic: a lightweight native music player for local files, Spotify and SoundCloud.
+//! Sumo: a lightweight native music player for local files, Spotify and SoundCloud.
 
 // No console window next to the app on Windows.
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     memory::tune();
     // How Spotify's audio stream shows up in pavucontrol / the PipeWire graph. Set before
     // any other thread exists, as required for set_var.
-    std::env::set_var("PULSE_PROP_application.name", "MultiMusic");
+    std::env::set_var("PULSE_PROP_application.name", "Sumo");
     std::env::set_var("PULSE_PROP_application.icon_name", "multimusic");
     std::env::set_var("PULSE_PROP_stream.description", "Spotify");
     let paths = Paths::new();
@@ -48,9 +48,9 @@ fn main() -> anyhow::Result<()> {
             .init(),
         None => tracing_subscriber::fmt().with_env_filter(filter).init(),
     }
-    tracing::info!("MultiMusic {} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("Sumo {} starting", env!("CARGO_PKG_VERSION"));
 
-    // Windows: starting MultiMusic again brings the running one to the front.
+    // Windows: starting Sumo again brings the running one to the front.
     #[cfg(windows)]
     if instance::running_elsewhere() {
         return Ok(());
@@ -73,7 +73,7 @@ fn main() -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("MultiMusic")
+            .with_title("Sumo")
             .with_app_id("multimusic")
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([880.0, 560.0])
@@ -87,7 +87,7 @@ fn main() -> anyhow::Result<()> {
     let ui_cmd = cmd.clone();
     let ui_shared = shared.clone();
     let result = eframe::run_native(
-        "MultiMusic",
+        "Sumo",
         options,
         Box::new(move |cc| Ok(Box::new(ui::App::new(cc, ui_shared, ui_cmd, cfg, paths, handle)))),
     );
@@ -124,7 +124,7 @@ fn log_file(paths: &Paths) -> Option<std::fs::File> {
     std::fs::File::create(paths.data_dir.join("multimusic.log")).ok()
 }
 
-/// One MultiMusic at a time on Windows: a second start asks the first to show itself.
+/// One Sumo at a time on Windows: a second start asks the first to show itself.
 #[cfg(windows)]
 mod instance {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
@@ -134,7 +134,7 @@ mod instance {
 
     const PIPE: &str = r"\\.\pipe\multimusic-running";
 
-    /// True when another MultiMusic runs (it was asked to come to the front).
+    /// True when another Sumo runs (it was asked to come to the front).
     pub fn running_elsewhere() -> bool {
         use std::io::Write;
         match std::fs::OpenOptions::new().write(true).open(PIPE) {

@@ -20,7 +20,7 @@ pub const LOGIN_FILES: &[&str] = &["oauth.json", "oauth-webapi.json", "credentia
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SettingsFile {
-    /// Marks the file as MultiMusic's (and its format).
+    /// Marks the file as Sumo's (and its format).
     pub multimusic_settings: u32,
     pub app_version: String,
     pub created_at: i64,
@@ -148,12 +148,12 @@ pub fn read(path: &Path) -> Result<SettingsFile> {
         if text.contains("multimusic_settings") {
             anyhow!("{} is damaged: {e}", path.display())
         } else {
-            anyhow!("{} isn't a MultiMusic settings file", path.display())
+            anyhow!("{} isn't a Sumo settings file", path.display())
         }
     })?;
     if file.multimusic_settings > FORMAT {
         return Err(anyhow!(
-            "{} comes from a newer MultiMusic ({}): update this one first",
+            "{} comes from a newer Sumo ({}): update this one first",
             path.display(),
             file.app_version
         ));
@@ -261,7 +261,7 @@ pub fn default_export_path() -> PathBuf {
         .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
         .unwrap_or_else(std::env::temp_dir);
     let today = chrono_date(crate::model::now_unix());
-    dir.join(format!("MultiMusic settings {today}.json"))
+    dir.join(format!("Sumo settings {today}.json"))
 }
 
 /// Settings files in Downloads, Documents and on the Desktop, newest first.
@@ -281,7 +281,8 @@ pub fn find_settings_files() -> Vec<PathBuf> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            name.starts_with("multimusic settings") && is_settings_file(p)
+            // Files saved before the app was renamed from MultiMusic count too.
+            (name.starts_with("sumo settings") || name.starts_with("multimusic settings")) && is_settings_file(p)
         })
         .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
         .collect();
@@ -395,7 +396,7 @@ mod tests {
         assert_eq!(bare.config.ui.accent, [1, 2, 3]);
 
         // Round trip through a file.
-        let path = dir.join("MultiMusic settings.json");
+        let path = dir.join("Sumo settings.json");
         write(&path, &all).unwrap();
         assert!(is_settings_file(&path));
         assert_eq!(read(&path).unwrap(), all);
@@ -404,11 +405,11 @@ mod tests {
         assert!(read(&dir.join("x.json"))
             .unwrap_err()
             .to_string()
-            .contains("isn't a MultiMusic"));
+            .contains("isn't a Sumo"));
         let mut newer = all.clone();
         newer.multimusic_settings = FORMAT + 1;
         write(&path, &newer).unwrap();
-        assert!(read(&path).unwrap_err().to_string().contains("newer MultiMusic"));
+        assert!(read(&path).unwrap_err().to_string().contains("newer Sumo"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -655,7 +655,7 @@ impl App {
                         .unwrap_or_default();
                     ui.label(format!(
                         "Your settings are replaced with the ones in “{name}”, its playlists are added, and \
-                         MultiMusic restarts."
+                         Sumo restarts."
                     ));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -679,11 +679,11 @@ impl App {
                         .as_ref()
                         .map(|r| r.version.clone())
                         .unwrap_or_default();
-                    ui.label(egui::RichText::new(format!("Install MultiMusic {version}")).font(theme::bold_font(18.0)));
+                    ui.label(egui::RichText::new(format!("Install Sumo {version}")).font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
                     ui.label(
                         "The new version is downloaded and checked. Enter your password to install it \
-                         (with sudo pacman); MultiMusic then starts again.",
+                         (with sudo pacman); Sumo then starts again.",
                     );
                     ui.add_space(10.0);
                     let r = ui.add(
@@ -715,7 +715,7 @@ impl App {
                     ui.label(egui::RichText::new("Delete playlist?").font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
                     ui.label(format!(
-                        "“{name}” will be removed from MultiMusic. Songs stay in your library."
+                        "“{name}” will be removed from Sumo. Songs stay in your library."
                     ));
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
