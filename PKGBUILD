@@ -1,7 +1,9 @@
 # Maintainer: v0-0x
 # Builds MultiMusic from this checkout:  makepkg -si
 pkgname=multimusic
-pkgver=0.1.0
+# The same as `version` in Cargo.toml (a test checks). A fixed version, not a pkgver() function:
+# makepkg writes what pkgver() returns into this file, which then blocks `git pull`.
+pkgver=0.3.2
 pkgrel=1
 pkgdesc="Lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
 arch=('x86_64' 'aarch64')
@@ -24,17 +26,6 @@ options=('!lto' '!debug')
 _root() {
   # The PKGBUILD lives in the repository root.
   printf '%s' "$startdir"
-}
-
-pkgver() {
-  cd "$(_root)"
-  local v
-  v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-  if git rev-parse --git-dir >/dev/null 2>&1; then
-    printf '%s.r%s.g%s' "$v" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
-  else
-    printf '%s' "$v"
-  fi
 }
 
 prepare() {

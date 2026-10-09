@@ -9,3 +9,5 @@
 
 - The PKGBUILD's `check()` runs `cargo test --frozen --release`, so keep tests offline and
   `Cargo.lock` committed and up to date.
+- A new version: change `version` in Cargo.toml and `pkgver` in PKGBUILD together (a test
+  checks). Pushing it builds and publishes the release the apps update from.

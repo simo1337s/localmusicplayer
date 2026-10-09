@@ -487,6 +487,20 @@ mod tests {
         assert!(is_platform_asset(&asset.name, "0.3.0"), "{}", asset.name);
     }
 
+    /// The Arch package has the app's version, so the updater finds it in a release.
+    #[test]
+    fn package_version_matches() {
+        let pkgver = include_str!("../PKGBUILD")
+            .lines()
+            .find_map(|l| l.strip_prefix("pkgver="))
+            .expect("pkgver in PKGBUILD");
+        assert_eq!(
+            pkgver.trim(),
+            env!("CARGO_PKG_VERSION"),
+            "set pkgver in PKGBUILD to the version in Cargo.toml"
+        );
+    }
+
     #[test]
     fn arch_packages() {
         let name = "multimusic-0.3.2.r130.gabc1234-1-x86_64.pkg.tar.zst";
