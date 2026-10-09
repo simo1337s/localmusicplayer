@@ -546,7 +546,10 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 ui.horizontal(|ui| {
                     let busy = matches!(
                         update.status,
-                        UpdateStatus::Checking | UpdateStatus::Downloading(_) | UpdateStatus::Installing
+                        UpdateStatus::Checking
+                            | UpdateStatus::Downloading(_)
+                            | UpdateStatus::NeedsPassword { .. }
+                            | UpdateStatus::Installing
                     );
                     if ui.add_enabled(!busy, egui::Button::new("Check now")).clicked() {
                         cx.actions.push(Action::Cmd(Command::CheckUpdates { manual: true }));
@@ -558,8 +561,14 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                         (UpdateStatus::Downloading(done), _) => {
                             ui.add(egui::ProgressBar::new(*done).desired_width(160.0).show_percentage());
                         }
+                        (UpdateStatus::NeedsPassword { .. }, _) => {
+                            ui.label("Waiting for your password…");
+                        }
                         (UpdateStatus::Installing, _) => {
                             ui.label("Installing…");
+                        }
+                        (UpdateStatus::Installed, _) => {
+                            ui.label("Installed. Start MultiMusic again to use the new version.");
                         }
                         (UpdateStatus::Failed(why), _) => {
                             ui.label(RichText::new(why).color(DANGER));
@@ -578,6 +587,12 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 });
                 if !crate::updater::can_install() {
                     hint(ui, "On Linux, update the way you installed: git pull && makepkg -sif");
+                } else if crate::updater::NEEDS_PASSWORD {
+                    hint(
+                        ui,
+                        "Update now downloads the new version's package, checks it, asks for your password and \
+                         installs it with pacman. MultiMusic then starts again.",
+                    );
                 }
             });
 
@@ -592,7 +607,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                 let mut keys = !st.export_no_keys;
                 ui.checkbox(
                     &mut keys,
-                    "Include keys and logins (Spotify, Last.fm, SoundCloud, Apple Music, Discord, GitHub)",
+                    "Include keys and logins (Spotify, Last.fm, SoundCloud, Apple Music, Discord)",
                 );
                 st.export_no_keys = !keys;
                 let mut playlists = !st.export_no_playlists;

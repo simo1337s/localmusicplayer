@@ -1,7 +1,7 @@
-//! Updates from GitHub releases. On Windows and macOS a new version is downloaded, checked
-//! against the release's SHA-256 sums and installed (the installer runs silently and starts
-//! MultiMusic again; the macOS app is swapped in place). Linux builds come from the git
-//! checkout, so there MultiMusic only says that a new version is out.
+//! Updates from GitHub releases. A new version is downloaded, checked against the release's
+//! SHA-256 sums and installed: on Windows the installer runs silently and starts MultiMusic
+//! again, on macOS the app is swapped in place, and on Arch Linux the release's package is
+//! installed with `sudo pacman -U` after asking for the password.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,25 +33,76 @@ pub struct Asset {
     pub size: u64,
 }
 
-/// What this platform downloads from a release.
-pub fn asset_name(version: &str) -> Option<String> {
+/// Whether `name` is what this platform downloads from the release of `version`.
+pub fn is_platform_asset(name: &str, version: &str) -> bool {
     if cfg!(windows) {
-        Some(format!("MultiMusic-Setup-{version}-x64.exe"))
+        name == format!("MultiMusic-Setup-{version}-x64.exe")
     } else if cfg!(target_os = "macos") {
         let arch = if cfg!(target_arch = "aarch64") {
             "arm64"
         } else {
             "intel"
         };
-        Some(format!("MultiMusic-{version}-macos-{arch}.zip"))
+        name == format!("MultiMusic-{version}-macos-{arch}.zip")
     } else {
-        None
+        is_arch_package(name, version, std::env::consts::ARCH)
     }
 }
 
-/// Whether this build can install updates by itself.
+/// An Arch Linux package of `version` for `arch`: `multimusic-0.3.2.r130.gabc1234-1-x86_64.pkg.tar.zst`
+/// (the version is followed by the commit it was built from).
+pub fn is_arch_package(name: &str, version: &str, arch: &str) -> bool {
+    let Some(rest) = name.strip_prefix("multimusic-").and_then(|r| r.strip_prefix(version)) else {
+        return false;
+    };
+    rest.starts_with(['.', '-']) && rest.ends_with(&format!("-{arch}.pkg.tar.zst"))
+}
+
+/// Whether this computer can install updates by itself: Windows and macOS always; Linux with
+/// pacman and sudo (Arch and its relatives).
 pub fn can_install() -> bool {
-    cfg!(any(windows, target_os = "macos"))
+    static CAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CAN.get_or_init(|| cfg!(any(windows, target_os = "macos")) || (on_path("pacman") && on_path("sudo")))
+}
+
+/// Installing asks for the password first (Linux).
+pub const NEEDS_PASSWORD: bool = cfg!(not(any(windows, target_os = "macos")));
+
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+/// A password, kept out of logs and wiped from memory when dropped.
+#[derive(Clone, PartialEq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(text: String) -> Secret {
+        Secret(text)
+    }
+
+    fn text(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        wipe(&mut self.0);
+    }
+}
+
+/// Overwrites text in memory before it's let go.
+pub fn wipe(text: &mut String) {
+    // SAFETY: zero bytes are valid UTF-8.
+    unsafe { text.as_mut_vec().fill(0) };
+    text.clear();
 }
 
 /// A client for GitHub's API and downloads: no overall time limit (installers are large), but
@@ -112,7 +163,7 @@ pub fn parse_release(json: &Value) -> Option<Release> {
         .unwrap_or_default();
     let find = |name: &str| assets.iter().find(|a| a.name == name).cloned();
     Some(Release {
-        asset: asset_name(&version).and_then(|n| find(&n)),
+        asset: assets.iter().find(|a| is_platform_asset(&a.name, &version)).cloned(),
         sums: find(SUMS_FILE),
         notes: json.get("body").and_then(Value::as_str).unwrap_or_default().to_string(),
         page: json
@@ -213,8 +264,114 @@ pub fn install(file: &Path) -> Result<()> {
     #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = file;
-        bail!("update MultiMusic with your package manager")
+        bail!("installing needs your password")
     }
+}
+
+/// Why installing a package didn't work.
+#[derive(Debug)]
+pub enum InstallError {
+    WrongPassword,
+    Failed(String),
+}
+
+/// Linux: installs a downloaded package with `sudo pacman -U`, giving sudo the password.
+pub fn install_package(file: &Path, password: &Secret) -> std::result::Result<(), InstallError> {
+    let failed = |e: std::io::Error| InstallError::Failed(format!("couldn't run sudo: {e}"));
+    // Check the password on its own first, so a wrong one is told apart from pacman failing.
+    let check = sudo(password, &["-v".as_ref()]).map_err(failed)?;
+    if !check.status.success() {
+        return Err(sudo_refused(&String::from_utf8_lossy(&check.stderr)));
+    }
+    let install = sudo(
+        password,
+        &[
+            "pacman".as_ref(),
+            "-U".as_ref(),
+            "--noconfirm".as_ref(),
+            file.as_os_str(),
+        ],
+    )
+    .map_err(failed)?;
+    if install.status.success() {
+        return Ok(());
+    }
+    let said = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr)
+    );
+    Err(InstallError::Failed(
+        last_line(&said).unwrap_or("pacman failed").to_string(),
+    ))
+}
+
+/// Runs `sudo <args>` with the password on its standard input (in English, so the answer can
+/// be understood).
+fn sudo(password: &Secret, args: &[&std::ffi::OsStr]) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sudo")
+        .args(["-S", "-p", ""])
+        .args(args)
+        .env("LC_ALL", "C")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // sudo doesn't read it while it remembers the password from a moment ago.
+        let _ = stdin.write_all(password.text().as_bytes());
+        let _ = stdin.write_all(b"\n");
+    }
+    child.wait_with_output()
+}
+
+/// What sudo turning the password down means.
+fn sudo_refused(stderr: &str) -> InstallError {
+    let lower = stderr.to_lowercase();
+    if lower.contains("incorrect password")
+        || lower.contains("sorry, try again")
+        || lower.contains("no password was provided")
+        || lower.contains("authentication failure")
+    {
+        InstallError::WrongPassword
+    } else if lower.contains("not in the sudoers") || lower.contains("not allowed") {
+        InstallError::Failed("your account isn't allowed to install software (sudo)".into())
+    } else {
+        InstallError::Failed(last_line(stderr).unwrap_or("sudo refused").to_string())
+    }
+}
+
+fn last_line(text: &str) -> Option<&str> {
+    text.lines().map(str::trim).rfind(|l| !l.is_empty())
+}
+
+/// Linux: starts this program again once the running one has quit (after an update replaced it).
+#[cfg(unix)]
+pub fn relaunch() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()?;
+    // The running program's file was just replaced: Linux reports it as "… (deleted)".
+    let exe = exe
+        .to_str()
+        .and_then(|p| p.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .unwrap_or(exe);
+    std::process::Command::new("/bin/sh")
+        .args([
+            "-c",
+            "while kill -0 \"$0\" 2>/dev/null; do sleep 0.2; done; exec \"$1\"",
+        ])
+        .arg(std::process::id().to_string())
+        .arg(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .context("couldn't start MultiMusic again")?;
+    Ok(())
 }
 
 /// macOS: unpacks the new MultiMusic.app and puts it where the running one is.
@@ -312,6 +469,8 @@ mod tests {
                 {"name": "MultiMusic-Setup-0.3.0-x64.exe", "url": "https://api.github.com/a/1", "size": 10},
                 {"name": "MultiMusic-0.3.0-macos-arm64.zip", "url": "https://api.github.com/a/2", "size": 20},
                 {"name": "MultiMusic-0.3.0-macos-intel.zip", "url": "https://api.github.com/a/4", "size": 20},
+                {"name": "multimusic-0.3.0.r130.gabc1234-1-x86_64.pkg.tar.zst", "url": "https://api.github.com/a/5", "size": 9},
+                {"name": "multimusic-0.3.0.r130.gabc1234-1-aarch64.pkg.tar.zst", "url": "https://api.github.com/a/6", "size": 9},
                 {"name": "SHA256SUMS.txt", "url": "https://api.github.com/a/3", "size": 1,
                  "browser_download_url": "https://github.com/o/r/releases/download/v0.3.0/SHA256SUMS.txt"}
             ]
@@ -324,10 +483,53 @@ mod tests {
             r.sums.unwrap().url,
             "https://github.com/o/r/releases/download/v0.3.0/SHA256SUMS.txt"
         );
-        match asset_name("0.3.0") {
-            Some(name) => assert_eq!(r.asset.unwrap().name, name),
-            None => assert!(r.asset.is_none()),
+        let asset = r.asset.expect("a download for this computer");
+        assert!(is_platform_asset(&asset.name, "0.3.0"), "{}", asset.name);
+    }
+
+    #[test]
+    fn arch_packages() {
+        let name = "multimusic-0.3.2.r130.gabc1234-1-x86_64.pkg.tar.zst";
+        assert!(is_arch_package(name, "0.3.2", "x86_64"));
+        assert!(!is_arch_package(name, "0.3.2", "aarch64"));
+        assert!(!is_arch_package(name, "0.3.1", "x86_64"));
+        // 0.3.2 isn't 0.3.20.
+        assert!(!is_arch_package(
+            "multimusic-0.3.20-1-x86_64.pkg.tar.zst",
+            "0.3.2",
+            "x86_64"
+        ));
+        assert!(is_arch_package(
+            "multimusic-0.3.2-1-x86_64.pkg.tar.zst",
+            "0.3.2",
+            "x86_64"
+        ));
+        assert!(!is_arch_package(
+            "multimusic-debug-0.3.2-1-x86_64.pkg.tar.zst",
+            "0.3.2",
+            "x86_64"
+        ));
+    }
+
+    #[test]
+    fn sudo_answers() {
+        assert!(matches!(
+            sudo_refused("Sorry, try again.\nsudo: no password was provided\nsudo: 1 incorrect password attempt\n"),
+            InstallError::WrongPassword
+        ));
+        match sudo_refused("simo is not in the sudoers file.\n") {
+            InstallError::Failed(why) => assert!(why.contains("isn't allowed"), "{why}"),
+            other => panic!("{other:?}"),
         }
+        match sudo_refused("sudo: unable to resolve host\nsudo: something else\n") {
+            InstallError::Failed(why) => assert_eq!(why, "sudo: something else"),
+            other => panic!("{other:?}"),
+        }
+        let secret = Secret::new("hunter2".into());
+        assert_eq!(format!("{secret:?}"), "Secret(…)");
+        let mut text = String::from("hunter2");
+        wipe(&mut text);
+        assert!(text.is_empty());
     }
 
     #[test]

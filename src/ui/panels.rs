@@ -525,7 +525,11 @@ pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mu
     };
     let busy = matches!(
         update.status,
-        UpdateStatus::Downloading(_) | UpdateStatus::Installing | UpdateStatus::Failed(_)
+        UpdateStatus::Downloading(_)
+            | UpdateStatus::NeedsPassword { .. }
+            | UpdateStatus::Installing
+            | UpdateStatus::Installed
+            | UpdateStatus::Failed(_)
     );
     if !busy && (release.version == *skipped || release.version == *dismissed) {
         return;
@@ -550,9 +554,19 @@ pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mu
                         ui.label(format!("Downloading MultiMusic {version}…"));
                         ui.add(egui::ProgressBar::new(*done).desired_width(160.0).show_percentage());
                     }
+                    UpdateStatus::NeedsPassword { .. } => {
+                        ui.label(format!(
+                            "MultiMusic {version} is downloaded. Enter your password to install it."
+                        ));
+                    }
                     UpdateStatus::Installing => {
                         ui.spinner();
                         ui.label(format!("Installing MultiMusic {version}. It starts again in a moment."));
+                    }
+                    UpdateStatus::Installed => {
+                        ui.label(format!(
+                            "MultiMusic {version} is installed. Start MultiMusic again to use it."
+                        ));
                     }
                     UpdateStatus::Failed(why) => {
                         ui.label(egui::RichText::new(format!("The update didn't work: {why}")).color(DANGER));
@@ -585,8 +599,10 @@ pub fn update_bar(ui: &mut Ui, cx: &mut Cx, skipped: &mut String, dismissed: &mu
                     }
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if !matches!(update.status, UpdateStatus::Downloading(_) | UpdateStatus::Installing)
-                        && widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Later").clicked()
+                    if !matches!(
+                        update.status,
+                        UpdateStatus::Downloading(_) | UpdateStatus::NeedsPassword { .. } | UpdateStatus::Installing
+                    ) && widgets::icon_button(ui, icon::X, 13.0, TEXT_DIM, "Later").clicked()
                     {
                         *dismissed = version.clone();
                     }

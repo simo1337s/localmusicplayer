@@ -63,7 +63,7 @@ makepkg -si          # builds and installs the `multimusic` package
 
 Then launch **MultiMusic** from your app launcher, or run `multimusic`.
 
-To update later (MultiMusic shows a bar when a new version is out):
+**Updates:** when a new version is out, MultiMusic shows a bar with **Update now**. It downloads the release's ready-made package (built by GitHub Actions for x86_64), checks its SHA-256 checksum, asks for your password and installs it with `sudo pacman -U`, then starts again. To update by hand instead:
 
 ```sh
 cd localmusicplayer

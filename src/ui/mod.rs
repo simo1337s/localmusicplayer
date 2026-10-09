@@ -97,10 +97,26 @@ const MAX_TEXTURE_SIDE: usize = 2048;
 const NEUTRAL_TINT: Color32 = Color32::from_rgb(0x53, 0x53, 0x53);
 
 enum Dialog {
-    NewPlaylist { name: String, tracks: Vec<Track> },
-    Rename { id: String, name: String },
-    Delete { id: String, name: String },
-    ImportSettings { path: std::path::PathBuf },
+    NewPlaylist {
+        name: String,
+        tracks: Vec<Track>,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    Delete {
+        id: String,
+        name: String,
+    },
+    ImportSettings {
+        path: std::path::PathBuf,
+    },
+    /// The password to install a downloaded update with (Linux).
+    UpdatePassword {
+        password: String,
+        wrong: bool,
+    },
 }
 
 pub struct App {
@@ -137,6 +153,8 @@ pub struct App {
     restarting: bool,
     /// A new version the user put off for now.
     update_dismissed: String,
+    /// The last password request (`UpdateStatus::NeedsPassword`) a dialog was opened for.
+    password_asked: u32,
     /// The last `Feed::art_changed` number handled.
     art_changed_seen: u64,
     rt: tokio::runtime::Handle,
@@ -205,6 +223,7 @@ impl App {
             tag_editor: None,
             restarting: false,
             update_dismissed: String::new(),
+            password_asked: 0,
             art_changed_seen: 0,
             rt,
             settings: settings::SettingsState::default(),
@@ -561,9 +580,23 @@ impl App {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
+        // A downloaded update waits for the password.
+        let asked = match self.shared.feed.read().unwrap().update.status {
+            crate::service::UpdateStatus::NeedsPassword { attempt, wrong } => Some((attempt, wrong)),
+            _ => None,
+        };
+        if let Some((attempt, wrong)) = asked.filter(|(attempt, _)| *attempt > self.password_asked) {
+            self.password_asked = attempt;
+            self.dialog = Some(Dialog::UpdatePassword {
+                password: String::new(),
+                wrong,
+            });
+        }
         let Some(dialog) = self.dialog.as_mut() else { return };
         let mut close = false;
         let mut submit: Option<Command> = None;
+        // Read before the text fields take the key for themselves.
+        let enter_pressed = ctx.input(|i| i.key_pressed(Key::Enter));
         let modal = egui::Modal::new(egui::Id::new("dialog")).show(ctx, |ui| {
             ui.set_width(380.0);
             match dialog {
@@ -578,7 +611,7 @@ impl App {
                     r.request_focus();
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let enter = enter_pressed;
                         if (widgets::pill(ui, "Create", self.accent, theme::on_color(self.accent)).clicked() || enter)
                             && !name.trim().is_empty()
                         {
@@ -599,7 +632,7 @@ impl App {
                     r.request_focus();
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        let enter = enter_pressed;
                         if (widgets::pill(ui, "Save", self.accent, theme::on_color(self.accent)).clicked() || enter)
                             && !name.trim().is_empty()
                         {
@@ -635,6 +668,49 @@ impl App {
                         }
                     });
                 }
+                Dialog::UpdatePassword { password, wrong } => {
+                    let version = self
+                        .shared
+                        .feed
+                        .read()
+                        .unwrap()
+                        .update
+                        .available
+                        .as_ref()
+                        .map(|r| r.version.clone())
+                        .unwrap_or_default();
+                    ui.label(egui::RichText::new(format!("Install MultiMusic {version}")).font(theme::bold_font(18.0)));
+                    ui.add_space(6.0);
+                    ui.label(
+                        "The new version is downloaded and checked. Enter your password to install it \
+                         (with sudo pacman); MultiMusic then starts again.",
+                    );
+                    ui.add_space(10.0);
+                    let r = ui.add(
+                        egui::TextEdit::singleline(password)
+                            .password(true)
+                            .hint_text("Your password")
+                            .desired_width(f32::INFINITY),
+                    );
+                    r.request_focus();
+                    if *wrong {
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("That password didn't work. Try again.").color(theme::DANGER));
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        let enter = enter_pressed;
+                        if (widgets::pill(ui, "Install", self.accent, theme::on_color(self.accent)).clicked() || enter)
+                            && !password.is_empty()
+                        {
+                            let typed = std::mem::take(password);
+                            submit = Some(Command::AuthorizeUpdate(crate::updater::Secret::new(typed)));
+                        }
+                        if widgets::pill(ui, "Cancel", theme::CARD, theme::TEXT).clicked() {
+                            submit = Some(Command::CancelUpdate);
+                        }
+                    });
+                }
                 Dialog::Delete { id, name } => {
                     ui.label(egui::RichText::new("Delete playlist?").font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
@@ -655,6 +731,10 @@ impl App {
         });
         if modal.should_close() {
             close = true;
+            // Closing the password dialog (Escape, a click outside) cancels the update.
+            if matches!(self.dialog, Some(Dialog::UpdatePassword { .. })) {
+                submit.get_or_insert(Command::CancelUpdate);
+            }
         }
         if let Some(c) = submit {
             if let Command::DeletePlaylist(id) = &c {
@@ -669,6 +749,9 @@ impl App {
             close = true;
         }
         if close {
+            if let Some(Dialog::UpdatePassword { password, .. }) = self.dialog.as_mut() {
+                crate::updater::wipe(password);
+            }
             self.dialog = None;
         }
     }

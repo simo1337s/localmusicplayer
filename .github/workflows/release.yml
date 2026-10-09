@@ -1,6 +1,7 @@
 # Builds the Windows installer and the macOS apps (Apple Silicon and Intel) with everything
-# they need (mpv, yt-dlp, ffmpeg, the Inter font), and publishes them as the GitHub release of
-# the version in Cargo.toml. The apps' updater installs new releases from there.
+# they need (mpv, yt-dlp, ffmpeg, the Inter font) and the Arch Linux package, and publishes them
+# as the GitHub release of the version in Cargo.toml. The apps' updater installs new releases
+# from there.
 name: Release
 
 on:
@@ -12,6 +13,7 @@ on:
       - "Cargo.lock"
       - "assets/**"
       - "packaging/**"
+      - "PKGBUILD"
       - ".github/workflows/release.yml"
   workflow_dispatch:
 
@@ -297,8 +299,49 @@ jobs:
             dist/*.dmg
           if-no-files-found: error
 
+  arch:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Tools
+        run: pacman -Syu --noconfirm --needed git
+
+      - uses: actions/checkout@v4
+        with:
+          # The package version counts the commits.
+          fetch-depth: 0
+
+      - name: Build the package
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          # The PKGBUILD's dependencies first; makepkg itself won't run as root.
+          bash -c 'source PKGBUILD && pacman -S --noconfirm --needed "${depends[@]}" "${makedepends[@]}"'
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          sudo -H -u builder git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo -H -u builder makepkg -f --noconfirm
+          mkdir -p dist
+          mv multimusic-*.pkg.tar.zst dist/
+          ls -la dist
+
+      - name: Check the package installs and starts
+        run: |
+          set -euo pipefail
+          pacman -U --noconfirm dist/multimusic-*.pkg.tar.zst
+          pacman -Qi multimusic | head -3
+          test -x /usr/bin/multimusic
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*.pkg.tar.zst
+          if-no-files-found: error
+
   release:
-    needs: [windows, macos]
+    needs: [windows, macos, arch]
+    # A problem with the Linux package doesn't hold back the Windows and macOS versions.
+    if: ${{ !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -322,7 +365,7 @@ jobs:
 
           - **Windows 10/11:** run \`MultiMusic-Setup-$VERSION-x64.exe\`. It installs for your user (no administrator prompt) with everything MultiMusic needs (mpv, yt-dlp, ffmpeg).
           - **macOS 11+:** open the \`.dmg\` for your Mac (**arm64** for Apple Silicon M1/M2/M3/M4, **intel** for Intel Macs) and drag MultiMusic to Applications. The app isn't notarized by Apple, so the first time: right-click MultiMusic → Open → Open (or System Settings → Privacy & Security → Open Anyway).
-          - **Arch Linux:** build from the repository with \`makepkg -si\`.
+          - **Arch Linux (x86_64):** \`sudo pacman -U multimusic-*-x86_64.pkg.tar.zst\`, or build from the repository with \`makepkg -si\`.
 
           MultiMusic checks for updates by itself and installs them with one click.
           EOF

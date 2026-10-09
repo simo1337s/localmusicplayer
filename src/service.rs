@@ -117,7 +117,12 @@ pub enum Command {
         manual: bool,
     },
     /// Downloads and installs the new version found, then quits (it starts again by itself).
+    /// On Linux it then waits for the password (`Feed::update.status` asks for it).
     InstallUpdate,
+    /// The password to install the downloaded update with (Linux).
+    AuthorizeUpdate(crate::updater::Secret),
+    /// Don't install the downloaded update after all.
+    CancelUpdate,
     Rescan,
     /// Ask mpv which output devices exist (for the device picker).
     ListAudioDevices,
@@ -370,8 +375,16 @@ pub enum UpdateStatus {
     UpToDate,
     /// Downloading, 0.0..=1.0.
     Downloading(f32),
+    /// Downloaded and checked; installing needs the password (Linux). Each request has its
+    /// own number, so the UI asks once per request; `wrong` after a mistyped one.
+    NeedsPassword {
+        attempt: u32,
+        wrong: bool,
+    },
     /// The new version is being installed; MultiMusic quits and starts again.
     Installing,
+    /// Installed, but MultiMusic couldn't start itself again.
+    Installed,
     Failed(String),
 }
 
@@ -450,6 +463,10 @@ enum Internal {
         result: Result<crate::updater::Release, String>,
     },
     UpdateFailed(String),
+    /// The update was downloaded and checked; installing it needs the password.
+    UpdateDownloaded(PathBuf),
+    /// sudo and pacman are done: `Err(None)` means a wrong password.
+    UpdateInstalled(std::result::Result<(), Option<String>>),
     TagsEdited {
         /// The files read again, with their new modification times.
         tracks: Vec<(Track, i64)>,
@@ -649,6 +666,9 @@ pub struct Service {
     lastfm: Option<Arc<Lastfm>>,
     /// Loads the profile page's stats (made when first needed).
     profile_stats: Option<Arc<ProfileStats>>,
+    /// A downloaded update waiting for the password (Linux), and how often it was asked for.
+    update_package: Option<PathBuf>,
+    update_attempt: u32,
     scrobble: ScrobbleTracker,
     discord: Discord,
     mpris: Mpris,
@@ -774,6 +794,8 @@ impl Service {
             lyrics,
             lastfm,
             profile_stats: None,
+            update_package: None,
+            update_attempt: 0,
             scrobble: {
                 let mut tracker = ScrobbleTracker::new();
                 tracker.set_instant(cfg.lastfm.scrobble_instantly);
@@ -1080,6 +1102,14 @@ impl Service {
             Command::ImportSettings(path) => self.import_settings(&path),
             Command::CheckUpdates { manual } => self.check_updates(manual),
             Command::InstallUpdate => self.install_update(),
+            Command::AuthorizeUpdate(password) => self.authorize_update(password),
+            Command::CancelUpdate => {
+                if let Some(file) = self.update_package.take() {
+                    let _ = std::fs::remove_file(file);
+                }
+                self.shared.feed.write().unwrap().update.status = UpdateStatus::Idle;
+                self.shared.repaint();
+            }
             Command::Rescan => self.start_scan(),
             Command::ListAudioDevices => {
                 let binary = crate::tools::resolve(&self.cfg.playback.mpv_path, "mpv");
@@ -2830,7 +2860,7 @@ impl Service {
     fn install_update(&mut self) {
         let release = self.shared.feed.read().unwrap().update.available.clone();
         let Some(release) = release else { return };
-        let Some(asset) = release.asset.clone() else {
+        let Some(asset) = release.asset.clone().filter(|_| crate::updater::can_install()) else {
             let why = if crate::updater::can_install() {
                 "This release has no download for your system yet"
             } else {
@@ -2868,14 +2898,21 @@ impl Service {
                 let name = asset.name.clone();
                 let installed = tokio::task::spawn_blocking(move || {
                     crate::updater::verify(&file, &name, &sums_text)?;
-                    crate::updater::install(&file)
+                    if crate::updater::NEEDS_PASSWORD {
+                        // Installed once the password is in (`authorize_update`).
+                        return Ok(Some(file));
+                    }
+                    crate::updater::install(&file).map(|()| None)
                 })
                 .await?;
                 installed
             }
             .await;
             match result {
-                Ok(()) => {
+                Ok(Some(file)) => {
+                    let _ = tx.send(Internal::UpdateDownloaded(file));
+                }
+                Ok(None) => {
                     let mut feed = shared.feed.write().unwrap();
                     feed.update.status = UpdateStatus::Installing;
                     // Quit so the new version can take over (it starts by itself).
@@ -2888,6 +2925,67 @@ impl Service {
                 }
             }
         });
+    }
+
+    /// Asks the UI for the password to install the downloaded update.
+    fn ask_update_password(&mut self, wrong: bool) {
+        self.update_attempt += 1;
+        self.shared.feed.write().unwrap().update.status = UpdateStatus::NeedsPassword {
+            attempt: self.update_attempt,
+            wrong,
+        };
+        self.shared.repaint();
+    }
+
+    /// Installs the downloaded update with the password (Linux: sudo pacman -U).
+    fn authorize_update(&mut self, password: crate::updater::Secret) {
+        let Some(file) = self.update_package.clone() else {
+            return;
+        };
+        self.shared.feed.write().unwrap().update.status = UpdateStatus::Installing;
+        self.shared.repaint();
+        let tx = self.internal_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = crate::updater::install_package(&file, &password).map_err(|e| match e {
+                crate::updater::InstallError::WrongPassword => None,
+                crate::updater::InstallError::Failed(why) => Some(why),
+            });
+            drop(password);
+            let _ = tx.send(Internal::UpdateInstalled(result));
+        });
+    }
+
+    fn update_installed(&mut self, result: std::result::Result<(), Option<String>>) {
+        match result {
+            Ok(()) => {
+                if let Some(file) = self.update_package.take() {
+                    let _ = std::fs::remove_file(file);
+                }
+                #[cfg(unix)]
+                let restarted = crate::updater::relaunch();
+                #[cfg(not(unix))]
+                let restarted: Result<()> = Err(anyhow!("can't restart here"));
+                let mut feed = self.shared.feed.write().unwrap();
+                match restarted {
+                    Ok(()) => {
+                        tracing::info!("update installed; starting again");
+                        feed.update.status = UpdateStatus::Installing;
+                        feed.quit = true;
+                    }
+                    Err(e) => {
+                        tracing::warn!("update installed, but couldn't start again: {e:#}");
+                        feed.update.status = UpdateStatus::Installed;
+                    }
+                }
+                drop(feed);
+                self.shared.repaint();
+            }
+            Err(None) => self.ask_update_password(true),
+            Err(Some(why)) => {
+                self.shared.feed.write().unwrap().update.status = UpdateStatus::Failed(why);
+                self.shared.repaint();
+            }
+        }
     }
 
     // ---------------------------------------------------------------- settings files
@@ -3965,6 +4063,11 @@ impl Service {
                 self.shared.feed.write().unwrap().update.status = UpdateStatus::Failed(e);
                 self.shared.repaint();
             }
+            Internal::UpdateDownloaded(file) => {
+                self.update_package = Some(file);
+                self.ask_update_password(false);
+            }
+            Internal::UpdateInstalled(result) => self.update_installed(result),
             Internal::TagsEdited {
                 tracks,
                 errors,
