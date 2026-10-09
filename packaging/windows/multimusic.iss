@@ -14,10 +14,10 @@ AppId={{6B0E8D4A-1F57-4C6B-9E1B-2D7A5C1F3E90}
 AppName=MultiMusic
 AppVersion={#AppVersion}
 AppVerName=MultiMusic {#AppVersion}
-AppPublisher=simo1337s
-AppPublisherURL=https://github.com/simo1337s/localmusicplayer
-AppSupportURL=https://github.com/simo1337s/localmusicplayer/issues
-AppUpdatesURL=https://github.com/simo1337s/localmusicplayer/releases
+AppPublisher=v0-0x
+AppPublisherURL=https://github.com/v0-0x/localmusicplayer
+AppSupportURL=https://github.com/v0-0x/localmusicplayer/issues
+AppUpdatesURL=https://github.com/v0-0x/localmusicplayer/releases
 ; Installed for the current user: no administrator prompt, and updates install silently.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog

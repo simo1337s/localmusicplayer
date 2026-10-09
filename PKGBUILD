@@ -1,11 +1,11 @@
-# Maintainer: simo1337s
+# Maintainer: v0-0x
 # Builds MultiMusic from this checkout:  makepkg -si
 pkgname=multimusic
 pkgver=0.1.0
 pkgrel=1
 pkgdesc="Lightweight native music player for local files, Spotify and SoundCloud with synced lyrics, Discord Rich Presence and Last.fm scrobbling"
 arch=('x86_64' 'aarch64')
-url="https://github.com/simo1337s/localmusicplayer"
+url="https://github.com/v0-0x/localmusicplayer"
 license=('MIT')
 depends=('mpv' 'libpulse' 'alsa-lib' 'openssl' 'libxkbcommon' 'libglvnd' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi'
          'hicolor-icon-theme' 'gcc-libs' 'glibc')

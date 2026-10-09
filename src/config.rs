@@ -285,6 +285,12 @@ pub const DEFAULT_ACCENT: [u8; 3] = [0xe9, 0xe6, 0xdf];
 /// The accent older versions used by default; replaced by the new default on load.
 const OLD_DEFAULT_ACCENT: [u8; 3] = [0x8b, 0x7c, 0xf6];
 
+/// Where new versions come from.
+pub const UPDATES_REPO: &str = "v0-0x/localmusicplayer";
+/// The repository's address before its owner was renamed. GitHub only redirects from it until
+/// someone else takes the name, so saved settings move to the new one.
+const OLD_UPDATES_REPO: &str = "simo1337s/localmusicplayer";
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct UiConfig {
@@ -350,7 +356,7 @@ impl Default for UpdatesConfig {
     fn default() -> Self {
         UpdatesConfig {
             check: true,
-            repo: "simo1337s/localmusicplayer".into(),
+            repo: UPDATES_REPO.into(),
             skipped: String::new(),
         }
     }
@@ -481,6 +487,9 @@ impl Config {
         if self.ui.accent == OLD_DEFAULT_ACCENT {
             self.ui.accent = DEFAULT_ACCENT;
         }
+        if self.updates.repo.trim().eq_ignore_ascii_case(OLD_UPDATES_REPO) {
+            self.updates.repo = UPDATES_REPO.into();
+        }
         let old_folder = std::mem::take(&mut self.soundcloud.download_folder);
         if self.downloads.folder.is_empty() {
             self.downloads.folder = old_folder;
@@ -591,5 +600,17 @@ mod tests {
         let mut cfg: Config = toml::from_str("[ui]\naccent = [200, 10, 10]\n").unwrap();
         cfg.upgrade();
         assert_eq!(cfg.ui.accent, [200, 10, 10]);
+    }
+
+    #[test]
+    fn updates_come_from_the_renamed_repository() {
+        let mut cfg: Config = toml::from_str("[updates]\nrepo = \"simo1337s/localmusicplayer\"\n").unwrap();
+        cfg.upgrade();
+        assert_eq!(cfg.updates.repo, UPDATES_REPO);
+        assert_eq!(Config::default().updates.repo, UPDATES_REPO);
+        // Another repository someone chose is kept.
+        let mut cfg: Config = toml::from_str("[updates]\nrepo = \"someone/fork\"\n").unwrap();
+        cfg.upgrade();
+        assert_eq!(cfg.updates.repo, "someone/fork");
     }
 }

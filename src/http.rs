@@ -6,7 +6,7 @@ use std::time::Duration;
 pub const USER_AGENT: &str = concat!(
     "MultiMusic/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/simo1337s/localmusicplayer)"
+    " (https://github.com/v0-0x/localmusicplayer)"
 );
 
 /// One client for the whole app: clones share the connection pool and the TLS

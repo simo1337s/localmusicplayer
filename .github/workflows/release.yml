@@ -114,7 +114,7 @@ jobs:
           Copy-Item target\release\multimusic.exe stage\
           dl\rcedit.exe stage\multimusic.exe --set-icon assets\multimusic.ico `
             --set-version-string ProductName MultiMusic --set-version-string FileDescription MultiMusic `
-            --set-version-string CompanyName simo1337s --set-file-version $env:VERSION --set-product-version $env:VERSION
+            --set-version-string CompanyName v0-0x --set-file-version $env:VERSION --set-product-version $env:VERSION
           if ($LASTEXITCODE -ne 0) { throw "rcedit failed" }
           Copy-Item LICENSE stage\LICENSE.txt
           Copy-Item packaging\THIRD-PARTY.txt stage\
