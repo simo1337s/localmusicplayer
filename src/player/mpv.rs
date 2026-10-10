@@ -44,6 +44,29 @@ pub struct MpvOptions {
     pub exclusive: bool,
 }
 
+/// ReplayGain 2.0 tags level songs to -18 LUFS, Spotify's "Normalize volume" to about
+/// -14 LUFS: this lifts tagged files to Spotify's level (mpv lowers it again where the
+/// song would clip).
+const REPLAYGAIN_PREAMP_DB: f64 = 4.0;
+/// Songs without ReplayGain tags (SoundCloud streams, untagged files) are mostly mastered
+/// at -10 to -6 LUFS, well above Spotify's level.
+const REPLAYGAIN_FALLBACK_DB: f64 = -6.0;
+
+/// mpv's loudness levelling properties. mpv applies the fallback gain even with ReplayGain
+/// off, so it must be 0 then (bit-perfect playback included).
+fn loudness(on: bool) -> [(&'static str, Value); 3] {
+    let (mode, preamp, fallback) = if on {
+        ("track", REPLAYGAIN_PREAMP_DB, REPLAYGAIN_FALLBACK_DB)
+    } else {
+        ("no", 0.0, 0.0)
+    };
+    [
+        ("replaygain", json!(mode)),
+        ("replaygain-preamp", json!(preamp)),
+        ("replaygain-fallback", json!(fallback)),
+    ]
+}
+
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 
 /// Events from one mpv instance, tagged with its [`Mpv::id`] (crossfades run two at once).
@@ -85,7 +108,6 @@ impl Mpv {
             .arg("--volume-max=100")
             .arg(format!("--volume={}", opts.volume.clamp(0.0, 100.0)))
             .arg(format!("--gapless-audio={}", if opts.gapless { "weak" } else { "no" }))
-            .arg(format!("--replaygain={}", if opts.replaygain { "track" } else { "no" }))
             .arg(format!(
                 "--audio-exclusive={}",
                 if opts.exclusive { "yes" } else { "no" }
@@ -105,6 +127,12 @@ impl Mpv {
         }
         if !opts.audio_device.is_empty() {
             cmd.arg(format!("--audio-device={}", opts.audio_device));
+        }
+        for (name, value) in loudness(opts.replaygain) {
+            match value.as_str() {
+                Some(text) => cmd.arg(format!("--{name}={text}")),
+                None => cmd.arg(format!("--{name}={value}")),
+            };
         }
         // Skip mpv's built-in Lua scripts (OSC, console, stats, ...): an audio backend
         // doesn't need them and each one costs memory. Options differ between versions,
@@ -249,6 +277,14 @@ impl Mpv {
         self.command(json!(["set_property", "volume", volume.clamp(0.0, 100.0)]))
             .await
             .map(|_| ())
+    }
+
+    /// Turns loudness levelling (see [`loudness`]) on or off.
+    pub async fn set_replaygain(&self, on: bool) -> Result<()> {
+        for (name, value) in loudness(on) {
+            self.command(json!(["set_property", name, value])).await?;
+        }
+        Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -544,6 +580,65 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(loaded, HashSet::from([7, 8]));
         assert_eq!(ended, HashSet::from([7, 8]));
+    }
+
+    /// Renders a generated WAV file (no ReplayGain tags) through a real mpv, if one is
+    /// installed, and checks how loud it comes out: the volume is cubic (50% is 1/8, as the
+    /// Spotify player does it) and levelling lowers untagged songs by 6 dB.
+    #[tokio::test]
+    async fn real_mpv_levels() {
+        if std::process::Command::new("mpv").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("multimusic-mpv-levels-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("tone.wav");
+        write_test_wav(&wav, 1.0);
+        let opts = MpvOptions {
+            binary: "mpv".into(),
+            volume: 50.0,
+            replaygain: true,
+            gapless: true,
+            audio_device: String::new(),
+            exclusive: false,
+        };
+        let mut peaks = Vec::new();
+        for levelling in [true, false] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let mpv = Mpv::spawn(&opts, 20 + levelling as u64, tx).await.unwrap();
+            if !levelling {
+                mpv.set_replaygain(false).await.unwrap();
+            }
+            let out = dir.join(format!("out-{levelling}.wav"));
+            for (name, value) in [
+                ("ao-pcm-file", json!(out.to_string_lossy())),
+                ("audio-format", json!("s16")),
+                ("ao", json!("pcm")),
+            ] {
+                mpv.command(json!(["set_property", name, value])).await.unwrap();
+            }
+            mpv.load(&wav.to_string_lossy(), 0.0).await.unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while let Ok(Some((_, ev))) = tokio::time::timeout_at(deadline, rx.recv()).await {
+                if matches!(ev, MpvEvent::EndFile { .. }) {
+                    break;
+                }
+            }
+            mpv.quit().await;
+            let data = std::fs::read(&out).unwrap();
+            let start = data.windows(4).position(|w| w == b"data").unwrap() + 8;
+            let peak = data[start..]
+                .chunks_exact(2)
+                .map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs())
+                .max()
+                .unwrap();
+            peaks.push(peak as f32);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+        // The test tone peaks at 8000.
+        let close = |got: f32, want: f32| (got - want).abs() < want * 0.03;
+        assert!(close(peaks[0], 8000.0 * 0.125 * 0.501), "levelling on: {}", peaks[0]);
+        assert!(close(peaks[1], 8000.0 * 0.125), "levelling off: {}", peaks[1]);
     }
 
     fn write_test_wav(path: &std::path::Path, secs: f32) {

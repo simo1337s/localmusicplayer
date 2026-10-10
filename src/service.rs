@@ -567,6 +567,8 @@ const FADE_STEP: Duration = Duration::from_millis(50);
 const MAX_CROSSFADE: f32 = 12.0;
 /// Shortest fade, used when the previous track is almost over.
 const MIN_FADE: f64 = 0.3;
+/// How long the volume has to stay put before it is saved.
+const VOLUME_SAVE_DELAY: Duration = Duration::from_secs(2);
 
 /// The previous track during a crossfade, fading out on its own player.
 struct Fading {
@@ -684,6 +686,8 @@ pub struct Service {
     discord: Discord,
     mpris: Mpris,
     last_tick: Instant,
+    /// When the volume last changed and isn't saved yet (saved once it settles).
+    volume_changed_at: Option<Instant>,
 
     /// Running downloads by track id: their task and work folder.
     download_jobs: HashMap<String, (tokio::task::AbortHandle, PathBuf)>,
@@ -815,6 +819,7 @@ impl Service {
             discord,
             mpris,
             last_tick: Instant::now(),
+            volume_changed_at: None,
             download_jobs: HashMap::new(),
             download_seq: 0,
             download_batch: Vec::new(),
@@ -892,12 +897,18 @@ impl Service {
                 let _ = lfm.flush_queue().await;
             });
         }
+        // Media controls report 100% until told otherwise, and desktop volume controls
+        // step from what they report.
+        self.mpris.set_volume(self.cfg.playback.volume);
         self.publish_player();
         self.publish_queue();
     }
 
     async fn shutdown(&mut self) {
         self.save_session();
+        if self.volume_changed_at.take().is_some() {
+            self.save_config();
+        }
         self.discord.shutdown();
         self.cancel_fades().await;
         if let Some(sp) = self.spotify.take() {
@@ -972,6 +983,7 @@ impl Service {
                 }
                 self.mpris.set_volume(v);
                 self.publish_player();
+                self.volume_changed_at = Some(Instant::now());
             }
             Command::SetShuffle(on) => {
                 self.queue.set_shuffle(on);
@@ -1882,6 +1894,11 @@ impl Service {
             }
         }
 
+        // Save the volume once it stops changing (a drag sends dozens of changes).
+        if self.volume_changed_at.is_some_and(|t| t.elapsed() >= VOLUME_SAVE_DELAY) {
+            self.volume_changed_at = None;
+            self.save_config();
+        }
         self.scrobble.tick(playing, dt);
         self.scrobble_if_due();
         if playing {
@@ -3916,6 +3933,9 @@ impl Service {
         // Secrets obtained by the service are not editable in the UI copy.
         cfg.lastfm.session_key = self.cfg.lastfm.session_key.clone();
         cfg.lastfm.username = self.cfg.lastfm.username.clone();
+        // The volume is set with SetVolume; the UI's copy is the one it started with, and
+        // taking it would jump back to that volume on the next song.
+        cfg.playback.volume = self.cfg.playback.volume;
         let old = std::mem::replace(&mut self.cfg, cfg);
 
         if old.playback != self.cfg.playback {
@@ -3928,13 +3948,7 @@ impl Service {
                         if p.bit_perfect { "yes" } else { "no" }
                     ]))
                     .await;
-                let _ = mpv
-                    .command(serde_json::json!([
-                        "set_property",
-                        "replaygain",
-                        if p.replaygain && !p.bit_perfect { "track" } else { "no" }
-                    ]))
-                    .await;
+                let _ = mpv.set_replaygain(p.replaygain && !p.bit_perfect).await;
                 let _ = mpv
                     .command(serde_json::json!([
                         "set_property",

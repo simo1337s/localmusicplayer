@@ -457,7 +457,12 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                          Albums stay gapless unless you tick the box above. Crossfade is off in bit-perfect mode.",
                     );
                 }
-                ui.checkbox(&mut cfg.playback.replaygain, "Use ReplayGain tags (local files)");
+                ui.checkbox(&mut cfg.playback.replaygain, "Even out loudness (local files and SoundCloud)");
+                hint(
+                    ui,
+                    "Plays songs about as loud as Spotify's \"Normalize volume\": files with ReplayGain tags \
+                     follow their tags, SoundCloud and untagged files play 6 dB quieter. Off in bit-perfect mode.",
+                );
                 ui.checkbox(&mut cfg.lyrics.enabled, "Show lyrics");
                 ui.checkbox(
                     &mut cfg.lyrics.online,

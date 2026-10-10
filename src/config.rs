@@ -75,7 +75,15 @@ pub struct PlaybackConfig {
     pub crossfade: f32,
     /// Also crossfade between songs of the same album (they play gapless otherwise).
     pub crossfade_albums: bool,
+    /// Which loudness curve `volume` was set on (see [`VOLUME_CURVE`]). Missing in settings
+    /// saved before there was a choice.
+    #[serde(default)]
+    pub volume_curve: u8,
 }
+
+/// The volume's loudness curve: 1 = mpv's cubic curve for every source. Before (0), Spotify
+/// followed librespot's 60 dB curve, about 12 dB quieter than mpv at the same setting.
+pub const VOLUME_CURVE: u8 = 1;
 
 impl Default for PlaybackConfig {
     fn default() -> Self {
@@ -88,6 +96,7 @@ impl Default for PlaybackConfig {
             bit_perfect: false,
             crossfade: 0.0,
             crossfade_albums: false,
+            volume_curve: VOLUME_CURVE,
         }
     }
 }
@@ -494,6 +503,15 @@ impl Config {
         if self.downloads.folder.is_empty() {
             self.downloads.folder = old_folder;
         }
+        if self.playback.volume_curve < VOLUME_CURVE {
+            // Keep Spotify as loud as it was, so nothing gets louder: its old curve played
+            // 1000^(v-1), the new one plays v³. Local files and SoundCloud get quieter.
+            let v = self.playback.volume.clamp(0.0, 100.0) / 100.0;
+            if v > 0.0 {
+                self.playback.volume = (1000.0 * 10f32.powf(v - 1.0)).round() / 10.0;
+            }
+            self.playback.volume_curve = VOLUME_CURVE;
+        }
     }
 
     pub fn save(&self, paths: &Paths) -> anyhow::Result<()> {
@@ -589,6 +607,29 @@ mod tests {
         cfg.upgrade();
         assert_eq!(cfg.downloads.folder, "/old");
         assert!(!toml::to_string(&cfg).unwrap().contains("download_folder"));
+    }
+
+    #[test]
+    fn volume_moves_to_the_new_curve_once() {
+        let upgraded = |text: &str| {
+            let mut cfg: Config = toml::from_str(text).unwrap();
+            cfg.upgrade();
+            cfg.playback
+        };
+        // Saved before the curves were the same: Spotify's loudness is kept.
+        for (old, new) in [(100.0, 100.0), (70.0, 50.1), (50.0, 31.6), (30.0, 20.0), (0.0, 0.0)] {
+            let p = upgraded(&format!("[playback]\nvolume = {old:.1}\n"));
+            assert_eq!((p.volume, p.volume_curve), (new, VOLUME_CURVE), "from {old}");
+        }
+        // Saved since: left alone, also when loaded again.
+        let p = upgraded("[playback]\nvolume = 50.0\nvolume_curve = 1\n");
+        assert_eq!(p.volume, 50.0);
+        let mut cfg = Config::default();
+        cfg.playback.volume = 31.6;
+        let text = toml::to_string(&cfg).unwrap();
+        assert_eq!(upgraded(&text).volume, 31.6);
+        // A new install starts on the new curve.
+        assert_eq!(Config::default().playback.volume_curve, VOLUME_CURVE);
     }
 
     #[test]
