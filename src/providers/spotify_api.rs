@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, warn};
 
-use crate::model::{ArtistHit, Source, Track};
+use crate::model::{ArtistHit, CollectionHit, Source, Track};
 
 const API_BASE: &str = "https://api.spotify.com/v1";
 
@@ -291,16 +291,23 @@ impl SpotifyApi {
         query: &str,
         limit: u32,
     ) -> Result<(Vec<Track>, Vec<ArtistHit>)> {
+        let hits = self.search_types(token, query, "track,artist", limit).await?;
+        Ok((hits.tracks, hits.artists))
+    }
+
+    /// Songs, artists, albums and public playlists matching `query`.
+    pub async fn search_all(&self, token: &str, query: &str, limit: u32) -> Result<SearchHits> {
+        self.search_types(token, query, "track,artist,album,playlist", limit)
+            .await
+    }
+
+    async fn search_types(&self, token: &str, query: &str, types: &str, limit: u32) -> Result<SearchHits> {
         let query = query.trim();
         let limit = limit.min(MAX_SEARCH_LIMIT);
         if query.is_empty() || limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(SearchHits::default());
         }
-        let base = format!(
-            "{}/search?type=track,artist&q={}",
-            self.base,
-            urlencoding::encode(query)
-        );
+        let base = format!("{}/search?type={types}&q={}", self.base, urlencoding::encode(query));
         let first = with_param(&base, "limit", limit);
         let page = match self.get_json_with(token, &first, Patience::Interactive).await {
             Ok(page) => page,
@@ -327,8 +334,13 @@ impl SpotifyApi {
                 tracks.push(t);
             }
         }
-        let artists = items("artists").iter().filter_map(parse_artist_hit).collect();
-        Ok((tracks, artists))
+        Ok(SearchHits {
+            tracks,
+            artists: items("artists").iter().filter_map(parse_artist_hit).collect(),
+            albums: items("albums").iter().filter_map(parse_album_hit).collect(),
+            // Spotify lists playlists it can't show as null.
+            playlists: items("playlists").iter().filter_map(parse_playlist_hit).collect(),
+        })
     }
 
     /// Save (`liked = true`) or remove a track from the user's Liked Songs.
@@ -351,6 +363,26 @@ impl SpotifyApi {
                     .with_context(|| format!("{action} Spotify track {uri} (/me/library: {e})"))
             }
             Err(e) => Err(e.context(format!("{action} Spotify track {uri}"))),
+        }
+    }
+
+    /// Save (`saved = true`) or remove an album (by id) in the user's Spotify library.
+    pub async fn set_album_saved(&self, token: &str, album_id: &str, saved: bool) -> Result<()> {
+        let uri = format!("spotify:album:{album_id}");
+        let method = if saved { Method::PUT } else { Method::DELETE };
+        let action = if saved { "saving" } else { "removing" };
+        let url = format!("{}/me/library?uris={}", self.base, urlencoding::encode(&uri));
+        match self.send(method.clone(), &url, token).await {
+            Ok(_) => Ok(()),
+            Err(e) if matches!(error_status(&e), Some(400 | 404 | 405)) => {
+                warn!(%uri, error = %e, "Spotify /me/library refused, falling back to /me/albums");
+                let url = format!("{}/me/albums?ids={}", self.base, urlencoding::encode(album_id));
+                self.send(method, &url, token)
+                    .await
+                    .map(|_| ())
+                    .with_context(|| format!("{action} Spotify album {uri} (/me/library: {e})"))
+            }
+            Err(e) => Err(e.context(format!("{action} Spotify album {uri}"))),
         }
     }
 
@@ -733,6 +765,76 @@ pub fn parse_user(v: &Value) -> Option<SpotifyUser> {
 }
 
 /// Maps a Web API artist object to a search hit.
+/// What a search found.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SearchHits {
+    pub tracks: Vec<Track>,
+    pub artists: Vec<ArtistHit>,
+    pub albums: Vec<CollectionHit>,
+    pub playlists: Vec<CollectionHit>,
+}
+
+/// An album in search results.
+pub fn parse_album_hit(v: &Value) -> Option<CollectionHit> {
+    let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let title = v
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let by = v
+        .get("artists")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.get("name").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some(CollectionHit {
+        key: format!("spotify:album:{id}"),
+        title: title.to_string(),
+        by,
+        image: v.get("images").and_then(pick_image),
+        source: Source::Spotify,
+        album: true,
+        songs: v.get("total_tracks").and_then(as_u64_lenient).map(|n| n as u32),
+        year: v
+            .get("release_date")
+            .and_then(Value::as_str)
+            .and_then(|d| d.get(..4))
+            .and_then(|y| y.parse().ok()),
+    })
+}
+
+/// A public playlist in search results.
+pub fn parse_playlist_hit(v: &Value) -> Option<CollectionHit> {
+    let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+    let title = v
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let songs = ["tracks", "items"]
+        .iter()
+        .find_map(|k| v.get(k).and_then(|t| t.get("total")).and_then(as_u64_lenient));
+    Some(CollectionHit {
+        key: format!("spotify:playlist:{id}"),
+        title: title.to_string(),
+        by: v
+            .pointer("/owner/display_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        image: v.get("images").and_then(pick_image),
+        source: Source::Spotify,
+        album: false,
+        songs: songs.map(|n| n as u32),
+        year: None,
+    })
+}
+
 pub fn parse_artist_hit(v: &Value) -> Option<ArtistHit> {
     let id = v.get("id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
     let name = v.get("name").and_then(Value::as_str).filter(|s| !s.is_empty())?;
@@ -1090,6 +1192,30 @@ mod tests {
 
     // 2023-05-12T18:22:31Z
     const ADDED: i64 = 1_683_915_751;
+
+    #[test]
+    fn album_and_playlist_hits() {
+        let album = json!({
+            "id": "1x", "name": "Eversince", "release_date": "2016-05-04", "total_tracks": 13,
+            "artists": [{"name": "Bladee"}],
+            "images": [{"url": "https://i/640", "width": 640}, {"url": "https://i/300", "width": 300}]
+        });
+        let a = parse_album_hit(&album).unwrap();
+        assert_eq!(a.key, "spotify:album:1x");
+        assert_eq!((a.by.as_str(), a.year, a.songs), ("Bladee", Some(2016), Some(13)));
+        assert_eq!(a.image.as_deref(), Some("https://i/300"));
+        assert_eq!(a.subtitle(), "Bladee · 2016");
+        let list = json!({
+            "id": "37i", "name": "Drain Gang Essentials", "owner": {"display_name": "Spotify"},
+            "tracks": {"total": 50}, "images": []
+        });
+        let p = parse_playlist_hit(&list).unwrap();
+        assert_eq!(p.key, "spotify:playlist:37i");
+        assert!(!p.album);
+        assert_eq!(p.subtitle(), "by Spotify · 50 songs");
+        // Spotify sends null for playlists it won't show.
+        assert!(parse_playlist_hit(&Value::Null).is_none());
+    }
 
     #[test]
     fn parses_old_playlist_item_shape() {

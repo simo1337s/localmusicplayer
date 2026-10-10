@@ -105,9 +105,11 @@ enum Dialog {
         id: String,
         name: String,
     },
+    /// Delete a playlist, or remove a saved album (`album`: where it's from).
     Delete {
         id: String,
         name: String,
+        album: Option<crate::model::Source>,
     },
     ImportSettings {
         path: std::path::PathBuf,
@@ -327,15 +329,15 @@ impl App {
                 }
                 Action::Rename(id, name) => self.dialog = Some(Dialog::Rename { id, name }),
                 Action::Delete(id) => {
-                    let name = self
+                    let (name, album) = self
                         .shared
                         .library
                         .read()
                         .unwrap()
                         .playlist(&id)
-                        .map(|p| p.name.clone())
+                        .map(|p| (p.name.clone(), p.kind.is_album().then(|| p.kind.source()).flatten()))
                         .unwrap_or_default();
-                    self.dialog = Some(Dialog::Delete { id, name });
+                    self.dialog = Some(Dialog::Delete { id, name, album });
                 }
                 Action::OpenUrl(url) => {
                     let _ = open::that_detached(url);
@@ -711,15 +713,30 @@ impl App {
                         }
                     });
                 }
-                Dialog::Delete { id, name } => {
-                    ui.label(egui::RichText::new("Delete playlist?").font(theme::bold_font(18.0)));
+                Dialog::Delete { id, name, album } => {
+                    let (title, text, button) = match album {
+                        Some(crate::model::Source::Spotify) => (
+                            "Remove album?",
+                            format!("“{name}” will be removed from your albums and your Spotify library."),
+                            "Remove",
+                        ),
+                        Some(_) => (
+                            "Remove album?",
+                            format!("“{name}” will be removed from your albums."),
+                            "Remove",
+                        ),
+                        None => (
+                            "Delete playlist?",
+                            format!("“{name}” will be removed from Sumo. Songs stay in your library."),
+                            "Delete",
+                        ),
+                    };
+                    ui.label(egui::RichText::new(title).font(theme::bold_font(18.0)));
                     ui.add_space(6.0);
-                    ui.label(format!(
-                        "“{name}” will be removed from Sumo. Songs stay in your library."
-                    ));
+                    ui.label(text);
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
-                        if widgets::pill(ui, "Delete", theme::DANGER, Color32::WHITE).clicked() {
+                        if widgets::pill(ui, button, theme::DANGER, Color32::WHITE).clicked() {
                             submit = Some(Command::DeletePlaylist(id.clone()));
                         }
                         if widgets::pill(ui, "Cancel", theme::CARD, theme::TEXT).clicked() {

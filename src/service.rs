@@ -20,8 +20,8 @@ use crate::integrations::mpris::Mpris;
 use crate::library::{self, liked_playlist, Db, Library, LIKED_ID};
 use crate::links::{self, LinkKind, Target};
 use crate::model::{
-    normalize_artist, normalize_title, now_unix, ArtistHit, AudioQuality, ImportedPlaylist, Lyrics, Playlist,
-    PlaylistKind, RepeatMode, Source, Track,
+    normalize_artist, normalize_title, now_unix, ArtistHit, AudioQuality, CollectionHit, ImportedPlaylist, Lyrics,
+    Playlist, PlaylistKind, RepeatMode, Source, Track,
 };
 use crate::player::mpv::{Mpv, MpvEvent, MpvOptions, MpvSender};
 use crate::player::queue::Queue;
@@ -80,6 +80,8 @@ pub enum Command {
         name: String,
     },
     DeletePlaylist(String),
+    /// Saves the album on the open page (by its page key) to the library's albums.
+    SaveAlbum(String),
     /// Shows a message (for things the UI does on its own, like copying songs).
     Notify(String),
     /// The main window's native handle (an HWND on Windows), for the system media controls.
@@ -253,6 +255,9 @@ pub struct SearchState {
     pub soundcloud: Vec<Track>,
     /// Spotify artists and SoundCloud profiles, best matches first.
     pub artists: Vec<ArtistHit>,
+    /// Albums and public playlists from Spotify and SoundCloud.
+    pub albums: Vec<CollectionHit>,
+    pub playlists: Vec<CollectionHit>,
     pub spotify_pending: bool,
     pub soundcloud_pending: bool,
     pub errors: Vec<String>,
@@ -276,6 +281,8 @@ pub struct PageState {
     pub source: Option<Source>,
     pub title: String,
     pub subtitle: String,
+    /// An album's artist.
+    pub artist: String,
     pub image: Option<String>,
     /// Artist pictures are drawn round.
     pub round: bool,
@@ -487,6 +494,8 @@ enum Internal {
         source: Source,
         tracks: Result<Vec<Track>>,
         artists: Vec<ArtistHit>,
+        albums: Vec<CollectionHit>,
+        playlists: Vec<CollectionHit>,
     },
     /// The client_id SoundCloud accepted, saved so the next start needn't scrape one.
     SoundCloudClientId(String),
@@ -534,6 +543,8 @@ struct SpotifySync {
     playlists: Vec<(SpotifyPlaylistMeta, Option<Vec<String>>)>,
     /// Liked Songs track ids, newest first.
     liked: Vec<String>,
+    /// Albums saved on Spotify that are new to the library.
+    albums: Vec<Playlist>,
     /// New or updated track metadata.
     tracks: Vec<Track>,
 }
@@ -1064,9 +1075,19 @@ impl Service {
             Command::LookUpTags { request, track } => self.look_up_tags(request, track),
             Command::DeletePlaylist(id) => {
                 if id != LIKED_ID {
+                    let album = {
+                        let lib = self.shared.library.read().unwrap();
+                        lib.playlist(&id)
+                            .filter(|p| p.kind == PlaylistKind::SpotifyAlbum)
+                            .and_then(|p| p.remote_id.clone())
+                    };
                     self.save_playlists(vec![], &[id]);
+                    if let Some(album) = album {
+                        self.spotify_album_saved(album, false);
+                    }
                 }
             }
+            Command::SaveAlbum(key) => self.save_album(&key),
             Command::ImportM3u(path) => {
                 let shared = self.shared.clone();
                 let tx = self.internal_tx.clone();
@@ -2269,6 +2290,69 @@ impl Service {
         self.shared.repaint();
     }
 
+    /// Saves the album on the open page to the library's albums (and to Spotify's library when
+    /// signed in, like liked songs).
+    fn save_album(&mut self, key: &str) {
+        let page = self.shared.feed.read().unwrap().page.clone();
+        if page.key != key || page.kind != "Album" || page.loading || page.tracks.is_empty() {
+            return;
+        }
+        let (kind, remote) = match (page.source, links::target(key)) {
+            (Some(Source::Spotify), Some(links::Target::Spotify(LinkKind::Album, id))) => {
+                (PlaylistKind::SpotifyAlbum, id)
+            }
+            (Some(Source::SoundCloud), _) => (PlaylistKind::SoundCloudAlbum, key.to_string()),
+            _ => return,
+        };
+        let artist = if page.artist.is_empty() {
+            page.tracks.first().map(|t| t.artist.clone()).unwrap_or_default()
+        } else {
+            page.artist.clone()
+        };
+        // SoundCloud songs often come without an album: they are on this one.
+        let tracks: Vec<Track> = page
+            .tracks
+            .iter()
+            .cloned()
+            .map(|mut t| {
+                if t.album.trim().is_empty() {
+                    t.album = page.title.clone();
+                }
+                t
+            })
+            .collect();
+        self.store_tracks(&tracks);
+        self.save_playlists(
+            vec![Playlist {
+                id: saved_album_id(kind, &remote),
+                name: page.title.clone(),
+                kind,
+                remote_id: Some(remote.clone()),
+                description: artist,
+                art: page.image.clone(),
+                track_ids: page.tracks.iter().map(|t| t.id.clone()).collect(),
+            }],
+            &[],
+        );
+        self.shared.info(format!("Saved “{}” to your albums", page.title));
+        if kind == PlaylistKind::SpotifyAlbum {
+            self.spotify_album_saved(remote, true);
+        }
+    }
+
+    /// Keeps Spotify's library in step with an album saved or removed here.
+    fn spotify_album_saved(&self, album_id: String, saved: bool) {
+        let Some(auth) = self.user_web_auth() else { return };
+        let api = self.spotify_api.clone();
+        tokio::spawn(async move {
+            if let Ok(token) = auth.token().await {
+                if let Err(e) = api.set_album_saved(&token, &album_id, saved).await {
+                    tracing::warn!("Spotify album sync failed: {e:#}");
+                }
+            }
+        });
+    }
+
     fn toggle_like(&mut self, track: Track) {
         self.store_tracks(std::slice::from_ref(&track));
         let (liked_now, playlist) = {
@@ -2455,13 +2539,20 @@ impl Service {
         };
         self.spotify_syncing = true;
         self.set_account(|f| &mut f.spotify, AccountStatus::Working("Syncing playlists…".into()));
-        let known: HashSet<String> = {
+        let (known, known_albums): (HashSet<String>, HashSet<String>) = {
             let lib = self.shared.library.read().unwrap();
-            lib.tracks
-                .values()
-                .filter(|t| t.source == Source::Spotify)
-                .map(|t| t.id.clone())
-                .collect()
+            (
+                lib.tracks
+                    .values()
+                    .filter(|t| t.source == Source::Spotify)
+                    .map(|t| t.id.clone())
+                    .collect(),
+                lib.playlists
+                    .iter()
+                    .filter(|p| p.kind == PlaylistKind::SpotifyAlbum)
+                    .filter_map(|p| p.remote_id.clone())
+                    .collect(),
+            )
         };
         let web = self.user_web_auth().map(|a| (a, self.spotify_api.clone()));
         let tx = self.internal_tx.clone();
@@ -2470,7 +2561,7 @@ impl Service {
             let progress = move |text: String| {
                 let _ = progress_tx.send(Internal::SyncProgress(text));
             };
-            let r = match spotify_sync_internal(session, known, progress).await {
+            let r = match spotify_sync_internal(session, known, known_albums, progress).await {
                 Ok(sync) => Ok(sync),
                 Err(e) => {
                     tracing::warn!("Spotify library import via session failed: {e:#}; trying the Web API");
@@ -2595,9 +2686,15 @@ impl Service {
                 track_ids,
             });
         }
+        let albums = sync.albums.len();
+        playlists.extend(sync.albums);
         self.merge_imported(tracks, playlists, &[PlaylistKind::Spotify, PlaylistKind::SpotifyLiked]);
         self.set_account(|f| &mut f.spotify, AccountStatus::Connected(sync.user));
-        self.shared.info(format!("Spotify synced: {count} playlists"));
+        self.shared.info(match albums {
+            0 => format!("Spotify synced: {count} playlists"),
+            1 => format!("Spotify synced: {count} playlists and 1 new album"),
+            n => format!("Spotify synced: {count} playlists and {n} new albums"),
+        });
         let _ = self.db.set_kv("spotify_synced_at", &now_unix().to_string());
         self.connect_spotify();
     }
@@ -2765,37 +2862,51 @@ impl Service {
             let tx = self.internal_tx.clone();
             let q = q.clone();
             tokio::spawn(async move {
-                let search = async { api.search_with_artists(&auth.token().await?, &q, 20).await };
+                let search = async { api.search_all(&auth.token().await?, &q, 20).await };
                 // Never leave the results spinning.
                 let r = tokio::time::timeout(Duration::from_secs(15), search)
                     .await
                     .unwrap_or_else(|_| Err(anyhow!("Spotify didn't answer in time")));
-                let (tracks, artists) = match r {
-                    Ok((tracks, artists)) => (Ok(tracks), artists),
-                    Err(e) => (Err(e), Vec::new()),
+                let (tracks, hits) = match r {
+                    Ok(mut hits) => (Ok(std::mem::take(&mut hits.tracks)), hits),
+                    Err(e) => (Err(e), Default::default()),
                 };
                 let _ = tx.send(Internal::SearchResults {
                     query: q,
                     source: Source::Spotify,
                     tracks,
-                    artists,
+                    artists: hits.artists,
+                    albums: hits.albums,
+                    playlists: hits.playlists,
                 });
             });
         }
         if let Some(sc) = sc {
             let tx = self.internal_tx.clone();
             tokio::spawn(async move {
-                let (tracks, users) = tokio::join!(sc.search(&q, 20), sc.search_users(&q, 8));
-                let artists = users.unwrap_or_else(|e| {
-                    tracing::warn!("SoundCloud artist search: {e:#}");
-                    Vec::new()
-                });
+                let (tracks, users, albums, playlists) = tokio::join!(
+                    sc.search(&q, 20),
+                    sc.search_users(&q, 8),
+                    sc.search_sets(&q, true, 10),
+                    sc.search_sets(&q, false, 10)
+                );
+                fn quietly<T>(what: &str, r: Result<Vec<T>>) -> Vec<T> {
+                    r.unwrap_or_else(|e| {
+                        tracing::warn!("SoundCloud {what} search: {e:#}");
+                        Vec::new()
+                    })
+                }
+                let artists = quietly("artist", users);
+                let albums = quietly("album", albums);
+                let playlists = quietly("playlist", playlists);
                 let ok = tracks.is_ok();
                 let _ = tx.send(Internal::SearchResults {
                     query: q,
                     source: Source::SoundCloud,
                     tracks,
                     artists,
+                    albums,
+                    playlists,
                 });
                 if ok {
                     if let Ok(id) = sc.client_id().await {
@@ -3393,10 +3504,15 @@ impl Service {
                                 tracks: vec![t],
                                 ..Default::default()
                             },
-                            ScResolved::Playlist(p) => PageState {
-                                kind: "Playlist".into(),
+                            ScResolved::Playlist { playlist: p, album, by } => PageState {
+                                kind: if album { "Album" } else { "Playlist" }.into(),
                                 source: Some(Source::SoundCloud),
-                                subtitle: format!("{} songs", p.tracks.len()),
+                                subtitle: match (album, by.is_empty()) {
+                                    (_, true) => songs_text(p.tracks.len()),
+                                    (true, false) => format!("Album · {by} · {}", songs_text(p.tracks.len())),
+                                    (false, false) => format!("by {by} · {}", songs_text(p.tracks.len())),
+                                },
+                                artist: if album { by } else { String::new() },
                                 title: p.name,
                                 image: p.art,
                                 external_url: Some(url),
@@ -4129,6 +4245,8 @@ impl Service {
                 source,
                 tracks,
                 artists,
+                albums,
+                playlists,
             } => {
                 let mut feed = self.shared.feed.write().unwrap();
                 let search = &mut feed.search;
@@ -4149,6 +4267,9 @@ impl Service {
                     }
                     search.artists.extend(artists);
                     rank_artists(&mut search.artists, &query);
+                    // Spotify's and SoundCloud's take turns, so both show up front.
+                    search.albums = interleave(std::mem::take(&mut search.albums), albums);
+                    search.playlists = interleave(std::mem::take(&mut search.playlists), playlists);
                 }
                 drop(feed);
                 self.shared.repaint();
@@ -4423,6 +4544,7 @@ fn make_lastfm(cfg: &Config, http: &reqwest::Client, paths: &Paths) -> Option<Ar
 async fn spotify_sync_internal(
     session: librespot_core::session::Session,
     known: HashSet<String>,
+    known_albums: HashSet<String>,
     progress: impl Fn(String),
 ) -> Result<SpotifySync> {
     use crate::providers::spotify_internal as si;
@@ -4462,13 +4584,61 @@ async fn spotify_sync_internal(
             }
         }
     }
-    progress("Loading Liked Songs…".into());
-    let liked = timed("loading Liked Songs", si::liked(&session))
+    progress("Loading Liked Songs and albums…".into());
+    let collection = timed("loading Liked Songs", si::collection(&session))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!("Spotify Liked Songs: {e:#}");
             Vec::new()
         });
+    let liked: Vec<(String, i64)> = collection
+        .iter()
+        .filter(|(uri, _)| uri.starts_with("spotify:track:"))
+        .cloned()
+        .collect();
+    // Albums saved on Spotify that aren't in the library yet (albums already here are kept
+    // as they are, and ones removed on Spotify stay until removed here).
+    let new_albums: Vec<String> = collection
+        .iter()
+        .filter_map(|(uri, _)| uri.strip_prefix("spotify:album:"))
+        .filter(|id| !known_albums.contains(*id))
+        .map(str::to_string)
+        .collect();
+    let mut albums = Vec::with_capacity(new_albums.len());
+    let mut album_tracks = Vec::new();
+    {
+        let total = new_albums.len();
+        let mut results = futures_util::stream::iter(new_albums)
+            .map(|id| {
+                let session = session.clone();
+                async move {
+                    let result = timed("loading an album", si::album_page(&session, &id)).await;
+                    (id, result)
+                }
+            })
+            .buffered(3);
+        let mut done = 0;
+        while let Some((id, result)) = results.next().await {
+            done += 1;
+            progress(format!("Loading your albums… {done}/{total}"));
+            match result {
+                Ok(page) if !page.tracks.is_empty() => {
+                    albums.push(Playlist {
+                        id: saved_album_id(PlaylistKind::SpotifyAlbum, &id),
+                        name: page.title,
+                        kind: PlaylistKind::SpotifyAlbum,
+                        remote_id: Some(id),
+                        description: page.artist,
+                        art: page.image,
+                        track_ids: page.tracks.iter().map(|t| t.id.clone()).collect(),
+                    });
+                    album_tracks.extend(page.tracks);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("skipping Spotify album {id}: {e:#}"),
+            }
+        }
+    }
 
     let mut need = Vec::new();
     let mut seen = HashSet::new();
@@ -4518,7 +4688,8 @@ async fn spotify_sync_internal(
         user,
         playlists,
         liked: liked_ids,
-        tracks: fetched.into_values().collect(),
+        albums,
+        tracks: fetched.into_values().chain(album_tracks).collect(),
     })
 }
 
@@ -4570,6 +4741,8 @@ async fn spotify_sync_web(
         },
         playlists,
         liked: liked_ids,
+        // The Web API fallback doesn't bring in saved albums.
+        albums: Vec::new(),
         tracks,
     })
 }
@@ -4622,6 +4795,26 @@ fn same_album(a: &Track, b: &Track) -> bool {
 
 /// Exact and prefix name matches first; Spotify before SoundCloud on ties. Stable, so each
 /// service's own relevance order is kept.
+/// The library id of a saved album.
+pub fn saved_album_id(kind: PlaylistKind, remote: &str) -> String {
+    match kind {
+        PlaylistKind::SpotifyAlbum => format!("spotify_album:{remote}"),
+        _ => format!("soundcloud_album:{remote}"),
+    }
+}
+
+/// `a` and `b` taking turns (what's left of the longer one at the end).
+fn interleave<T>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut a, mut b) = (a.into_iter(), b.into_iter());
+    loop {
+        match (a.next(), b.next()) {
+            (None, None) => return out,
+            (x, y) => out.extend(x.into_iter().chain(y)),
+        }
+    }
+}
+
 fn rank_artists(artists: &mut [ArtistHit], query: &str) {
     let q = query.trim().to_lowercase();
     artists.sort_by_cached_key(|a| {
@@ -4652,6 +4845,7 @@ async fn spotify_page(session: librespot_core::session::Session, kind: LinkKind,
         source: Some(Source::Spotify),
         title: data.title,
         subtitle: data.subtitle,
+        artist: data.artist,
         image: data.image,
         round: kind == LinkKind::Artist,
         tracks: data.tracks,
@@ -4795,7 +4989,7 @@ async fn songs_behind_link(
         }
         Target::SoundCloudUrl(url) => match soundcloud.resolve_url(&url).await.ok()? {
             ScResolved::Track(t) => Some(vec![t]),
-            ScResolved::Playlist(p) => Some(p.tracks),
+            ScResolved::Playlist { playlist, .. } => Some(playlist.tracks),
             ScResolved::User(_) => None,
         },
         _ => None,

@@ -123,8 +123,9 @@ fn playlist_meta(id: &str, list: &SelectedListContent) -> SpotifyPlaylistMeta {
     }
 }
 
-/// Liked Songs (the "collection" set), newest first.
-pub async fn liked(session: &Session) -> Result<Vec<(String, i64)>> {
+/// Everything in the "collection" set: liked songs (`spotify:track:…`) and saved albums
+/// (`spotify:album:…`), newest first.
+pub async fn collection(session: &Session) -> Result<Vec<(String, i64)>> {
     let username = session.username();
     let mut headers = HeaderMap::new();
     let ct = HeaderValue::from_static("application/vnd.collection-v2.spotify.proto");
@@ -143,12 +144,12 @@ pub async fn liked(session: &Session) -> Result<Vec<(String, i64)>> {
                 Some(&body),
             )
             .await
-            .map_err(|e| anyhow!("loading Liked Songs: {e}"))?;
+            .map_err(|e| anyhow!("loading your library: {e}"))?;
         let page = decode_page_response(&bytes)?;
         out.extend(
             page.items
                 .into_iter()
-                .filter(|i| !i.is_removed && i.uri.starts_with("spotify:track:"))
+                .filter(|i| !i.is_removed)
                 .map(|i| (i.uri, i.added_at)),
         );
         if page.next_page_token.is_empty() {
@@ -212,6 +213,8 @@ pub async fn tracks(session: &Session, uris: &[String]) -> Result<HashMap<String
 pub struct PageData {
     pub title: String,
     pub subtitle: String,
+    /// An album's artist (empty for other pages).
+    pub artist: String,
     pub image: Option<String>,
     pub tracks: Vec<Track>,
 }
@@ -291,6 +294,7 @@ pub async fn artist_page(session: &Session, id: &str) -> Result<PageData> {
     Ok(PageData {
         title: artist.name().to_string(),
         subtitle: format!("Artist · {} songs", tracks.len()),
+        artist: String::new(),
         image: pick_image(&artist.portrait_group.image, &artist.portrait),
         tracks,
     })
@@ -315,6 +319,7 @@ pub async fn album_page(session: &Session, id: &str) -> Result<PageData> {
     Ok(PageData {
         title: album.name().to_string(),
         subtitle: format!("Album · {artists} · {} songs", tracks.len()),
+        artist: artists,
         image: pick_image(&album.cover_group.image, &album.cover),
         tracks,
     })
@@ -331,6 +336,7 @@ pub async fn playlist_page(session: &Session, id: &str) -> Result<PageData> {
     Ok(PageData {
         title: list.meta.name,
         subtitle,
+        artist: String::new(),
         image: list.meta.art.or_else(|| tracks.iter().find_map(|t| t.art.clone())),
         tracks,
     })
@@ -344,6 +350,7 @@ pub async fn track_page(session: &Session, id: &str) -> Result<PageData> {
     Ok(PageData {
         title: t.title.clone(),
         subtitle: format!("Song · {}", t.artist),
+        artist: String::new(),
         image: t.art.clone(),
         tracks,
     })

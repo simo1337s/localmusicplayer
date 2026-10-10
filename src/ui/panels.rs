@@ -147,7 +147,11 @@ pub fn sidebar(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState, size: SidebarSiz
                     .lib
                     .playlists
                     .iter()
-                    .filter(|p| p.id != LIKED_ID && (p.kind == PlaylistKind::Custom || !p.track_ids.is_empty()))
+                    .filter(|p| {
+                        p.id != LIKED_ID
+                            && !p.kind.is_album()
+                            && (p.kind == PlaylistKind::Custom || !p.track_ids.is_empty())
+                    })
                     .collect();
                 if playlists.is_empty() && !collapsed {
                     ui.label(
@@ -241,8 +245,11 @@ fn nav_item(
     current: &View,
     collapsed: bool,
 ) -> egui::Response {
+    // A saved album opens as a library page, but it belongs with the albums.
+    let saved_album = |id: &str| cx.lib.playlist(id).is_some_and(|p| p.kind.is_album());
     let active = *current == target
         || (target == View::Albums && matches!(current, View::Album(_)))
+        || (target == View::Albums && matches!(current, View::Playlist(id) if saved_album(id)))
         || (target == View::Artists && matches!(current, View::Artist(_)));
     let w = ui.available_width() - 4.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, 36.0), Sense::click());

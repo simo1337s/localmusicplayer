@@ -162,6 +162,10 @@ pub enum PlaylistKind {
     AppleMusic,
     /// Imported from an .m3u/.m3u8 file.
     M3u,
+    /// A Spotify album saved to the library (shown with the albums, not the playlists).
+    SpotifyAlbum,
+    /// A SoundCloud album saved to the library.
+    SoundCloudAlbum,
 }
 
 impl PlaylistKind {
@@ -175,6 +179,8 @@ impl PlaylistKind {
             PlaylistKind::SoundCloudLikes => "soundcloud_likes",
             PlaylistKind::AppleMusic => "applemusic",
             PlaylistKind::M3u => "m3u",
+            PlaylistKind::SpotifyAlbum => "spotify_album",
+            PlaylistKind::SoundCloudAlbum => "soundcloud_album",
         }
     }
 
@@ -188,8 +194,15 @@ impl PlaylistKind {
             "soundcloud_likes" => PlaylistKind::SoundCloudLikes,
             "applemusic" => PlaylistKind::AppleMusic,
             "m3u" => PlaylistKind::M3u,
+            "spotify_album" => PlaylistKind::SpotifyAlbum,
+            "soundcloud_album" => PlaylistKind::SoundCloudAlbum,
             _ => return None,
         })
+    }
+
+    /// Saved albums, shown under Albums instead of the playlists.
+    pub fn is_album(self) -> bool {
+        matches!(self, PlaylistKind::SpotifyAlbum | PlaylistKind::SoundCloudAlbum)
     }
 
     /// Playlists the user can edit inside the app.
@@ -199,8 +212,10 @@ impl PlaylistKind {
 
     pub fn source(self) -> Option<Source> {
         match self {
-            PlaylistKind::Spotify | PlaylistKind::SpotifyLiked => Some(Source::Spotify),
-            PlaylistKind::SoundCloud | PlaylistKind::SoundCloudLikes => Some(Source::SoundCloud),
+            PlaylistKind::Spotify | PlaylistKind::SpotifyLiked | PlaylistKind::SpotifyAlbum => Some(Source::Spotify),
+            PlaylistKind::SoundCloud | PlaylistKind::SoundCloudLikes | PlaylistKind::SoundCloudAlbum => {
+                Some(Source::SoundCloud)
+            }
             PlaylistKind::AppleMusic => Some(Source::AppleMusic),
             _ => None,
         }
@@ -239,6 +254,49 @@ pub struct ArtistHit {
     pub image: Option<String>,
     pub source: Source,
     pub subtitle: String,
+}
+
+/// An album or playlist in search results; `key` opens its page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollectionHit {
+    /// Page key: `spotify:album:<id>`, `spotify:playlist:<id>` or a SoundCloud set's link.
+    pub key: String,
+    pub title: String,
+    /// The artist of an album, the owner of a playlist.
+    pub by: String,
+    pub image: Option<String>,
+    pub source: Source,
+    pub album: bool,
+    /// How many songs, when known.
+    pub songs: Option<u32>,
+    /// Release year of an album, when known.
+    pub year: Option<u16>,
+}
+
+impl CollectionHit {
+    /// "Artist · 2024" for albums, "by Owner · 32 songs" for playlists.
+    pub fn subtitle(&self) -> String {
+        let mut parts = Vec::new();
+        if self.album {
+            if !self.by.is_empty() {
+                parts.push(self.by.clone());
+            }
+            if let Some(y) = self.year {
+                parts.push(y.to_string());
+            }
+        } else {
+            if !self.by.is_empty() {
+                parts.push(format!("by {}", self.by));
+            }
+            if let Some(n) = self.songs {
+                parts.push(if n == 1 { "1 song".into() } else { format!("{n} songs") });
+            }
+        }
+        if parts.is_empty() {
+            return if self.album { "Album".into() } else { "Playlist".into() };
+        }
+        parts.join(" · ")
+    }
 }
 
 /// 1234 -> "1.2K", 2500000 -> "2.5M".

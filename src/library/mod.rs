@@ -220,6 +220,8 @@ impl Library {
                 PlaylistKind::SoundCloudLikes => 5,
                 PlaylistKind::SoundCloud => 6,
                 PlaylistKind::AppleMusic => 7,
+                PlaylistKind::SpotifyAlbum => 8,
+                PlaylistKind::SoundCloudAlbum => 9,
             }
         }
         // Stable: keeps service order (e.g. Spotify's own playlist order) within a kind.

@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::library::tags::Metadata;
-use crate::model::{ArtistHit, ImportedPlaylist, Source, Track};
+use crate::model::{ArtistHit, CollectionHit, ImportedPlaylist, Source, Track};
 
 const API_BASE: &str = "https://api-v2.soundcloud.com";
 const WEB_BASE: &str = "https://soundcloud.com/";
@@ -65,7 +65,12 @@ pub struct ScUser {
 pub enum ScResolved {
     User(ScUser),
     Track(Track),
-    Playlist(ImportedPlaylist),
+    /// A playlist or an album (`album`), with whoever made it.
+    Playlist {
+        playlist: ImportedPlaylist,
+        album: bool,
+        by: String,
+    },
 }
 
 /// SoundCloud api-v2 client. Cheap to share behind an `Arc`; all methods take `&self`.
@@ -277,6 +282,28 @@ impl SoundCloud {
             .unwrap_or_default())
     }
 
+    /// Albums (`albums`) or playlists matching `query`.
+    pub async fn search_sets(&self, query: &str, albums: bool, limit: usize) -> Result<Vec<CollectionHit>> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let path = if albums {
+            "/search/albums"
+        } else {
+            "/search/playlists_without_albums"
+        };
+        let limit_s = limit.min(50).to_string();
+        let v = self
+            .get_json(&api(path), &[("q", query), ("limit", limit_s.as_str())])
+            .await
+            .with_context(|| format!("SoundCloud playlist search for \"{query}\" failed"))?;
+        Ok(v.get("collection")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().filter_map(parse_set_hit).take(limit).collect())
+            .unwrap_or_default())
+    }
+
     /// One user by numeric id.
     pub async fn user(&self, id: u64) -> Result<ScUser> {
         let v = self
@@ -324,8 +351,18 @@ impl SoundCloud {
             Some("user") => Ok(ScResolved::User(parse_user(&v).context("unexpected user response")?)),
             Some("track") => Ok(ScResolved::Track(parse_track(&v).context("unexpected track response")?)),
             Some("playlist") | Some("system-playlist") => {
+                let album = is_album(&v);
+                let by = v
+                    .pointer("/user/username")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
                 let mut cache = HashMap::new();
-                Ok(ScResolved::Playlist(self.load_playlist(v, &mut cache).await?))
+                Ok(ScResolved::Playlist {
+                    playlist: self.load_playlist(v, &mut cache).await?,
+                    album,
+                    by,
+                })
             }
             other => bail!("{url} isn't a SoundCloud profile, track or playlist ({other:?})"),
         }
@@ -900,6 +937,53 @@ fn parse_user(v: &Value) -> Option<ScUser> {
     })
 }
 
+/// Whether a SoundCloud set is an album (or EP, single, compilation) rather than a playlist.
+fn is_album(v: &Value) -> bool {
+    v.get("is_album").and_then(Value::as_bool).unwrap_or(false)
+        || matches!(
+            v.get("set_type").and_then(Value::as_str),
+            Some("album" | "ep" | "single" | "compilation")
+        )
+}
+
+/// A playlist or album in search results.
+pub fn parse_set_hit(v: &Value) -> Option<CollectionHit> {
+    let url = non_empty(v.get("permalink_url"))?.to_owned();
+    let title = non_empty(v.get("title"))?.trim().to_owned();
+    let user = v.get("user");
+    // Sets without their own artwork show their first song's, then the uploader's picture.
+    let image = non_empty(v.get("artwork_url"))
+        .or_else(|| {
+            v.get("tracks")
+                .and_then(Value::as_array)
+                .and_then(|t| t.iter().find_map(|t| non_empty(t.get("artwork_url"))))
+        })
+        .or_else(|| {
+            user.and_then(|u| non_empty(u.get("avatar_url")))
+                .filter(|u| !is_default_avatar(u))
+        })
+        .map(upscale_art);
+    let year = ["release_date", "display_date", "created_at"]
+        .iter()
+        .find_map(|k| non_empty(v.get(*k)))
+        .and_then(|d| d.get(..4))
+        .and_then(|y| y.parse().ok());
+    let album = is_album(v);
+    Some(CollectionHit {
+        key: url,
+        title,
+        by: user
+            .and_then(|u| non_empty(u.get("username")))
+            .unwrap_or_default()
+            .to_owned(),
+        image,
+        source: Source::SoundCloud,
+        album,
+        songs: v.get("track_count").and_then(Value::as_u64).map(|n| n as u32),
+        year: if album { year } else { None },
+    })
+}
+
 /// A user as an artist search result.
 pub fn artist_hit(u: &ScUser) -> ArtistHit {
     ArtistHit {
@@ -1272,7 +1356,10 @@ fn extract_client_id(text: &str) -> Option<String> {
 // -------------------------------------------------------------------------------------------
 
 fn api(path: &str) -> String {
-    format!("{API_BASE}{path}")
+    // Tests of the whole app point this at a stand-in for SoundCloud.
+    static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let base = BASE.get_or_init(|| std::env::var("MULTIMUSIC_SOUNDCLOUD_API").unwrap_or_else(|_| API_BASE.to_string()));
+    format!("{base}{path}")
 }
 
 /// `url` with `params` and `client_id` added. Any `client_id` already present (e.g. in a
@@ -1451,6 +1538,36 @@ mod tests {
                 "verified": true
             }
         })
+    }
+
+    #[test]
+    fn set_search_hits() {
+        let album = serde_json::json!({
+            "permalink_url": "https://soundcloud.com/bladee/sets/eversince", "title": "Eversince",
+            "artwork_url": null, "track_count": 13, "is_album": true, "set_type": "album",
+            "release_date": "2016-05-04T00:00:00Z", "user": {"username": "bladee"},
+            "tracks": [{"artwork_url": "https://i1.sndcdn.com/artworks-1-large.jpg"}]
+        });
+        let a = parse_set_hit(&album).unwrap();
+        assert_eq!(a.key, "https://soundcloud.com/bladee/sets/eversince");
+        assert!(a.album);
+        assert_eq!(a.year, Some(2016));
+        assert_eq!(
+            a.image.as_deref(),
+            Some("https://i1.sndcdn.com/artworks-1-t500x500.jpg")
+        );
+        assert_eq!(a.subtitle(), "bladee · 2016");
+        let list = serde_json::json!({
+            "permalink_url": "https://soundcloud.com/someone/sets/late-night", "title": "late night",
+            "track_count": 1, "set_type": "", "user": {"username": "someone",
+            "avatar_url": "https://i1.sndcdn.com/avatars-x-large.jpg"}
+        });
+        let p = parse_set_hit(&list).unwrap();
+        assert!(!p.album);
+        assert_eq!(p.year, None);
+        assert_eq!(p.image.as_deref(), Some("https://i1.sndcdn.com/avatars-x-t500x500.jpg"));
+        assert_eq!(p.subtitle(), "by someone · 1 song");
+        assert!(parse_set_hit(&serde_json::json!({"title": "no link"})).is_none());
     }
 
     #[test]

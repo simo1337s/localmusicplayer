@@ -8,8 +8,9 @@ use super::theme::{self, *};
 use super::widgets::{self, text_trunc, TableOpts};
 use super::{Action, Cx, View};
 use crate::library::Album;
+use crate::library::Library;
 use crate::links;
-use crate::model::{ArtistHit, Playlist, PlaylistKind, Source, Track};
+use crate::model::{ArtistHit, CollectionHit, Playlist, PlaylistKind, Source, Track};
 use crate::service::{Command, DownloadState, PlayStatus};
 
 pub struct ViewState<'a> {
@@ -104,8 +105,14 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
         ui.label(egui::RichText::new("Home").font(theme::bold_font(26.0)));
         ui.add_space(12.0);
 
-        let playlists: Vec<&Playlist> = cx.lib.playlists.iter().filter(|p| !p.track_ids.is_empty()).collect();
-        if playlists.is_empty() && cx.lib.local.is_empty() {
+        let playlists: Vec<&Playlist> = cx
+            .lib
+            .playlists
+            .iter()
+            .filter(|p| !p.track_ids.is_empty() && !p.kind.is_album())
+            .collect();
+        let saved_albums = cx.lib.playlists.iter().any(|p| p.kind.is_album());
+        if playlists.is_empty() && cx.lib.local.is_empty() && !saved_albums {
             onboarding(ui, cx);
             super::profile::home_card(ui, cx);
             return;
@@ -200,14 +207,14 @@ fn home(ui: &mut Ui, cx: &mut Cx) {
             });
         }
 
-        if !cx.lib.albums.is_empty() {
+        let albums = library_albums(cx.lib, None);
+        if !albums.is_empty() {
             ui.add_space(10.0);
             if heading_with_link(ui, "Albums in your library", "Show all") {
                 cx.actions.push(Action::Go(View::Albums));
             }
-            let n = cx.lib.albums.len().min(tiles_per_row(ui, 168.0) * 2);
-            let albums: Vec<&Album> = cx.lib.albums.iter().take(n).collect();
-            album_grid(ui, cx, &albums);
+            let n = albums.len().min(tiles_per_row(ui, 168.0) * 2);
+            album_grid(ui, cx, &albums[..n]);
         }
 
         // You on Last.fm, near the bottom.
@@ -329,29 +336,144 @@ fn onboarding(ui: &mut Ui, cx: &mut Cx) {
     });
 }
 
-fn album_grid(ui: &mut Ui, cx: &mut Cx, albums: &[&Album]) {
+/// An album in the library: one made of local files, or one saved from Spotify or SoundCloud.
+#[derive(Clone, Copy)]
+enum LibAlbum<'a> {
+    Local(&'a Album),
+    Saved(&'a Playlist),
+}
+
+impl<'a> LibAlbum<'a> {
+    fn name(self) -> &'a str {
+        match self {
+            LibAlbum::Local(a) => &a.name,
+            LibAlbum::Saved(p) => &p.name,
+        }
+    }
+
+    fn artist(self) -> &'a str {
+        match self {
+            LibAlbum::Local(a) => &a.artist,
+            LibAlbum::Saved(p) => &p.description,
+        }
+    }
+
+    fn art(self) -> Option<&'a str> {
+        match self {
+            LibAlbum::Local(a) => a.art.as_deref(),
+            LibAlbum::Saved(p) => p.art.as_deref(),
+        }
+    }
+
+    fn source(self) -> Source {
+        match self {
+            LibAlbum::Local(_) => Source::Local,
+            LibAlbum::Saved(p) => p.kind.source().unwrap_or(Source::Local),
+        }
+    }
+
+    fn track_ids(self) -> &'a [String] {
+        match self {
+            LibAlbum::Local(a) => &a.track_ids,
+            LibAlbum::Saved(p) => &p.track_ids,
+        }
+    }
+}
+
+/// Every album in the library by artist, then title; `only` keeps the ones from one source.
+fn library_albums(lib: &Library, only: Option<Source>) -> Vec<LibAlbum<'_>> {
+    let mut all: Vec<LibAlbum> = lib
+        .albums
+        .iter()
+        .map(LibAlbum::Local)
+        .chain(lib.playlists.iter().filter(|p| p.kind.is_album()).map(LibAlbum::Saved))
+        .filter(|a| only.is_none_or(|s| a.source() == s))
+        .collect();
+    all.sort_by_cached_key(|a| (a.artist().to_lowercase(), a.name().to_lowercase()));
+    all
+}
+
+fn album_grid(ui: &mut Ui, cx: &mut Cx, albums: &[LibAlbum]) {
     widgets::grid(ui, albums.len(), 168.0, |ui, i, w| {
         let a = albums[i];
-        let (resp, play) = widgets::tile(ui, w, &a.name, &a.artist, cx.accent, |ui, r| {
+        let source = a.source();
+        let (resp, play) = widgets::tile(ui, w, a.name(), a.artist(), cx.accent, |ui, r| {
             widgets::cover(
                 ui,
                 cx.art,
-                a.art.as_deref(),
+                a.art(),
                 r,
                 6,
-                (theme::mix(source_color(Source::Local), PANEL, 0.4), icon::VINYL_RECORD),
-            )
+                (theme::mix(source_color(source), PANEL, 0.4), icon::VINYL_RECORD),
+            );
+            if source != Source::Local {
+                source_corner(ui, r, source);
+            }
         });
         if play {
             cx.actions.push(Action::Cmd(Command::Play {
-                tracks: cx.lib.tracks_for(&a.track_ids),
-                start: widgets::first_song(cx, a.track_ids.len()),
-                context: a.name.clone(),
+                tracks: cx.lib.tracks_for(a.track_ids()),
+                start: widgets::first_song(cx, a.track_ids().len()),
+                context: a.name().to_string(),
             }));
         } else if resp.clicked() {
-            cx.actions.push(Action::Go(View::Album(a.key.clone())));
+            cx.actions.push(Action::Go(match a {
+                LibAlbum::Local(album) => View::Album(album.key.clone()),
+                LibAlbum::Saved(p) => View::Playlist(p.id.clone()),
+            }));
         }
     });
+}
+
+/// The saved album a page (by its key) is, if it's saved.
+fn saved_album<'a>(lib: &'a Library, key: &str, source: Option<Source>) -> Option<&'a Playlist> {
+    let id = match (source, crate::links::target(key)) {
+        (Some(Source::Spotify), Some(crate::links::Target::Spotify(crate::links::LinkKind::Album, id))) => {
+            crate::service::saved_album_id(PlaylistKind::SpotifyAlbum, &id)
+        }
+        (Some(Source::SoundCloud), _) => crate::service::saved_album_id(PlaylistKind::SoundCloudAlbum, key),
+        _ => return None,
+    };
+    lib.playlist(&id)
+}
+
+/// A row of albums or playlists from search (Spotify's and SoundCloud's taking turns).
+fn collection_row(ui: &mut Ui, cx: &mut Cx, title: &str, hits: &[CollectionHit]) {
+    if hits.is_empty() {
+        return;
+    }
+    let per_row = tiles_per_row(ui, 150.0);
+    let more_id = Id::new(("search-show-all", title));
+    let all = ui.data(|d| d.get_temp::<bool>(more_id)).unwrap_or(false);
+    if hits.len() > per_row {
+        let link = if all { "Show less" } else { "Show all" };
+        if heading_with_link(ui, title, link) {
+            ui.data_mut(|d| d.insert_temp(more_id, !all));
+        }
+    } else {
+        widgets::heading(ui, title);
+    }
+    let n = if all { hits.len() } else { hits.len().min(per_row) };
+    widgets::grid(ui, n, 150.0, |ui, i, w| {
+        let h = &hits[i];
+        let glyph = if h.album { icon::VINYL_RECORD } else { icon::PLAYLIST };
+        let (resp, play) = widgets::tile(ui, w, &h.title, &h.subtitle(), cx.accent, |ui, r| {
+            widgets::cover(
+                ui,
+                cx.art,
+                h.image.as_deref(),
+                r,
+                6,
+                (theme::mix(source_color(h.source), PANEL, 0.4), glyph),
+            );
+            source_corner(ui, r, h.source);
+        });
+        // Its songs come with its page.
+        if play || resp.clicked() {
+            cx.actions.push(Action::Open(h.key.clone()));
+        }
+    });
+    ui.add_space(8.0);
 }
 
 fn play_playlist(cx: &mut Cx, p: &Playlist, shuffle: bool) {
@@ -592,20 +714,46 @@ fn albums(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
                 );
             });
         });
-        ui.add_space(16.0);
+        ui.add_space(12.0);
+        // Tabs for where the albums come from, when there's more than one place.
+        let everything = library_albums(cx.lib, None);
+        let tab_id = Id::new("albums-source");
+        let mut only: Option<Source> = ui.data(|d| d.get_temp(tab_id)).unwrap_or(None);
+        let tabs: Vec<(Option<Source>, &str)> = [
+            (None, "All"),
+            (Some(Source::Local), "Local files"),
+            (Some(Source::Spotify), "Spotify"),
+            (Some(Source::SoundCloud), "SoundCloud"),
+        ]
+        .into_iter()
+        .filter(|(s, _)| s.is_none_or(|s| everything.iter().any(|a| a.source() == s)))
+        .collect();
+        if tabs.len() > 2 {
+            if let Some(pick) = widgets::segmented(ui, &tabs, only) {
+                only = pick;
+                ui.data_mut(|d| d.insert_temp(tab_id, only));
+            }
+            ui.add_space(14.0);
+        } else {
+            only = None;
+        }
         let needle = st.filter_text.trim().to_lowercase();
-        let list: Vec<&Album> = cx
-            .lib
-            .albums
-            .iter()
+        let list: Vec<LibAlbum> = everything
+            .into_iter()
+            .filter(|a| only.is_none_or(|s| a.source() == s))
             .filter(|a| {
                 needle.is_empty()
-                    || a.name.to_lowercase().contains(&needle)
-                    || a.artist.to_lowercase().contains(&needle)
+                    || a.name().to_lowercase().contains(&needle)
+                    || a.artist().to_lowercase().contains(&needle)
             })
             .collect();
         if list.is_empty() {
-            panels::empty_state(ui, icon::VINYL_RECORD, "No albums yet");
+            panels::empty_state(
+                ui,
+                icon::VINYL_RECORD,
+                "No albums yet. Albums from your music folders show up here, and so do albums you save \
+                 from Spotify or SoundCloud (search for one, open it and click Save album).",
+            );
             return;
         }
         album_grid(ui, cx, &list);
@@ -732,7 +880,7 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
         let all: Vec<&Track> = p.track_ids.iter().filter_map(|id| cx.lib.get(id)).collect();
         let total_ms: u64 = all.iter().map(|t| t.duration_ms).sum();
         let header = Header {
-            kind: "Playlist",
+            kind: if p.kind.is_album() { "Album" } else { "Playlist" },
             title: &p.name,
             description: &p.description,
             meta: format!("{} songs, {}", all.len(), theme::fmt_total(total_ms)),
@@ -783,7 +931,7 @@ fn playlist(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, id: &str) {
             id: "playlist",
             context: &p.name,
             playlist: Some(p),
-            show_album: true,
+            show_album: !p.kind.is_album(),
             show_header: true,
         };
         widgets::track_table(ui, cx, &tracks, &opts, viewport, origin);
@@ -800,6 +948,22 @@ fn playlist_actions(ui: &mut Ui, cx: &mut Cx, p: &Playlist) {
         PlaylistKind::SoundCloud | PlaylistKind::SoundCloudLikes => {
             if widgets::icon_button(ui, icon::ARROWS_CLOCKWISE, 22.0, TEXT_DIM, "Sync with SoundCloud").clicked() {
                 cx.actions.push(Action::Cmd(Command::SyncSoundCloud));
+            }
+        }
+        PlaylistKind::SpotifyAlbum | PlaylistKind::SoundCloudAlbum => {
+            if widgets::icon_button(ui, icon::TRASH, 22.0, TEXT_DIM, "Remove from your albums").clicked() {
+                cx.actions.push(Action::Delete(p.id.clone()));
+            }
+            let link = match (p.kind, p.remote_id.as_deref()) {
+                (PlaylistKind::SpotifyAlbum, Some(id)) => Some(format!("https://open.spotify.com/album/{id}")),
+                (_, Some(url)) if url.starts_with("https://") => Some(url.to_string()),
+                _ => None,
+            };
+            if let Some(url) = link {
+                let tip = format!("Open on {}", service_name(p.kind.source()));
+                if widgets::icon_button(ui, icon::ARROW_SQUARE_OUT, 22.0, TEXT_DIM, &tip).clicked() {
+                    cx.actions.push(Action::OpenUrl(url));
+                }
             }
         }
         PlaylistKind::Custom | PlaylistKind::M3u => {
@@ -1045,6 +1209,39 @@ fn remote_page(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState, key: &str) {
                 }
             },
             |ui, cx| {
+                let saveable = p.kind == "Album"
+                    && matches!(p.source, Some(Source::Spotify | Source::SoundCloud))
+                    && !p.tracks.is_empty();
+                if saveable {
+                    match saved_album(cx.lib, &p.key, p.source) {
+                        Some(saved) => {
+                            let tip = if p.source == Some(Source::Spotify) {
+                                "Remove from your albums (and your Spotify library)"
+                            } else {
+                                "Remove from your albums"
+                            };
+                            if widgets::action_button(ui, icon::CHECK, "Saved", false, cx.accent)
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                cx.actions.push(Action::Delete(saved.id.clone()));
+                            }
+                        }
+                        None => {
+                            let tip = if p.source == Some(Source::Spotify) {
+                                "Add it to your albums (and your Spotify library)"
+                            } else {
+                                "Add it to your albums"
+                            };
+                            if widgets::action_button(ui, icon::PLUS, "Save album", false, cx.accent)
+                                .on_hover_text(tip)
+                                .clicked()
+                            {
+                                cx.actions.push(Action::Cmd(Command::SaveAlbum(p.key.clone())));
+                            }
+                        }
+                    }
+                }
                 if !p.tracks.is_empty()
                     && widgets::icon_button(ui, icon::PLUS_CIRCLE, 28.0, TEXT_DIM, "Save as a playlist in Sumo")
                         .clicked()
@@ -1234,6 +1431,11 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             ui.add_space(8.0);
         }
 
+        let albums: &[CollectionHit] = if fresh { &search.albums } else { &[] };
+        let playlists: &[CollectionHit] = if fresh { &search.playlists } else { &[] };
+        collection_row(ui, cx, "Albums", albums);
+        collection_row(ui, cx, "Playlists", playlists);
+
         // Library songs not already shown under "Songs".
         let local: Vec<&Track> = local
             .into_iter()
@@ -1319,7 +1521,14 @@ fn search(ui: &mut Ui, cx: &mut Cx, st: &mut ViewState) {
             }
         }
         let pending = spotify_pending || soundcloud_pending;
-        if !any && local.is_empty() && spotify.is_empty() && soundcloud.is_empty() && !pending {
+        if !any
+            && local.is_empty()
+            && spotify.is_empty()
+            && soundcloud.is_empty()
+            && albums.is_empty()
+            && playlists.is_empty()
+            && !pending
+        {
             panels::empty_state(ui, icon::MAGNIFYING_GLASS, &format!("No results for “{q}”"));
         }
     });
@@ -1583,12 +1792,12 @@ fn browse(ui: &mut Ui, cx: &mut Cx) {
         (
             Source::Spotify,
             "Spotify",
-            "Songs and artists from the whole catalogue (log in under Settings)",
+            "Songs, artists, albums and playlists from the whole catalogue (log in under Settings)",
         ),
         (
             Source::SoundCloud,
             "SoundCloud",
-            "Tracks and artist profiles, no account needed",
+            "Tracks, artists, albums and playlists, no account needed",
         ),
         (
             Source::AppleMusic,
