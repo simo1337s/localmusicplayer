@@ -17,8 +17,9 @@ on:
       - ".github/workflows/release.yml"
   workflow_dispatch:
 
+# Read-only by default; only the job that publishes the release can write.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -31,13 +32,15 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Version
         shell: bash
         run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: windows
 
@@ -56,6 +59,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           New-Item -ItemType Directory -Force stage\tools, stage\fonts, dl | Out-Null
+          # Downloads of a fixed version must be exactly the file that was checked.
+          function Assert-Hash($file, $hash) {
+            $got = (Get-FileHash $file -Algorithm SHA256).Hash.ToLower()
+            if ($got -ne $hash) { throw "checksum mismatch for ${file}: $got" }
+          }
 
           # mpv: shinchiro's builds (the ones mpv.io links to), the x86-64 one that runs on any CPU.
           $rel = gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest | ConvertFrom-Json
@@ -68,6 +76,10 @@ jobs:
           Get-ChildItem dl\mpv -Filter *.dll | Copy-Item -Destination stage\tools\
 
           Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe -OutFile stage\tools\yt-dlp.exe
+          Invoke-WebRequest https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS -OutFile dl\yt-dlp.sums
+          $line = Get-Content dl\yt-dlp.sums | Where-Object { $_ -match '\s+yt-dlp\.exe$' } | Select-Object -First 1
+          if (-not $line) { throw "yt-dlp has no checksum for yt-dlp.exe" }
+          Assert-Hash stage\tools\yt-dlp.exe ($line -split '\s+')[0]
 
           # ffmpeg and ffprobe (LGPL, sharing their DLLs).
           Invoke-WebRequest https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip -OutFile dl\ffmpeg.zip
@@ -77,10 +89,12 @@ jobs:
           Get-ChildItem $bin.FullName -Filter *.dll | Copy-Item -Destination stage\tools\
 
           Invoke-WebRequest https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip -OutFile dl\inter.zip
+          Assert-Hash dl\inter.zip 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
           Expand-Archive dl\inter.zip dl\inter
           Copy-Item dl\inter\extras\ttf\Inter-Regular.ttf, dl\inter\extras\ttf\Inter-SemiBold.ttf stage\fonts\
 
           Invoke-WebRequest https://github.com/electron/rcedit/releases/download/v2.0.0/rcedit-x64.exe -OutFile dl\rcedit.exe
+          Assert-Hash dl\rcedit.exe 3e7801db1a5edbec91b49a24a094aad776cb4515488ea5a4ca2289c400eade2a
 
       - name: Check the tools run
         shell: pwsh
@@ -168,7 +182,7 @@ jobs:
           # Clean up the test (the Mesa files must not stay).
           Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows
           path: dist/Sumo-Setup-*.exe
@@ -189,14 +203,16 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Version
         run: echo "VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_ENV"
 
       - run: rustup target add ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: macos-${{ matrix.arch }}
 
@@ -224,16 +240,29 @@ jobs:
           mv "$app" mpv.app
           file mpv.app/Contents/MacOS/mpv
 
+          # Downloads of a fixed version must be exactly the file that was checked.
+          check() { echo "$2  $1" | shasum -a 256 -c -; }
+
           curl -fsSL -o tools/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_macos
+          curl -fsSL -o dl/yt-dlp.sums https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS
+          check tools/yt-dlp "$(awk '$2 == "yt-dlp_macos" { print $1 }' dl/yt-dlp.sums)"
           ff=$([ "${{ matrix.arch }}" = arm64 ] && echo arm64 || echo x64)
           for t in ffmpeg ffprobe; do
+            case "$t-$ff" in
+              ffmpeg-arm64) sum=6be74d6f449889c2e87a75873894f8520cad56c08ac76f2a628d85b0519daaca ;;
+              ffmpeg-x64) sum=a12354fce7eb62361473bbe10d53a1893695babd35869ec8e92e5dfea8d0440b ;;
+              ffprobe-arm64) sum=a4db76bafdb8529312e138fb55aaf143cad21b6d672e2634c9dd07ae83c6a310 ;;
+              ffprobe-x64) sum=b75d816c5658bd417a2a05e174957963e2f9f85be3eb731b2a04467545a665dc ;;
+            esac
             curl -fsSL -o "dl/$t.gz" "https://github.com/eugeneware/ffmpeg-static/releases/download/b6.0/$t-darwin-$ff.gz"
+            check "dl/$t.gz" "$sum"
             gunzip -c "dl/$t.gz" > "tools/$t"
           done
           chmod +x tools/*
           codesign --force --sign - tools/*
 
           curl -fsSL -o dl/inter.zip https://github.com/rsms/inter/releases/download/v4.1/Inter-4.1.zip
+          check dl/inter.zip 9883fdd4a49d4fb66bd8177ba6625ef9a64aa45899767dde3d36aa425756b11e
           unzip -q -j dl/inter.zip extras/ttf/Inter-Regular.ttf extras/ttf/Inter-SemiBold.ttf -d fonts
 
       - name: Build the app
@@ -291,7 +320,7 @@ jobs:
           done
           ls -la dist
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-${{ matrix.arch }}
           path: |
@@ -306,7 +335,9 @@ jobs:
       - name: Tools
         run: pacman -Syu --noconfirm --needed git
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Build the package
         run: |
@@ -333,7 +364,7 @@ jobs:
           test -f /usr/share/icons/hicolor/32x32/apps/sumo.png
           grep -q "^Icon=sumo$" /usr/share/applications/multimusic.desktop
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arch
           path: dist/*.pkg.tar.zst
@@ -344,10 +375,14 @@ jobs:
     # A problem with the Linux package doesn't hold back the Windows and macOS versions.
     if: ${{ !cancelled() && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true

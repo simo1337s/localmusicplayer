@@ -42,7 +42,7 @@ It's written in Rust with [egui](https://github.com/emilk/egui), like [Spotifast
 
 ## Install on Windows or macOS
 
-**[Download the newest version](https://github.com/v0-0x/localmusicplayer/releases/latest)** (under *Assets* on that page):
+**[Download the newest version](https://github.com/v0-0x/sumo-music/releases/latest)** (under *Assets* on that page):
 
 - **Windows 10/11 (64-bit):** `Sumo-Setup-<version>-x64.exe`. It installs for your user (no administrator prompt), with everything Sumo needs: mpv for playback, yt-dlp and ffmpeg for downloads, and the Inter font. Start menu entry and an optional desktop shortcut included; uninstall from *Settings → Apps*. Your settings stay in `%APPDATA%\multimusic`.
 - **macOS 11 or newer:** `Sumo-<version>-macos-arm64.dmg` for Apple Silicon (M1/M2/M3/M4) or `Sumo-<version>-macos-intel.dmg` for Intel Macs. Open it and drag Sumo to Applications; mpv, yt-dlp and ffmpeg are inside the app. Sumo isn't notarized by Apple (that needs a paid developer account), so the first time macOS asks: right-click Sumo → **Open** → **Open**, or *System Settings → Privacy & Security → Open Anyway*.
@@ -57,8 +57,8 @@ The installers are built by GitHub Actions ([`.github/workflows/release.yml`](.g
 
 ```sh
 sudo pacman -S --needed base-devel git rust mpv
-git clone https://github.com/v0-0x/localmusicplayer.git
-cd localmusicplayer
+git clone https://github.com/v0-0x/sumo-music.git
+cd sumo-music
 makepkg -si          # builds and installs the `multimusic` package
 ```
 
@@ -67,7 +67,7 @@ Then launch **Sumo** from your app launcher, or run `sumo`.
 **Updates:** when a new version is out, Sumo shows a bar with **Update now**. It downloads the release's ready-made package (built by GitHub Actions for x86_64), checks its SHA-256 checksum, asks for your password and installs it with `sudo pacman -U`, then starts again. To update by hand instead:
 
 ```sh
-cd localmusicplayer
+cd sumo-music
 git pull
 makepkg -sif
 ```
@@ -184,7 +184,7 @@ Logs: on Linux run `MULTIMUSIC_LOG=multimusic=debug multimusic` in a terminal. T
 - **Media keys don't work**: on Linux Sumo registers as `org.mpris.MediaPlayer2.multimusic`; check with `playerctl -l`. It needs a D-Bus session, which every normal desktop session has. Windows (media overlay and keys) and macOS (Now Playing and keys) need nothing.
 - **macOS says Sumo "can't be opened" or "is damaged"**: it isn't notarized by Apple. Right-click it → Open → Open once, or run `xattr -dr com.apple.quarantine /Applications/Sumo.app` in Terminal.
 - **Windows: the window stays black or Sumo closes right away**: Sumo draws with OpenGL; update your graphics driver. Remote Desktop sessions and virtual machines without a graphics driver only offer OpenGL 1.1, which is too old. `%APPDATA%\multimusic\data\multimusic.log` says what went wrong.
-- **An update doesn't install**: *Settings → Updates* shows why. You can always download the newest version from the [Releases page](https://github.com/v0-0x/localmusicplayer/releases/latest) and install it over the old one; settings are kept.
+- **An update doesn't install**: *Settings → Updates* shows why. You can always download the newest version from the [Releases page](https://github.com/v0-0x/sumo-music/releases/latest) and install it over the old one; settings are kept.
 - **Interface too small or too large**: Settings → Appearance → *Interface scale*.
 
 ## How it works

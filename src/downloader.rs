@@ -240,11 +240,7 @@ pub fn basic_metadata(track: &Track) -> Metadata {
 /// Cover art; at most a few MB.
 async fn fetch_image(http: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
     let resp = http.get(url).send().await.ok()?.error_for_status().ok()?;
-    if resp.content_length().is_some_and(|n| n > 8 << 20) {
-        return None;
-    }
-    let bytes = resp.bytes().await.ok()?;
-    (bytes.len() <= 8 << 20).then(|| bytes.to_vec())
+    crate::http::read_capped(resp, 8 << 20).await.ok()
 }
 
 /// Fragmented MP4 (SoundCloud's AAC streams) can't take tags; ffmpeg rewrites it as a regular

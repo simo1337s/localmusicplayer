@@ -3001,11 +3001,11 @@ impl Service {
         self.shared.repaint();
         let shared = self.shared.clone();
         let tx = self.internal_tx.clone();
+        let cache = self.paths.cache_dir.clone();
         tokio::spawn(async move {
             let result = async {
                 let http = crate::updater::client();
-                let dir = crate::updater::download_dir();
-                tokio::fs::create_dir_all(&dir).await?;
+                let dir = tokio::task::spawn_blocking(move || crate::updater::fresh_download_dir(&cache)).await??;
                 let file = dir.join(&asset.name);
                 let last = std::sync::atomic::AtomicU32::new(0);
                 crate::updater::download(&http, &asset, &file, |done| {
@@ -3155,13 +3155,8 @@ impl Service {
                     continue;
                 }
                 let target = dir.join(name);
-                if let Err(e) = std::fs::write(&target, text) {
+                if let Err(e) = crate::config::write_private(&target, text) {
                     self.shared.error(format!("Couldn't restore the Spotify login: {e}"));
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600));
                 }
             }
         }
@@ -4890,7 +4885,7 @@ async fn load_cover(http: &reqwest::Client, src: &str) -> Result<Vec<u8>> {
     let src = src.trim();
     let bytes = if src.starts_with("http://") || src.starts_with("https://") {
         let resp = http.get(src).send().await?.error_for_status()?;
-        resp.bytes().await?.to_vec()
+        crate::http::read_capped(resp, crate::http::MAX_IMAGE).await?
     } else {
         let path = local_path(src).unwrap_or_else(|| PathBuf::from(src));
         tokio::fs::read(&path)

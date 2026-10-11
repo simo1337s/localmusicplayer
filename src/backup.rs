@@ -133,12 +133,7 @@ pub fn write(path: &Path, file: &SettingsFile) -> Result<()> {
         std::fs::create_dir_all(dir).with_context(|| format!("couldn't create {}", dir.display()))?;
     }
     let text = serde_json::to_string_pretty(file)?;
-    std::fs::write(path, text).with_context(|| format!("couldn't write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::config::write_private(path, text).with_context(|| format!("couldn't write {}", path.display()))?;
     Ok(())
 }
 
@@ -177,7 +172,9 @@ pub fn is_settings_file(path: &Path) -> bool {
 
 /// The imported settings, adjusted for this computer: library and download folders that don't
 /// exist here, the mpv and yt-dlp programs and the audio devices stay as they are. A file
-/// without keys keeps the keys and logins you have.
+/// without keys keeps the keys and logins you have. What decides which programs run (yt-dlp's
+/// extra options) and where updates come from is never taken from a file: one someone sends
+/// could otherwise run their commands or install their build.
 pub fn merge_config(current: &Config, imported: &SettingsFile) -> Config {
     let mut cfg = imported.config.clone();
     if !imported.has_keys {
@@ -195,7 +192,9 @@ pub fn merge_config(current: &Config, imported: &SettingsFile) -> Config {
     let downloads = cfg.downloads.folder.trim();
     if !downloads.is_empty() {
         let path = expand_home(downloads);
-        let usable = path.is_absolute() && (path.is_dir() || path.parent().is_some_and(Path::is_dir));
+        // A folder, or one that can be made in a folder that is there (never a file).
+        let usable =
+            path.is_absolute() && (path.is_dir() || (!path.exists() && path.parent().is_some_and(Path::is_dir)));
         if !usable {
             cfg.downloads.folder = current.downloads.folder.clone();
         }
@@ -203,7 +202,9 @@ pub fn merge_config(current: &Config, imported: &SettingsFile) -> Config {
     cfg.playback.mpv_path = current.playback.mpv_path.clone();
     cfg.playback.audio_device = current.playback.audio_device.clone();
     cfg.downloads.ytdlp_path = current.downloads.ytdlp_path.clone();
+    cfg.downloads.ytdlp_args = current.downloads.ytdlp_args.clone();
     cfg.spotify.audio_output = current.spotify.audio_output.clone();
+    cfg.updates = current.updates.clone();
     cfg
 }
 
@@ -427,6 +428,9 @@ mod tests {
         from.downloads.folder = "/home/someone/nowhere/dl".into();
         from.playback.mpv_path = "/usr/bin/mpv".into();
         from.playback.volume = 33.0;
+        from.downloads.ytdlp_args = "--exec 'touch /tmp/owned'".into();
+        from.updates.repo = "someone/fake-sumo".into();
+        from.updates.check = false;
         let file = SettingsFile {
             multimusic_settings: FORMAT,
             app_version: "0".into(),
@@ -445,6 +449,9 @@ mod tests {
         assert_eq!(cfg.library.folders, vec![here.clone()]);
         assert_eq!(cfg.downloads.folder, "");
         assert_eq!(cfg.playback.mpv_path, current.playback.mpv_path);
+        // Nothing in a file decides which commands run or where updates come from.
+        assert_eq!(cfg.downloads.ytdlp_args, current.downloads.ytdlp_args);
+        assert_eq!(cfg.updates, current.updates);
 
         // A file without keys keeps yours.
         let mut keyless = file.clone();

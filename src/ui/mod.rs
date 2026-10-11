@@ -340,7 +340,11 @@ impl App {
                     self.dialog = Some(Dialog::Delete { id, name, album });
                 }
                 Action::OpenUrl(url) => {
-                    let _ = open::that_detached(url);
+                    if can_open(&url) {
+                        let _ = open::that_detached(url);
+                    } else {
+                        tracing::warn!("not opening {url}: only web pages and folders are opened");
+                    }
                 }
                 Action::RightTab(t) => {
                     if self.cfg.ui.show_right_panel && self.right_tab == t {
@@ -690,11 +694,17 @@ impl App {
                     ui.add_space(10.0);
                     let r = ui.add(
                         egui::TextEdit::singleline(password)
+                            .id(PASSWORD_FIELD.into())
                             .password(true)
                             .hint_text("Your password")
                             .desired_width(f32::INFINITY),
                     );
                     r.request_focus();
+                    // The field's undo history would keep copies of what was typed.
+                    if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), r.id) {
+                        state.clear_undoer();
+                        egui::TextEdit::store_state(ui.ctx(), r.id, state);
+                    }
                     if *wrong {
                         ui.add_space(4.0);
                         ui.label(egui::RichText::new("That password didn't work. Try again.").color(theme::DANGER));
@@ -768,6 +778,7 @@ impl App {
         if close {
             if let Some(Dialog::UpdatePassword { password, .. }) = self.dialog.as_mut() {
                 crate::updater::wipe(password);
+                ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(PASSWORD_FIELD.into()));
             }
             self.dialog = None;
         }
@@ -1091,5 +1102,49 @@ impl eframe::App for App {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::WINDOW_BG.to_normalized_gamma_f32()
+    }
+}
+
+/// The update password field (its state is dropped with the dialog).
+const PASSWORD_FIELD: &str = "update-password";
+
+/// What Sumo hands to the system to open: web pages and folders, never a program, a file or
+/// another kind of link (names and links can come from online services or imported files).
+fn can_open(target: &str) -> bool {
+    let lower = target.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return true;
+    }
+    let path = std::path::Path::new(target);
+    // On macOS apps (and other bundles that run) are folders too.
+    let runs = path.extension().is_some_and(|e| {
+        let e = e.to_string_lossy().to_ascii_lowercase();
+        cfg!(target_os = "macos")
+            && matches!(
+                e.as_str(),
+                "app" | "appex" | "prefpane" | "workflow" | "action" | "saver" | "service" | "bundle" | "plugin"
+            )
+    });
+    path.is_absolute() && path.is_dir() && !runs
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn opens_only_web_pages_and_folders() {
+        use super::can_open;
+        assert!(can_open("https://open.spotify.com/track/x"));
+        assert!(can_open("http://www.last.fm/user/x"));
+        assert!(can_open(&std::env::temp_dir().to_string_lossy()));
+        for bad in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "smb://host/share",
+            "relative/dir",
+            "/bin/sh",
+            "",
+        ] {
+            assert!(!can_open(bad), "{bad}");
+        }
     }
 }

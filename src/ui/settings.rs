@@ -16,7 +16,8 @@ pub struct SettingsState {
     import_path: String,
     /// Settings export: where to, and what to leave out.
     export_to: String,
-    export_no_keys: bool,
+    /// Off until ticked: an exported file is often sent to someone or synced to the cloud.
+    export_keys: bool,
     export_no_playlists: bool,
     /// The settings file to import (the newest one found, to begin with).
     settings_file: String,
@@ -609,12 +610,10 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                      you like. Import it on another computer (Linux, Windows or macOS) to carry on where you left off.",
                 );
                 ui.add_space(4.0);
-                let mut keys = !st.export_no_keys;
                 ui.checkbox(
-                    &mut keys,
+                    &mut st.export_keys,
                     "Include keys and logins (Spotify, Last.fm, SoundCloud, Apple Music, Discord)",
                 );
-                st.export_no_keys = !keys;
                 let mut playlists = !st.export_no_playlists;
                 ui.checkbox(&mut playlists, "Include your playlists and Liked Songs");
                 st.export_no_playlists = !playlists;
@@ -626,11 +625,14 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, cfg: &mut Config, st: &mut SettingsState, 
                     if ui.button(theme::ic(icon::UPLOAD_SIMPLE, "Export")).clicked() && !st.export_to.trim().is_empty() {
                         cx.actions.push(Action::Cmd(Command::ExportSettings {
                             path: expand_home(&st.export_to),
-                            include: crate::backup::Include { keys, playlists },
+                            include: crate::backup::Include {
+                                keys: st.export_keys,
+                                playlists,
+                            },
                         }));
                     }
                 });
-                if keys {
+                if st.export_keys {
                     hint(ui, "The file then holds your passwords and tokens: keep it private.");
                 }
                 if let Some(saved) = &cx.feed.exported_settings {

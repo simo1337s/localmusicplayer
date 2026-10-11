@@ -165,7 +165,7 @@ async fn load_bytes(http: &reqwest::Client, disk: &Path, src: &str) -> Option<Ve
             return Some(b);
         }
         let resp = http.get(src).send().await.ok()?.error_for_status().ok()?;
-        let bytes = resp.bytes().await.ok()?.to_vec();
+        let bytes = crate::http::read_capped(resp, crate::http::MAX_IMAGE).await.ok()?;
         let _ = tokio::fs::write(&file, &bytes).await;
         return Some(bytes);
     }

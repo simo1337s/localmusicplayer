@@ -516,7 +516,24 @@ impl SoundCloud {
             let _ = tokio::fs::remove_file(&part).await;
             return Err(e);
         }
-        let ext = sniff_file_ext(&part).await.unwrap_or("mp3");
+        // Only files that are audio in a known format are kept, under that format's name:
+        // anything else (a playlist, a web page) could make the player fetch or open other
+        // things when it is played.
+        let mut ext = sniff_file_ext(&part).await;
+        if ext.is_none() && kind == DownloadKind::Original {
+            warn!("SoundCloud: original file of \"{title}\" isn't audio Sumo knows; saving the stream");
+            let _ = tokio::fs::remove_file(&part).await;
+            kind = DownloadKind::Stream;
+            if let Err(e) = self.download_stream(&json, &title, &part, progress).await {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(e);
+            }
+            ext = sniff_file_ext(&part).await;
+        }
+        let Some(ext) = ext else {
+            let _ = tokio::fs::remove_file(&part).await;
+            bail!("\"{title}\" didn't download as an audio file");
+        };
         let path = unique_path(dir, &stem, ext);
         tokio::fs::rename(&part, &path)
             .await
@@ -574,15 +591,15 @@ impl SoundCloud {
         let mut file = tokio::fs::File::create(part).await?;
         let total = hls.segments.len() + usize::from(hls.init.is_some());
         for (i, segment) in hls.init.iter().chain(hls.segments.iter()).enumerate() {
-            let bytes = self
+            let resp = self
                 .http
                 .get(segment)
                 .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
-                .with_context(|| format!("downloading part {} of {total}", i + 1))?
-                .bytes()
-                .await?;
+                .with_context(|| format!("downloading part {} of {total}", i + 1))?;
+            // A part is a few seconds of audio.
+            let bytes = crate::http::read_capped(resp, 64 << 20).await?;
             tokio::io::AsyncWriteExt::write_all(&mut file, &bytes).await?;
             progress((i + 1) as f32 / total as f32);
         }
@@ -751,7 +768,9 @@ impl SoundCloud {
         loop {
             let cid = self.client_id().await?;
             let full = build_url(url, params, &cid)?;
-            let token = self.token(require_auth);
+            // Links come from SoundCloud's answers (next pages, streams): the login only goes
+            // to SoundCloud itself.
+            let token = self.token(require_auth).filter(|_| is_soundcloud_api(&full));
             let mut req = self.http.get(full).header(ACCEPT, "application/json");
             if let Some(token) = token {
                 req = req.header(AUTHORIZATION, format!("OAuth {token}"));
@@ -1222,6 +1241,10 @@ async fn save_body(
         let Some(chunk) = chunk else { break };
         file.write_all(&chunk).await?;
         done += chunk.len() as u64;
+        // Hours of studio-quality WAV stay well below this.
+        if done > 4 << 30 {
+            bail!("the file is too big");
+        }
         if let Some(total) = total {
             progress((done as f32 / total as f32).min(1.0));
         }
@@ -1274,20 +1297,31 @@ pub fn file_stem(artist: &str, title: &str) -> String {
     } else {
         format!("{artist} - {title}")
     };
-    let clean: String = name
-        .chars()
-        .map(|c| {
-            if c.is_control() || r#"/\:*?"<>|"#.contains(c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .take(150)
-        .collect();
+    let mut clean = String::new();
+    for c in name.chars() {
+        let c = if c.is_control() || r#"/\:*?"<>|"#.contains(c) {
+            '_'
+        } else {
+            c
+        };
+        // File names are limited to 255 bytes; leave room for " (2)" and the extension.
+        if clean.len() + c.len_utf8() > 200 {
+            break;
+        }
+        clean.push(c);
+    }
     let clean = clean.trim().trim_matches('.').trim().to_string();
     if clean.is_empty() {
-        "SoundCloud track".into()
+        return "SoundCloud track".into();
+    }
+    // Names Windows keeps for devices, even with an extension ("CON.mp3").
+    let base = clean.split('.').next().unwrap_or("").trim().to_ascii_uppercase();
+    let reserved = matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && base.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{clean}")
     } else {
         clean
     }
@@ -1360,6 +1394,13 @@ fn api(path: &str) -> String {
     static BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let base = BASE.get_or_init(|| std::env::var("MULTIMUSIC_SOUNDCLOUD_API").unwrap_or_else(|_| API_BASE.to_string()));
     format!("{base}{path}")
+}
+
+/// Whether `url` is SoundCloud's (or the stand-in tests point Sumo at), so it may get the login.
+fn is_soundcloud_api(url: &Url) -> bool {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    (url.scheme() == "https" && (host == "soundcloud.com" || host.ends_with(".soundcloud.com")))
+        || url.as_str().starts_with(&api(""))
 }
 
 /// `url` with `params` and `client_id` added. Any `client_id` already present (e.g. in a
@@ -1796,6 +1837,16 @@ mod tests {
     }
 
     #[test]
+    fn login_only_goes_to_soundcloud() {
+        let ok = |u: &str| is_soundcloud_api(&Url::parse(u).unwrap());
+        assert!(ok("https://api-v2.soundcloud.com/me"));
+        assert!(ok("https://api.soundcloud.com/tracks/1/streams"));
+        assert!(!ok("http://api-v2.soundcloud.com/me"));
+        assert!(!ok("https://soundcloud.com.evil.example/me"));
+        assert!(!ok("https://evil.example/?u=api-v2.soundcloud.com"));
+    }
+
+    #[test]
     fn build_url_replaces_client_id() {
         let next =
             "https://api-v2.soundcloud.com/users/183/track_likes?offset=1709208000000%2C123&limit=200&client_id=OLD";
@@ -2014,7 +2065,13 @@ mod tests {
         // Characters file systems (or other OSes) reject are replaced.
         assert_eq!(file_stem("A/B", "What?: \"Yes\" <3"), "A_B - What__ _Yes_ _3");
         assert_eq!(file_stem("", " ..."), "SoundCloud track");
-        assert!(file_stem("x", &"long ".repeat(100)).chars().count() <= 150);
+        assert!(file_stem("x", &"long ".repeat(100)).len() <= 200);
+        // Counted in bytes: 255 is the most a file name can have.
+        let wide = file_stem("", &"歌".repeat(150));
+        assert!(wide.len() <= 200 && wide.starts_with('歌'), "{}", wide.len());
+        assert_eq!(file_stem("", "con"), "_con");
+        assert_eq!(file_stem("", "COM1.final"), "_COM1.final");
+        assert_eq!(file_stem("", "Console"), "Console");
 
         let dir = std::env::temp_dir().join(format!("multimusic-names-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

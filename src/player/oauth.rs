@@ -365,9 +365,10 @@ async fn wait_for_code(listener: &TcpListener, state: &str, path: &str) -> Resul
     let expected = path;
     loop {
         let (mut stream, _) = listener.accept().await?;
-        let request = match read_request(&mut stream).await {
-            Ok(r) => r,
-            Err(_) => continue,
+        // A whole request in a few seconds, so a client that sends nothing can't hold it up.
+        let request = match tokio::time::timeout(Duration::from_secs(10), read_request(&mut stream)).await {
+            Ok(Ok(r)) => r,
+            _ => continue,
         };
         let path = request
             .lines()
@@ -382,15 +383,8 @@ async fn wait_for_code(listener: &TcpListener, state: &str, path: &str) -> Resul
         }
         let params = parse_query(query.trim_start_matches('?'));
         let get = |k: &str| params.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
-        if let Some(err) = get("error") {
-            respond(
-                &mut stream,
-                "200 OK",
-                &page("Login cancelled", &format!("Spotify said: {err}")),
-            )
-            .await;
-            bail!("Spotify login was not completed ({err})");
-        }
+        // Only Spotify's redirect knows the state: anything else (another web page opening
+        // this address) is turned away without ending the login.
         if get("state").as_deref() != Some(state) {
             respond(
                 &mut stream,
@@ -398,7 +392,21 @@ async fn wait_for_code(listener: &TcpListener, state: &str, path: &str) -> Resul
                 &page("Something went wrong", "Please try logging in again."),
             )
             .await;
-            bail!("Spotify login returned an unexpected state; please try again");
+            continue;
+        }
+        if let Some(err) = get("error") {
+            let err: String = err
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || " _-.".contains(*c))
+                .take(80)
+                .collect();
+            respond(
+                &mut stream,
+                "200 OK",
+                &page("Login cancelled", &format!("Spotify said: {err}")),
+            )
+            .await;
+            bail!("Spotify login was not completed ({err})");
         }
         let Some(code) = get("code") else {
             respond(
@@ -437,7 +445,9 @@ async fn read_request(stream: &mut TcpStream) -> Result<String> {
 
 async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\
+         X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let _ = stream.write_all(resp.as_bytes()).await;
@@ -445,12 +455,28 @@ async fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 fn page(title: &str, text: &str) -> String {
+    let (title, text) = (escape_html(title), escape_html(text));
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Sumo</title><style>\
          body{{background:#121212;color:#f2f0ea;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0}}\
          .c{{text-align:center}}svg{{width:96px;height:96px}}h1{{font-weight:700;margin:18px 0 6px}}p{{color:#a7a59f}}\
          </style></head><body><div class=\"c\">{LOGO_SVG}<h1>{title}</h1><p>{text}</p></div></body></html>"
     )
+}
+
+fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 pub fn parse_query(q: &str) -> Vec<(String, String)> {
@@ -739,6 +765,33 @@ mod tests {
             assert_eq!(resp.starts_with("HTTP/1.1 200"), ok, "{resp}");
         }
         assert_eq!(waiter.await.unwrap().unwrap(), "right");
+    }
+
+    /// Another web page opening the callback can't end the login or put its markup on the page.
+    #[tokio::test]
+    async fn requests_without_the_state_are_turned_away() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiter = tokio::spawn(async move { wait_for_code(&listener, "s3cret", "/login").await });
+        for path in [
+            "/login?error=%3Cscript%3Ealert(1)%3C/script%3E",
+            "/login?code=forged&state=guess",
+            "/login?code=real&state=s3cret",
+        ] {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            s.read_to_string(&mut resp).await.unwrap();
+            assert!(!resp.contains("<script>"), "{resp}");
+            assert!(resp.contains("Content-Security-Policy: default-src 'none'"), "{resp}");
+        }
+        assert_eq!(waiter.await.unwrap().unwrap(), "real");
+        assert_eq!(
+            escape_html("<a href=\"x\">&'"),
+            "&lt;a href=&quot;x&quot;&gt;&amp;&#39;"
+        );
     }
 
     #[tokio::test]

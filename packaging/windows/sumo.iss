@@ -15,9 +15,9 @@ AppName=Sumo
 AppVersion={#AppVersion}
 AppVerName=Sumo {#AppVersion}
 AppPublisher=v0-0x
-AppPublisherURL=https://github.com/v0-0x/localmusicplayer
-AppSupportURL=https://github.com/v0-0x/localmusicplayer/issues
-AppUpdatesURL=https://github.com/v0-0x/localmusicplayer/releases
+AppPublisherURL=https://github.com/v0-0x/sumo-music
+AppSupportURL=https://github.com/v0-0x/sumo-music/issues
+AppUpdatesURL=https://github.com/v0-0x/sumo-music/releases
 ; Installed for the current user: no administrator prompt, and updates install silently.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog

@@ -40,7 +40,14 @@ const SKIPPED_TRACK_FLAGS: [&str; 6] = ["Podcast", "Movie", "TV Show", "Music Vi
 
 /// Import an iTunes / Apple Music "Library.xml" export (File > Library > Export Library on macOS/Windows).
 pub fn import_library_xml(path: &Path) -> Result<AppleLibrary> {
-    let root = plist::Value::from_file(path)
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read Apple Music library export {}", path.display()))?;
+    // Reading (and freeing) the plist recurses once per level: a crafted file nested
+    // thousands deep would crash the app, while a real export is a handful of levels.
+    if !nesting_ok(&bytes, 64) {
+        bail!("{} is not an iTunes / Apple Music library export", path.display());
+    }
+    let root = plist::Value::from_reader_xml(std::io::Cursor::new(bytes))
         .with_context(|| format!("failed to read Apple Music library export {}", path.display()))?;
     let library = parse_library_plist(&root)
         .with_context(|| format!("{} is not an iTunes / Apple Music library export", path.display()))?;
@@ -51,6 +58,28 @@ pub fn import_library_xml(path: &Path) -> Result<AppleLibrary> {
         "imported Apple Music library export"
     );
     Ok(library)
+}
+
+/// Whether an XML plist nests its arrays and dictionaries at most `max` deep.
+fn nesting_ok(xml: &[u8], max: usize) -> bool {
+    let mut depth = 0usize;
+    let mut rest = xml;
+    while let Some(at) = rest.iter().position(|&b| b == b'<') {
+        rest = &rest[at + 1..];
+        let end = rest.iter().position(|&b| b == b'>').unwrap_or(rest.len());
+        let tag = &rest[..end];
+        let opens = tag == b"array" || tag == b"dict" || tag.starts_with(b"array ") || tag.starts_with(b"dict ");
+        if opens {
+            depth += 1;
+            if depth > max {
+                return false;
+            }
+        } else if tag == b"/array" || tag == b"/dict" {
+            depth = depth.saturating_sub(1);
+        }
+        rest = &rest[end.min(rest.len())..];
+    }
+    true
 }
 
 fn parse_library_plist(root: &plist::Value) -> Result<AppleLibrary> {
@@ -1085,6 +1114,23 @@ mod tests {
 </plist>
 "#
         )
+    }
+
+    #[test]
+    fn deeply_nested_files_are_refused() {
+        let ok =
+            b"<plist><dict><key>Tracks</key><dict/><key>Playlists</key><array><dict></dict></array></dict></plist>";
+        assert!(nesting_ok(ok, 64));
+        let deep = format!(
+            "<plist>{}{}</plist>",
+            "<array>".repeat(200_000),
+            "</array>".repeat(200_000)
+        );
+        assert!(!nesting_ok(deep.as_bytes(), 64));
+        let dir = TempDir::new();
+        let file = dir.0.join("Library.xml");
+        std::fs::write(&file, deep).unwrap();
+        assert!(import_library_xml(&file).is_err());
     }
 
     #[test]

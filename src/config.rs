@@ -295,10 +295,10 @@ pub const DEFAULT_ACCENT: [u8; 3] = [0xe9, 0xe6, 0xdf];
 const OLD_DEFAULT_ACCENT: [u8; 3] = [0x8b, 0x7c, 0xf6];
 
 /// Where new versions come from.
-pub const UPDATES_REPO: &str = "v0-0x/localmusicplayer";
-/// The repository's address before its owner was renamed. GitHub only redirects from it until
-/// someone else takes the name, so saved settings move to the new one.
-const OLD_UPDATES_REPO: &str = "simo1337s/localmusicplayer";
+pub const UPDATES_REPO: &str = "v0-0x/sumo-music";
+/// The repository's earlier addresses (before its owner and then it were renamed). GitHub only
+/// redirects from them until someone else takes the name, so saved settings move to the new one.
+const OLD_UPDATES_REPOS: [&str; 2] = ["simo1337s/localmusicplayer", "v0-0x/localmusicplayer"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -389,6 +389,10 @@ impl Paths {
                 d.cache_dir().to_path_buf(),
             ),
             None => {
+                #[cfg(unix)]
+                // SAFETY: geteuid has no preconditions.
+                let base = std::env::temp_dir().join(format!("multimusic-{}", unsafe { libc::geteuid() }));
+                #[cfg(not(unix))]
                 let base = std::env::temp_dir().join("multimusic");
                 (base.join("config"), base.join("data"), base.join("cache"))
             }
@@ -401,6 +405,13 @@ impl Paths {
         }
         for d in [&config_dir, &data_dir, &cache_dir] {
             let _ = std::fs::create_dir_all(d);
+            // Keys, logins (librespot writes its own readable by all), listening history and
+            // update downloads: for this user only.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700));
+            }
         }
         Paths {
             config_dir,
@@ -496,7 +507,10 @@ impl Config {
         if self.ui.accent == OLD_DEFAULT_ACCENT {
             self.ui.accent = DEFAULT_ACCENT;
         }
-        if self.updates.repo.trim().eq_ignore_ascii_case(OLD_UPDATES_REPO) {
+        if OLD_UPDATES_REPOS
+            .iter()
+            .any(|old| self.updates.repo.trim().eq_ignore_ascii_case(old))
+        {
             self.updates.repo = UPDATES_REPO.into();
         }
         let old_folder = std::mem::take(&mut self.soundcloud.download_folder);
@@ -518,16 +532,31 @@ impl Config {
         let text = toml::to_string_pretty(self)?;
         let file = paths.config_file();
         let tmp = file.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)?;
         // The file holds API secrets, keep it private.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
+        let _ = std::fs::remove_file(&tmp);
+        write_private(&tmp, text)?;
         std::fs::rename(tmp, file)?;
         Ok(())
     }
+}
+
+/// Writes a file only this user can read, for keys and logins. On Unix it is private before
+/// anything is written to it, so the secret is never readable by others, not even briefly.
+pub fn write_private(path: &Path, data: impl AsRef<[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    // A file that was already there keeps its old mode when opened.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(data.as_ref())?;
+    file.flush()
 }
 
 /// `~/x` → `$HOME/x`.
@@ -645,9 +674,11 @@ mod tests {
 
     #[test]
     fn updates_come_from_the_renamed_repository() {
-        let mut cfg: Config = toml::from_str("[updates]\nrepo = \"simo1337s/localmusicplayer\"\n").unwrap();
-        cfg.upgrade();
-        assert_eq!(cfg.updates.repo, UPDATES_REPO);
+        for old in OLD_UPDATES_REPOS {
+            let mut cfg: Config = toml::from_str(&format!("[updates]\nrepo = \"{old}\"\n")).unwrap();
+            cfg.upgrade();
+            assert_eq!(cfg.updates.repo, UPDATES_REPO);
+        }
         assert_eq!(Config::default().updates.repo, UPDATES_REPO);
         // Another repository someone chose is kept.
         let mut cfg: Config = toml::from_str("[updates]\nrepo = \"someone/fork\"\n").unwrap();

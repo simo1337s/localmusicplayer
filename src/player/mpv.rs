@@ -89,7 +89,12 @@ impl Mpv {
     /// instances.
     pub async fn spawn(opts: &MpvOptions, id: u64, events: MpvSender) -> Result<Mpv> {
         let socket = ipc_path(id);
-        let _ = std::fs::remove_file(&socket);
+        // A socket left at our path that can't be removed isn't ours to talk to.
+        if let Err(e) = std::fs::remove_file(&socket) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                bail!("can't reuse {}: {e}", socket.display());
+            }
+        }
 
         let mut cmd = crate::tools::command(&opts.binary);
         cmd.arg("--no-config")
@@ -317,18 +322,71 @@ fn ipc_path(id: u64) -> PathBuf {
     if cfg!(windows) {
         return PathBuf::from(format!(r"\\.\pipe\{name}"));
     }
-    let socket = ipc_dir().join(&name);
-    // Unix socket paths are limited to ~104 bytes.
-    if socket.as_os_str().len() > 100 {
-        return PathBuf::from("/tmp").join(&name);
-    }
-    socket
+    ipc_dir().join(&name)
 }
 
+/// A folder only this user can enter, for mpv's sockets: anyone who can reach a socket can
+/// make mpv run programs, and anyone who could put one at our path first would get our
+/// commands. The login's runtime folder when there is one, otherwise a folder of our own.
+#[cfg(unix)]
 fn ipc_dir() -> PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        // Unix socket paths are limited to ~104 bytes.
+        let short = |dir: &Path| dir.join(format!("{IPC_PREFIX}{}-99.sock", u32::MAX)).as_os_str().len() <= 100;
+        if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from) {
+            if short(&dir) && is_private_dir(&dir) {
+                return dir;
+            }
+        }
+        let base = std::env::temp_dir();
+        let base = if short(&base.join("multimusic-4294967295-xxxxxxxx")) {
+            base
+        } else {
+            PathBuf::from("/tmp")
+        };
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let mine = base.join(format!("multimusic-{uid}"));
+        if private_dir(&mine) {
+            return mine;
+        }
+        // Someone else has that name: a fresh one with a random name.
+        for _ in 0..16 {
+            let dir = base.join(format!("multimusic-{uid}-{:08x}", rand::random::<u32>()));
+            if private_dir(&dir) {
+                return dir;
+            }
+        }
+        mine
+    })
+    .clone()
+}
+
+#[cfg(windows)]
+fn ipc_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
+/// Makes `dir` (mode 0700) or checks the one that is there is ours and private.
+#[cfg(unix)]
+fn private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => is_private_dir(dir),
+        Err(_) => false,
+    }
+}
+
+/// A real folder (not a link) owned by this user that nobody else can enter.
+#[cfg(unix)]
+fn is_private_dir(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+        // SAFETY: geteuid has no preconditions.
+        m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 == 0
+    })
 }
 
 async fn connect(path: &Path) -> std::io::Result<(IpcReader, IpcWriter)> {
@@ -348,10 +406,18 @@ async fn connect(path: &Path) -> std::io::Result<(IpcReader, IpcWriter)> {
 /// Stops players a previous Sumo left behind when it was killed (Linux ends them with
 /// the app; on Windows a job object does).
 pub fn stop_orphans() {
+    // Older versions put sockets straight into /tmp.
     #[cfg(unix)]
     for dir in [ipc_dir(), PathBuf::from("/tmp")] {
+        use std::os::unix::fs::MetadataExt;
         let Ok(entries) = std::fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
+            // Only our own: other users' sockets are none of our business.
+            // SAFETY: geteuid has no preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if !entry.metadata().is_ok_and(|m| m.uid() == uid) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let Some(pid) = name
                 .strip_prefix(IPC_PREFIX)
@@ -360,8 +426,11 @@ pub fn stop_orphans() {
             else {
                 continue;
             };
-            // SAFETY: signal 0 only checks whether the process exists.
-            let alive = pid == std::process::id() as i32 || unsafe { libc::kill(pid, 0) } == 0;
+            // SAFETY: signal 0 only checks whether the process exists. EPERM means it does
+            // (someone else's).
+            let alive = pid == std::process::id() as i32
+                || unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
             if alive {
                 continue;
             }
@@ -580,6 +649,29 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(loaded, HashSet::from([7, 8]));
         assert_eq!(ended, HashSet::from([7, 8]));
+    }
+
+    /// mpv's sockets go where only this user can reach them.
+    #[cfg(unix)]
+    #[test]
+    fn sockets_live_in_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        assert!(is_private_dir(&ipc_dir()), "{}", ipc_dir().display());
+        assert!(ipc_path(3).starts_with(ipc_dir()));
+        assert!(ipc_path(3).as_os_str().len() <= 104);
+        let dir = std::env::temp_dir().join(format!("multimusic-private-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(private_dir(&dir));
+        assert!(private_dir(&dir));
+        // Open to others, or a link to somewhere else: not used.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!private_dir(&dir));
+        let link = dir.with_extension("link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(ipc_dir(), &link).unwrap();
+        assert!(!is_private_dir(&link));
+        std::fs::remove_file(link).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     /// Renders a generated WAV file (no ReplayGain tags) through a real mpv, if one is

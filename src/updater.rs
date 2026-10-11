@@ -152,8 +152,12 @@ pub fn parse_release(json: &Value) -> Option<Release> {
                     // Public download links come from GitHub's file servers, which don't count
                     // against the API's hourly limit.
                     let url = a.get("browser_download_url").or_else(|| a.get("url"))?;
+                    let name = a.get("name")?.as_str()?;
+                    if !is_plain_file_name(name) {
+                        return None;
+                    }
                     Some(Asset {
-                        name: a.get("name")?.as_str()?.to_string(),
+                        name: name.to_string(),
                         url: url.as_str()?.to_string(),
                         size: a.get("size").and_then(Value::as_u64).unwrap_or(0),
                     })
@@ -208,7 +212,11 @@ pub async fn download(http: &reqwest::Client, asset: &Asset, dest: &Path, progre
         .error_for_status()
         .context("the download was refused")?;
     let total = resp.content_length().unwrap_or(asset.size).max(1);
-    let mut file = tokio::fs::File::create(dest)
+    // A new file only: never write through something already there.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
         .await
         .with_context(|| format!("couldn't write {}", dest.display()))?;
     let mut done = 0u64;
@@ -240,9 +248,41 @@ pub fn verify(file: &Path, name: &str, sums: &str) -> Result<()> {
     Ok(())
 }
 
-/// Where downloads wait to be installed.
-pub fn download_dir() -> PathBuf {
-    std::env::temp_dir().join("multimusic-update")
+/// A new, empty folder for an update's download inside `base` (Sumo's own cache folder, which
+/// only this user can write to), readable by this user only. It is made afresh each time, so
+/// nobody else can have put files or links in it, and the checked download can't be swapped
+/// before it is installed (as root, on Linux).
+pub fn fresh_download_dir(base: &Path) -> Result<PathBuf> {
+    let dir = base.join("update");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&dir)?,
+        // A file or a link: remove it, not what it points to.
+        Ok(_) => std::fs::remove_file(&dir)?,
+        Err(_) => {}
+    }
+    std::fs::create_dir_all(base)?;
+    #[cfg(unix)]
+    let folder = {
+        let mut folder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut folder, 0o700);
+        folder
+    };
+    #[cfg(not(unix))]
+    let folder = std::fs::DirBuilder::new();
+    // Fails if something appeared there in the meantime.
+    folder
+        .create(&dir)
+        .with_context(|| format!("couldn't make {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Whether a release's file name can be used as a file name as it is (no folders, no "..").
+pub fn is_plain_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains(['/', '\\', ':', '\0'])
+        && name != "."
+        && name != ".."
+        && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
 }
 
 /// Starts installing a downloaded update. Sumo has to quit right after; the new
@@ -286,7 +326,7 @@ pub fn install_package(file: &Path, password: &Secret) -> std::result::Result<()
     let install = sudo(
         password,
         &[
-            "pacman".as_ref(),
+            "/usr/bin/pacman".as_ref(),
             "-U".as_ref(),
             "--noconfirm".as_ref(),
             file.as_os_str(),
@@ -311,7 +351,12 @@ pub fn install_package(file: &Path, password: &Secret) -> std::result::Result<()
 fn sudo(password: &Secret, args: &[&std::ffi::OsStr]) -> std::io::Result<std::process::Output> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let mut child = Command::new("sudo")
+    // The system's sudo, not whatever is first on the PATH.
+    let program = ["/usr/bin/sudo", "/bin/sudo"]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .unwrap_or("sudo");
+    let mut child = Command::new(program)
         .args(["-S", "-p", ""])
         .args(args)
         .env("LC_ALL", "C")
@@ -440,14 +485,15 @@ fn install_app(zip: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_dir_all(&old);
     let _ = std::fs::remove_dir_all(&unpack);
-    // Start the new version once this one has quit.
-    let script = format!(
-        "while kill -0 {} 2>/dev/null; do sleep 0.2; done; open \"{}\"",
-        std::process::id(),
-        target.display()
-    );
+    // Start the new version once this one has quit. The path is an argument, never part of
+    // the script.
     std::process::Command::new("/bin/sh")
-        .args(["-c", &script])
+        .args([
+            "-c",
+            "while kill -0 \"$0\" 2>/dev/null; do sleep 0.2; done; exec /usr/bin/open \"$1\"",
+        ])
+        .arg(std::process::id().to_string())
+        .arg(&target)
         .spawn()
         .context("couldn't restart Sumo")?;
     Ok(())
@@ -569,6 +615,47 @@ mod tests {
         assert!(verify(&file, "app.zip", "abc  app.zip").is_err());
         assert!(verify(&file, "missing.zip", &sums).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn downloads_get_a_private_folder() {
+        let base = std::env::temp_dir().join(format!("multimusic-update-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = fresh_download_dir(&base).unwrap();
+        std::fs::write(dir.join("left-over"), b"x").unwrap();
+        // Made afresh each time.
+        let dir = fresh_download_dir(&base).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+            // A link put in its place is removed, not followed.
+            let elsewhere = base.join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::fs::write(elsewhere.join("keep"), b"x").unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &dir).unwrap();
+            let dir = fresh_download_dir(&base).unwrap();
+            assert!(!std::fs::symlink_metadata(&dir).unwrap().file_type().is_symlink());
+            assert!(elsewhere.join("keep").exists());
+        }
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn release_file_names_stay_file_names() {
+        assert!(is_plain_file_name("Sumo-Setup-0.5.1-x64.exe"));
+        assert!(is_plain_file_name("multimusic-0.5.1-1-x86_64.pkg.tar.zst"));
+        for bad in ["", ".", "..", "../x", "a/b", "a\\b", "C:x", "/etc/passwd"] {
+            assert!(!is_plain_file_name(bad), "{bad:?}");
+        }
+        let json = serde_json::json!({
+            "tag_name": "v9.0.0",
+            "assets": [{"name": "../SHA256SUMS.txt", "browser_download_url": "https://x/y"}],
+        });
+        assert!(parse_release(&json).unwrap().sums.is_none());
     }
 
     /// The whole check against a stand-in for GitHub's API, which needs no login.

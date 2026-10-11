@@ -132,12 +132,29 @@ mod instance {
 
     use crate::service::Command;
 
-    const PIPE: &str = r"\\.\pipe\multimusic-running";
+    /// One name per user: pipe names are shared by everyone on the computer, and another
+    /// user's pipe must not count as this user's Sumo running.
+    fn pipe() -> String {
+        let user: String = std::env::var("USERNAME")
+            .unwrap_or_default()
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        format!(r"\\.\pipe\multimusic-running-{user}")
+    }
 
     /// True when another Sumo runs (it was asked to come to the front).
     pub fn running_elsewhere() -> bool {
         use std::io::Write;
-        match std::fs::OpenOptions::new().write(true).open(PIPE) {
+        use std::os::windows::fs::OpenOptionsExt;
+        // SECURITY_IDENTIFICATION: whoever made the pipe may learn who connects, but can't
+        // act as this user.
+        const SECURITY_IDENTIFICATION: u32 = 1 << 16;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .security_qos_flags(SECURITY_IDENTIFICATION)
+            .open(pipe())
+        {
             Ok(mut pipe) => {
                 let _ = pipe.write_all(b"raise\n");
                 true
@@ -148,7 +165,7 @@ mod instance {
 
     pub fn listen(rt: &tokio::runtime::Handle, commands: UnboundedSender<Command>) {
         let _guard = rt.enter();
-        let Ok(server) = ServerOptions::new().first_pipe_instance(true).create(PIPE) else {
+        let Ok(server) = ServerOptions::new().first_pipe_instance(true).create(pipe()) else {
             return;
         };
         rt.spawn(serve(server, commands));
@@ -161,7 +178,7 @@ mod instance {
             }
             let _ = commands.send(Command::Raise);
             // A new instance of the pipe for the next start.
-            match ServerOptions::new().create(PIPE) {
+            match ServerOptions::new().create(pipe()) {
                 Ok(next) => server = next,
                 Err(_) => return,
             }
